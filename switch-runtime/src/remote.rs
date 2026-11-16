@@ -3,8 +3,8 @@
 //! Each runtime owns one [`Mailbox`], allocated with it and never freed: its
 //! blocks' metadata points at it, and a foreign thread may wake a task long after
 //! the runtime is gone. A foreign wake pushes the task header under the lock; the
-//! owner takes the requests at the start of its next turn and wakes each task
-//! locally, where the slot's flags make a stale or finished task's wake a no-op.
+//! owner takes the requests at the start of its next poll and wakes each task locally.
+//! A free or finished slot ignores the wake; a reused slot can give its newer task an extra poll.
 
 use std::cell::{Cell, UnsafeCell};
 use std::ptr::{self, NonNull};

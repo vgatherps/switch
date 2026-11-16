@@ -1,4 +1,4 @@
-//! Direct in-process junction host wiring shared by socket and tap tests.
+//! Direct in-process daemon wiring shared by socket and tap tests.
 
 use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;

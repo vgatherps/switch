@@ -33,21 +33,21 @@ pub(crate) enum Lifecycle {
 #[inline]
 fn unlikely() {}
 
-/// `Runtime::poll` starts another round only while fewer task polls than this
-/// were made. The check runs between rounds and a started round always
-/// finishes, so one call makes at most `POLL_BUDGET - 1` polls plus the length
-/// of its last round.
+/// `Runtime::poll` starts another pass only while fewer task polls than this
+/// were made. The check runs between passes and a started pass always
+/// finishes unless a task requests a turn, so a call can exceed the budget
+/// by the remaining tasks in its last pass.
 pub(crate) const POLL_BUDGET: usize = 1024;
 
 /// Single-threaded executor.
 ///
 /// Three queues: wakes go to `incoming`, deferred wakes to `deferred` (appended
-/// to `incoming` when a `Runtime::poll` starts), and each round swaps `incoming`
+/// to `incoming` when a `Runtime::poll` starts), and each pass swaps `incoming`
 /// into `run_queue` and polls it from `cursor`. A turn request (`request_turn`)
-/// stops the round after a task poll; the next `Runtime::poll` finishes
+/// stops the pass after a task poll; the next `Runtime::poll` finishes
 /// `run_queue[cursor..]` first. Simple iteration, no VecDeque.
 pub struct Executor {
-    /// Tasks to poll this round, by header; `run_queue[cursor..]` are still to
+    /// Tasks to poll this pass, by header; `run_queue[cursor..]` are still to
     /// poll, and keep QUEUED until then.
     run_queue: Vec<*const TaskHeader>,
     cursor: usize,
@@ -186,9 +186,9 @@ impl Executor {
     }
 
     /// An ordinary wake of a deferred task: its entry moves from `deferred` to
-    /// `incoming`, so it runs in this poll's next round. The other deferred
+    /// `incoming`, so it runs in this poll's next pass. The other deferred
     /// tasks keep their order. A task whose entry already left `deferred` at the
-    /// start of this poll is in the current round: nothing to do.
+    /// start of this poll is in the current pass: nothing to do.
     ///
     /// # Safety
     /// As for [`Self::wake`]; the task is LIVE, QUEUED and DEFERRED.
@@ -265,10 +265,10 @@ impl Executor {
         }
     }
 
-    /// Finish the round a turn request stopped, then poll rounds: each round
-    /// polls a snapshot of `incoming`, and another round follows while `incoming`
+    /// Finish the pass a turn request stopped, then poll passes: each pass
+    /// polls a snapshot of `incoming`, and another pass follows while `incoming`
     /// is not empty and fewer than [`POLL_BUDGET`] polls were made (the budget
-    /// never cuts a round short). A turn request from a task stops before the
+    /// never cuts a pass short). A turn request from a task stops before the
     /// next task poll.
     ///
     /// Guard owns the active turn; expiry handoff is fully normalized.
@@ -426,9 +426,10 @@ thread_local! {
     static POLLING: Cell<*mut Executor> = const { Cell::new(std::ptr::null_mut()) };
 }
 
-/// Ends the `Runtime::poll` running on this thread after the task being polled, so
-/// the loop turns the network sooner; the next poll first finishes the rest of the
-/// round. Lasts that one poll. Does nothing outside a `Runtime::poll`.
+/// Ends the `Runtime::poll` running on this thread after the task being polled.
+///
+/// This lets the loop drive the network sooner. The next poll finishes the rest of the pass
+/// first. The request lasts one poll and does nothing outside a `Runtime::poll`.
 pub fn request_turn() {
     let executor = POLLING.get();
     if !executor.is_null() {

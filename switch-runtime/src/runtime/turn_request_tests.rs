@@ -1,5 +1,5 @@
 //! `request_turn` from a task ends `Runtime::poll` after that task's poll; the next poll
-//! first finishes that round, then tasks woken between polls, then deferred ones.
+//! first finishes that pass, then tasks woken between polls, then deferred ones.
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
@@ -193,8 +193,8 @@ fn a_panic_in_the_last_task_polled_leaves_the_round_to_shutdown() {
     assert_eq!(f.drops.get(), 3);
 }
 
-/// With a round left: a task woken between polls and one deferred in the stopped poll run
-/// after it, woken first; a wake of a task still in the round does not poll it twice.
+/// With a pass left: a task woken between polls and one deferred in the stopped poll run
+/// after it, woken first; a wake of a task still in the pass does not poll it twice.
 #[test]
 fn wakes_while_a_round_is_left_run_after_it_in_order() {
     let mut f = Fixture::new(&[("b", Act::Park), ("c", Act::Park), ("d", Act::Park)]);
@@ -217,8 +217,8 @@ fn wakes_while_a_round_is_left_run_after_it_in_order() {
 
 /// Two stops in one resume sequence, a reused slot and a panic with tasks still queued:
 /// a finishes and stops the poll; n, spawned between polls, takes a's freed slot (a pool
-/// hands out its lowest free slot); b, in the stopped round, stops the resume; c panics
-/// with d still in the round. Each task is polled in that order and dropped once.
+/// hands out its lowest free slot); b, in the stopped pass, stops the resume; c panics
+/// with d still in the pass. Each task is polled in that order and dropped once.
 #[test]
 fn repeated_stops_a_reused_slot_and_a_panic_in_one_resume_sequence() {
     let mut f = Fixture::new(&[

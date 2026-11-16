@@ -1,6 +1,6 @@
 //! Memory that two processes share: a named shared-memory object or file ([`Backing`]),
 //! mapped once ([`Mapping`]) or twice back to back ([`DoubleMapping`]). It has no queue logic.
-//! The junction receive ring and the cephalopod send rings are built on it; applications
+//! The daemon's receive rings and the cephalopod send rings are built on it; applications
 //! never use it directly.
 
 mod backing;

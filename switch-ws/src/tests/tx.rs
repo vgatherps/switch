@@ -724,7 +724,8 @@ fn every_op_after_a_failure() {
 }
 
 /// Our close sealed and the peer's not yet received, then a failure or `abandon`: no further
-/// Close is sent, the sealed one still goes out, and a later `close` is `Closed`.
+/// WebSocket close frame is sent, and the sealed one still goes out. After `abandon`, a later
+/// `close` is `Closed`.
 #[test]
 fn abandon_after_our_close_was_sent() {
     for failure in [Some(Failure::Protocol(crate::ProtocolError::ReservedBits)), Some(Failure::PeerEof), Some(Failure::Tls(switch_tls::Error::Truncated)), None] {

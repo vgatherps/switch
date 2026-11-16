@@ -7,6 +7,6 @@ Its API reference is built by `make docs` at the repository root, or alone with 
 ## Build and test
 
 ```sh
-make test                        # every crate that builds without DPDK, this one included
+make test                        # the host tests that need no DPDK, this crate included
 cargo test -p switch-depot       # this crate only
 ```

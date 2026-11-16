@@ -104,7 +104,7 @@ impl std::error::Error for SendError {}
 /// | the daemon is stopped (SIGINT or SIGTERM) | `Ended(HostShutdown)`, or `Disconnected` | closes the network card without closing them; peers see no FIN or reset |
 /// | the daemon is killed or crashes | `Disconnected` | nothing |
 /// | the daemon kicked the session | `Ended(Kicked)` | resets them |
-/// | the session broke the protocol, such as a send before `Connected` | `Ended(ProtocolError)` | resets them |
+/// | the session broke the protocol, such as a send reaching the daemon before the socket's open request | `Ended(ProtocolError)` | resets them |
 /// | writing to the control socket failed | `Io(..)` or `Disconnected` | resets them, as for a dropped session |
 /// | the daemon sent bytes the session cannot decode | `Protocol(..)` | nothing until the session is dropped; then resets them |
 ///
@@ -197,8 +197,8 @@ struct Slot {
     shut: bool,
 }
 
-/// One application's connection to the junction daemon: TCP and UDP sockets on the network
-/// card the daemon owns, with packet data passed through shared memory.
+/// One application's connection to the daemon: TCP and UDP sockets on its network card,
+/// with packet data passed through shared memory.
 ///
 /// Most programs do not use a `Session` directly: they connect one and hand it to
 /// `Net::remote` in `switch::net`, and their tasks then run against the daemon. A program
@@ -293,7 +293,8 @@ struct Slot {
 /// close and shutdown already sent and closes the remaining TCP connections with a FIN. A
 /// connection that still has bytes queued closes after they are sent; if the peer stops
 /// acknowledging, the daemon gives up after 8 retransmission back-offs and resets it. A
-/// connection with received data the program never read is reset.
+/// connection with unread data still held by the daemon is reset. Data already copied into the
+/// session's receive ring does not cause a reset by itself.
 ///
 /// Dropping a `Session` without a successful `finish` is treated as a crash: the daemon resets
 /// every socket the session still had. Dropping it after a successful `finish` but before
@@ -525,7 +526,10 @@ impl Session {
     /// the peer has not received it. The daemon passes the bytes to its network stack as fast as
     /// the stack accepts them and queues the rest without limit, so a peer that does not read
     /// never makes this return `Full`. Received data chunks need not match these records. Send
-    /// only after the socket's [`Event::Connected`].
+    /// only after the socket's [`Event::Connected`]. A send that reaches the daemon before
+    /// the socket's open request is a protocol error. A send to a socket whose open was
+    /// rejected, or to an opened TCP socket that cannot yet send, can be discarded after
+    /// `Ok` with no protocol-error event.
     ///
     /// # Panics
     /// Panics if [`finish`](Self::finish) has succeeded, for an out-of-range or stale id, or

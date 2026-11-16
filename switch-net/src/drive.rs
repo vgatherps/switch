@@ -21,16 +21,17 @@ pub enum RoundError {
 }
 
 /// One round: [`net.receive(now)`](Net::receive), [`rt.poll(tick)`](Runtime::poll), then
-/// [`net.send()`](Net::send). Because the send step comes after the poll, a reply a woken task
-/// queues leaves in the same round as the packet that woke it.
+/// [`net.send()`](Net::send). The send step can attempt a reply queued by a task woken in this
+/// round; transmission can still wait for peer or card capacity.
 ///
-/// `now` is the Stack's time in microseconds and `tick` the runtime's tick; take both from one
+/// `now` is the network stack's time in microseconds and `tick` the runtime's tick; take both from one
 /// clock reading. Ticks must be nanoseconds if any task uses [`within`].
 ///
-/// Never sleeps. Returns `true` if anything moved: the receive step received, rejected or
-/// processed packets or had the NIC accept some, packets are still staged, the poll ran a task,
-/// or the send step had packets accepted or left some pending. A loop that sleeps when nothing
-/// moved should wake by [`Net::poll_at`] at the latest.
+/// Never sleeps. Returns `true` if packets arrived or were processed, the card accepted packets,
+/// or the runtime polled a task; when sharing a card, also if daemon events arrived or sends
+/// were committed to the daemon. It also returns `true` while received packets await processing
+/// or outgoing packets await the card. A loop that sleeps on `false` should wake by
+/// [`Net::poll_at`] at the latest.
 pub fn round(net: &mut Net, rt: &mut Runtime, now: Instant, tick: u64) -> Result<bool, RoundError> {
     let received = net.receive(now).map_err(RoundError::Turn)?;
     let polled = rt.poll(tick).map_err(RoundError::Runtime)?;
@@ -44,8 +45,8 @@ pub fn round(net: &mut Net, rt: &mut Runtime, now: Instant, tick: u64) -> Result
 
 /// Races two futures: `Some` with `a`'s output if `a` finishes, `None` if `b` finishes first
 /// (its output is discarded). Each poll polls `a` before `b`, so `a` wins when both are ready.
-/// The future that did not finish is dropped, and with it whatever it held; to keep an `Unpin`
-/// `b` for another race, pass `&mut b`.
+/// The future that did not finish is dropped, and with it whatever it owns; borrowed values
+/// stay with their owner. To keep an `Unpin` `b` for another race, pass `&mut b`.
 pub async fn first<A: Future, B: Future>(a: A, b: B) -> Option<A::Output> {
     let (mut a, mut b) = (pin!(a), pin!(b));
     poll_fn(|cx| match a.as_mut().poll(cx) {
@@ -56,7 +57,7 @@ pub async fn first<A: Future, B: Future>(a: A, b: B) -> Option<A::Output> {
 }
 
 /// Bounds `work` by a time limit: `Some` with its output if it finishes in time, `None` once
-/// `limit` has passed, in which case `work` is dropped with whatever it held.
+/// `limit` has passed, in which case `work` is dropped with whatever it owns.
 ///
 /// The limit is a runtime sleep of `limit` in nanoseconds, counted from the runtime's latest
 /// accepted tick at the first poll. It has passed once a poll's tick reaches the deadline.

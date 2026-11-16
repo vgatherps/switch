@@ -1,4 +1,4 @@
-//! switch-net against a raw conduit Stack peer on net_ring; every future runs
+//! switch-net against a raw network stack peer on `net_ring`; every future runs
 //! as a switch task.
 
 use std::cell::RefCell;

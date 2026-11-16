@@ -7,7 +7,7 @@ Documentation is the `switch` crate's API reference: `make docs` at the reposito
 ## Build and test
 
 ```sh
-make test                          # every crate that builds without DPDK, this one included
+make test                          # the host tests that need no DPDK, this crate included
 cargo test -p switch-runtime       # this crate only
 make miri                          # its unsafe code under Miri (nightly)
 ```

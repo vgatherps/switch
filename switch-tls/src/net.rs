@@ -46,7 +46,7 @@ pub enum SetupError {
     /// The stream does not belong to the Net of the handle passed with it.
     ForeignHandle,
     /// A frame can carry `room` bytes, fewer than the `need` bytes the connection's largest
-    /// frame takes. `room` is bounded by the backend's frame size, the socket's send buffer
+    /// frame takes. `room` is bounded by the Net's frame size, the socket's send buffer
     /// and, over TLS, the config's `max_fragment_size`.
     RoomTooSmall { room: usize, need: usize },
     /// The socket had already closed or reset.
@@ -68,14 +68,14 @@ pub struct SwitchTx {
     handle: NetHandle,
     tcp: TcpTx,
     /// Bytes per frame: the connection's MSS, raised to the caller's largest frame, within the
-    /// Stack's frame capacity and the socket's send buffer.
+    /// Net's frame capacity and the socket's send buffer.
     room: usize,
 }
 
 impl SwitchTx {
-    /// Sends on `tcp`, in frames from `handle`. A frame carries the connection's MSS (one
-    /// segment), or `min_room`, the largest frame the caller will send, if that is more: TCP
-    /// cuts such a frame into segments. Its storage, the Stack's frame capacity (one frame is
+    /// Sends on `tcp`, in frames from `handle`. A frame carries up to the connection's MSS,
+    /// or `min_room` if that is more; TCP can split it into smaller segments. Its storage,
+    /// the Net's frame capacity (one frame is
     /// taken to read it) and the socket's send buffer (so every `room` request can resolve),
     /// bounds it; storage below `min_room` is refused here, before any byte goes out.
     pub async fn new(handle: &NetHandle, tcp: TcpTx, min_room: usize) -> Result<SwitchTx, SetupError> {
@@ -190,8 +190,11 @@ impl std::error::Error for Error {}
 /// send half `tx` (write with [`send_bytes`]), and the TCP receive half that feeds `rx`. Use it
 /// from one task.
 pub struct Tls {
+    /// Decrypted input; read with [`TlsRx::current`] after [`Tls::ready`].
     pub rx: TlsRx<TcpFrame, SwitchTx>,
+    /// TLS sender; pass it to [`send_bytes`] to write plaintext.
     pub tx: TlsTx<SwitchTx>,
+    /// TCP receive half that supplies encrypted input to `rx`.
     pub tcp: TcpRx,
 }
 
@@ -233,7 +236,8 @@ impl Tls {
     ///
     /// Fails with `Send(TxError::Closed)` if close_notify was already sent,
     /// `Send(TxError::Received(e))` after a receive error, and `Send(TxError::Lower(e))` if the
-    /// socket closed or reset.
+    /// socket closed or reset. Also fails with `Send(TxError::Broken)` if an earlier encrypted
+    /// record was lost before TCP accepted it.
     pub async fn close(&mut self) -> Result<(), Error> {
         self.tx.send_close_notify().await.map_err(Error::Send)?;
         self.tx.shutdown();
@@ -282,10 +286,13 @@ async fn send_sealed<L: FrameTx>(lower: &mut L, mut sealed: L::Sealed, len: usiz
 ///
 /// `min_plain` is the largest plaintext the caller will send as one record (0 counts as 1);
 /// [`send_bytes`] splits larger writes, so 1 suits a caller that sends only through it. One
-/// frame must hold such a record: `min_plain` plus 76 B of record overhead must fit the
-/// backend's frame size and the socket's send buffer, `min_plain` must be at most 16384, and
-/// `config.max_fragment_size`, if set, at least `min_plain + 5`. Otherwise the result is
-/// `Setup(RoomTooSmall)`, before anything is sent.
+/// frame must hold such a record: `min_plain.max(1)` plus 76 B of record overhead must fit
+/// the Net's frame size and the socket's send buffer, and `min_plain` must be at most 16384.
+/// `config.max_fragment_size`, if set, must be in rustls's range 32..=16389 and at least
+/// `min_plain.max(1) + 5`. The stream and server name are checked first. If those checks
+/// succeed, values outside rustls's range return `Tls(Tls(BadMaxFragmentSize))`.
+/// Insufficient frame or plaintext room returns `Setup(RoomTooSmall)` unless an earlier
+/// check failed. Nothing is sent for these errors.
 ///
 /// The handshake waits on the server. A rejected handshake also waits, until the alert and FIN
 /// it sends are acknowledged or the connection ends. Bound the call with

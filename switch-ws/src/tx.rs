@@ -35,21 +35,23 @@ const CLOSE: u8 = 8;
 const PONG: u8 = 10;
 const FIN: u8 = 0x80;
 
-/// Why a connection failed, inside `Error::Failed`. The first failure is kept: every later
-/// `send`, `close` and `recv` reports it. Before `recv` returns it, the connection delivers
-/// what it still owes the peer, so the connection may be dropped then; if the peer may still be
-/// sending, call `linger` first so that the drop sends no reset.
+/// Why a connection failed, inside `Error::Failed`.
+///
+/// A stored failure is kept. A send-side `Dead` need not be stored: `recv` can still parse
+/// buffered input, find the peer's WebSocket close frame and return `Ok(None)`. Before reporting a
+/// stored failure, `recv` waits for owed output to be delivered or the connection to end.
+/// If the peer may still be sending, call `linger` before dropping to avoid a reset.
 ///
 /// | Failure | Cause | Sent before it is reported |
 /// |---|---|---|
-/// | `Protocol(e)` | The peer broke the WebSocket protocol. | close_notify (over TLS) and FIN; no close frame. |
-/// | `PeerEof` | The peer's FIN, or its close_notify, came before its close frame. | close_notify (over TLS) and FIN. |
+/// | `Protocol(e)` | The peer broke the WebSocket protocol. | close_notify (over TLS) and FIN; no WebSocket close frame. |
+/// | `PeerEof` | The peer's close_notify, or a FIN without TLS, came before its WebSocket close frame. | close_notify (over TLS) and FIN. |
 /// | `Tls(Truncated)` | Over TLS: TCP ended without close_notify. | FIN. |
 /// | `Tls(Tls(e))` | Over TLS: a record from the peer failed. | The TLS alert and FIN. |
-/// | `Dead` | The socket closed or reset before the peer's close frame, or was dead at setup. A reset after the peer's close frame is a clean end. | Nothing. |
+/// | `Dead` | The socket closed or reset before the peer's WebSocket close frame, or was dead at setup. A reset after the peer's WebSocket close frame is a clean end. | Nothing. |
 #[derive(Clone, Debug, PartialEq)]
 pub enum Failure {
-    /// The peer broke the WebSocket protocol; no close frame is sent.
+    /// The peer broke the WebSocket protocol; no WebSocket close frame is sent.
     Protocol(ProtocolError),
     /// The peer ended its stream before its WebSocket close.
     PeerEof,
@@ -95,8 +97,8 @@ fn header_len(len: usize, masked: bool) -> usize {
     2 + ext + if masked { 4 } else { 0 }
 }
 
-/// Bytes of the largest control frame `role` sends: 125 B of payload and its header (masked as
-/// a client). Every frame room must carry it.
+/// Bytes of the largest WebSocket control frame `role` sends: 125 B of payload and its header
+/// (masked as a client). Every frame's plaintext room must carry it.
 pub(crate) fn max_control_frame(role: Role) -> usize {
     header_len(125, role == Role::Client) + 125
 }

@@ -1,4 +1,4 @@
-//! The client side of the junction daemon, `switch-junctiond`, which owns one network card
+//! The client side of `switch-junctiond`, the daemon that owns one network card
 //! and lets several programs on the same machine use it. A [`session::Session`] connects to
 //! the daemon and opens TCP and UDP sockets on its card; packet data moves through shared
 //! memory. Applications reach this as `switch::junction`, and usually hand a connected

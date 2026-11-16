@@ -1090,8 +1090,8 @@ fn missing_requested_offload_is_error() {
     });
 }
 
-/// A readback holding any offload bit outside the requested set fails, with
-/// or without a requested profile.
+/// A readback holding an unrequested offload bit other than TX `MULTI_SEGS` fails, with or
+/// without a requested profile.
 #[switch_test_support::pinned_test]
 fn unrequested_offload_is_error() {
     with_test_eal(|eal| {

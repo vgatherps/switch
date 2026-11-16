@@ -38,7 +38,7 @@ impl DynDepot {
     ///
     /// # Panics
     ///
-    /// When the next slot numbers would not fit in a `u32`.
+    /// When growing would exceed 4,294,967,232 slots.
     #[inline]
     pub fn alloc(&mut self) -> u32 {
         let Some(top) = self.summary.iter().position(|&bits| bits != 0) else {
@@ -74,8 +74,9 @@ impl DynDepot {
     ///
     /// # Panics
     ///
-    /// If `alloc` never reached `slot`. A double free panics only in debug builds; in
-    /// release builds it goes undetected.
+    /// A slot outside the allocated bitmap panics. A slot that is already free, including an
+    /// unused slot in an allocated bitmap word, panics only in debug builds; release builds
+    /// do not detect it.
     #[inline]
     pub fn free(&mut self, slot: u32) {
         let word = slot as usize / 64;

@@ -9,9 +9,8 @@ body runs at spawn; arguments its returned future does not capture are dropped
 then. The future runs when the runtime polls it.
 
 The function keeps its name, visibility, generics and attributes. Type and const
-generics, `where` clauses and `impl Trait` arguments are supported. Each generic
-instantiation has its own task pool. The future and its output must be
-`'static`; neither has to be `Send`. The future and task metadata must fit in a
+generics, `where` clauses and `impl Trait` arguments are supported. The future and
+its output must be `'static`; neither has to be `Send`. The future and task metadata must fit in a
 64 KiB task block, checked at compile time.
 
 Arguments must be plain identifiers, optionally `mut`. The attribute takes no

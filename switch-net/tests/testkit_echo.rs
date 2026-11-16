@@ -1,4 +1,4 @@
-//! A switch-net client against a kernel TCP echo peer on a tap device, on both backends:
+//! A switch-net client against a kernel TCP echo peer on a tap card, owned or shared:
 //! the testkit example of the book's "Writing tests that use DPDK" page.
 //! Needs CAP_NET_ADMIN and /dev/net/tun (the Docker test container).
 

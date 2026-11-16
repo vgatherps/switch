@@ -316,8 +316,9 @@ impl<F: RxFrame, L: FrameTx> TlsRx<F, L> {
         self.discard();
     }
 
-    /// Drops everything held: the frame, the bytes kept in scratch, the run. The caller reads
-    /// no more: `chunk` returns `Ok(None)` until a `push`, and nothing should be pushed.
+    /// Drops the buffered frame, any partly received record and the current plaintext without
+    /// changing whether the stream is open, closed or failed. A failed stream keeps returning
+    /// its error. Push nothing afterwards.
     pub fn discard(&mut self) {
         self.frame = None;
         self.scratch.clear();

@@ -627,12 +627,12 @@ impl fmt::Debug for Port {
 }
 
 impl Port {
-    /// Configure and start one queue pair with exactly the requested offloads.
-    /// A requested offload the PMD does not support fails before pool
-    /// acquisition; a configuration that does not read back exactly the
-    /// requested set fails setup.
+    /// Configure and start one queue pair with the requested offloads.
+    /// A requested offload the PMD does not support fails before pool acquisition.
+    /// The requested offloads must read back unchanged; the only extra bit allowed is
+    /// TX `MULTI_SEGS`, which ENA enables automatically.
     ///
-    /// Before both pools are acquired, errors leave the ethdev with the caller.
+    /// Before all three pools are acquired, errors leave the ethdev with the caller.
     /// After acquisition, setup owns the ethdev and rolls it back on failure.
     /// Failed rollback returns its actual retained owner in `PortOpenError`.
     ///

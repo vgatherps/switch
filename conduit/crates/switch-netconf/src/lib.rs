@@ -1,4 +1,4 @@
-//! The network config file: the JSON file that describes one NIC port for a program that
+//! The network config file: the JSON file that describes one network card for a program that
 //! owns the card, and the library behind the `switch-netconf` command.
 //!
 //! Applications reach [`Config`] and its parts as `switch::nic::Config` and so on, and pass

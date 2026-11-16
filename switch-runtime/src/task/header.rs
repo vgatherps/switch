@@ -15,7 +15,7 @@ pub(crate) const DROP_STARTED: u8 = 16;
 /// cleared when the slot is freed.
 pub(crate) const TAKEN: u8 = 8;
 /// With QUEUED: the queue entry was put in `deferred` (`StoredWaker::wake_deferred`).
-/// Cleared with QUEUED when the task's round takes the entry, or by an upgrade. Bit 2, next to LIVE and QUEUED:
+/// Cleared with QUEUED when the task's pass takes the entry, or by an upgrade. Bit 2, next to LIVE and QUEUED:
 /// the wake check's mask `LIVE | QUEUED | DEFERRED` (0b111) is then one AArch64
 /// logical immediate.
 pub(crate) const DEFERRED: u8 = 4;

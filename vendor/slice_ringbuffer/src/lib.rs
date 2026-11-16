@@ -1,4 +1,4 @@
-//! Junction's receive ring: one writer (the daemon) and one reader (an application's
+//! A session's receive ring: one writer (the daemon) and one reader (an application's
 //! session) over shared memory. Each record is a [`PacketMeta`] and a payload, and the reader
 //! gets each payload back as a frame that points into the ring. Applications see only
 //! `PacketMeta`, as `switch::junction::rx::PacketMeta`.
@@ -330,7 +330,8 @@ pub struct RingReader {
 impl RingReader {
     /// Opens the ring in `backing` and claims its reader place, for the life of the ring: a
     /// second open fails with `AlreadyExists`, even after the first reader is dropped. Fails
-    /// with `InvalidData` if the backing does not hold a valid ring. Does not keep `backing`.
+    /// with `InvalidData` for invalid ring headers or cursors; a backing too short for its
+    /// mappings can return `InvalidInput`. Does not keep `backing`.
     pub fn open(backing: &Backing) -> io::Result<RingReader> {
         let page = backing.page_size()?;
         let header = Mapping::new(backing.fd(), 0, page)?;

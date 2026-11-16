@@ -50,7 +50,8 @@ impl From<Unavailable> for RuntimeError {
 /// What one [`Runtime::poll`] did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PollReport {
-    /// Calls this poll made into task futures. A task woken twice in one poll counts twice.
+    /// Calls this poll made into task futures. A task polled twice counts twice; repeated
+    /// wakes while it is already queued coalesce.
     pub tasks_polled: usize,
     /// Tasks that have not finished, including tasks parked on a timer or waiting for a
     /// wake. Zero once every spawned task has finished.
@@ -61,8 +62,8 @@ pub struct PollReport {
 ///
 /// Implements `Debug` (which omits the token) but not `Display` or `std::error::Error`.
 pub struct SpawnError<T> {
-    /// [`RuntimeError::Closed`] or [`RuntimeError::Panicked`]. A spawn is never refused for
-    /// lack of space: task storage grows as needed.
+    /// [`RuntimeError::Closed`] or [`RuntimeError::Panicked`]. Task storage grows as needed;
+    /// exhausting its slot numbers panics the spawn rather than returning this error.
     pub reason: RuntimeError,
     /// The task, not started. Dropping it drops its arguments.
     pub token: SpawnToken<T>,
@@ -153,13 +154,13 @@ impl Control {
 /// A `Runtime` is neither `Send` nor `Sync`: it is created, polled and dropped on one
 /// thread, and its tasks run on that thread. Tasks are started through a [`Spawner`].
 ///
-/// Task storage grows as tasks are spawned, so the number of live tasks has no limit. Each
-/// task's future must fit in a 64 KiB block; a larger one is a compile error. That memory
-/// is never returned to the system, also after the runtime is dropped, so a program
-/// creates one runtime and keeps it until it exits.
+/// Task storage grows as tasks are spawned. In each runtime, each task function and each
+/// generic instantiation of one numbers its slots separately; a spawn needing more than
+/// 4,294,967,232 slots for one of them panics. Each task's future must fit in a 64 KiB block;
+/// a larger one is a compile error. That memory is never returned to the system, also
+/// after the runtime is dropped, so a program creates one runtime and keeps it until it exits.
 ///
-/// Dropping a `Runtime` is the same as [`Runtime::shutdown`]. Dropping it from the
-/// destructor of one of its own tasks while that shutdown runs aborts the process.
+/// Dropping a `Runtime` is the same as [`Runtime::shutdown`].
 pub struct Runtime {
     control: Rc<Control>,
 }
@@ -197,12 +198,12 @@ impl Runtime {
     ///    before `now` wakes its task; these become ready after the tasks already ready,
     ///    earliest deadline first.
     /// 5. If the last poll was ended by [`request_turn`](crate::request_turn), the tasks
-    ///    left in its round run first.
-    /// 6. Ready tasks run in rounds. A round runs each task that was ready when the round
+    ///    left in its pass run first.
+    /// 6. Ready tasks run in passes. A pass runs each task that was ready when the pass
     ///    started, until it returns `Pending` or finishes; a task woken or spawned during a
-    ///    round runs in the next one. Rounds continue until no task is ready, or until 1024
-    ///    task polls were made. The limit is checked between rounds, so one poll can make
-    ///    more than 1024. A task that calls `request_turn` ends the poll as soon as it
+    ///    pass runs in the next one. Passes continue while tasks are ready and fewer than
+    ///    1024 task polls have been made. The limit is checked only between passes, so one
+    ///    call can exceed 1024. A task that calls `request_turn` ends the poll as soon as it
     ///    returns. Ready tasks left over run in the next poll.
     ///
     /// Tasks are never interrupted: a task keeps the thread until it awaits something not
@@ -254,7 +255,7 @@ impl Runtime {
     /// |---|---|
     /// | [`Runtime::poll`] | `Err(RuntimeError::Closed)` |
     /// | [`Spawner::spawn`], [`Spawner::spawn_join`] | [`SpawnError`] with reason `Closed` |
-    /// | [`Spawner::sleep`], [`Spawner::sleep_until`], awaiting a [`Sleep`](crate::Sleep) | `Err(SleepError::Closed)` |
+    /// | [`Spawner::sleep`], [`Spawner::sleep_until`], awaiting an unresolved [`Sleep`](crate::Sleep) | `Err(SleepError::Closed)`; a completed sleep keeps its result |
     /// | awaiting the [`JoinHandle`] of an unfinished task | `Err(Canceled)` |
     /// | a wake from another thread ([`RemoteWaker`](crate::RemoteWaker) or a task's `Waker`) | dropped |
     ///
@@ -274,8 +275,7 @@ impl Drop for CleanupContinuation<'_> {
     }
 }
 
-/// Shuts the runtime down, as [`Runtime::shutdown`]. Dropping the `Runtime` from a task
-/// destructor that this shutdown runs aborts the process.
+/// Shuts the runtime down, as [`Runtime::shutdown`].
 impl Drop for Runtime {
     fn drop(&mut self) {
         let _continuation = CleanupContinuation(&self.control);
@@ -330,12 +330,12 @@ impl Spawner {
     /// Starts a task, detached: its return value is dropped when it completes.
     ///
     /// The task does not run inside `spawn`. It first runs in the next [`Runtime::poll`],
-    /// or, when a running task spawns it, in a later round of the current poll. For a task
+    /// or, when a running task spawns it, in a later pass of the current poll. For a task
     /// function written as a plain `fn` returning a future, the function's body runs here,
     /// to build the future.
     ///
-    /// If that body shuts down or drops the runtime, the runtime closes at once and its
-    /// tasks, this one included, are dropped before `spawn` returns `Ok`.
+    /// If that body shuts down or drops the runtime, the runtime closes to new work at once.
+    /// Its tasks, including the new one, are dropped before `spawn` returns `Ok`.
     ///
     /// # Errors
     ///
@@ -345,6 +345,9 @@ impl Spawner {
     ///
     /// At most 65,535 distinct threads in a process can spawn tasks; a spawn on the next
     /// new thread panics.
+    ///
+    /// Panics when no slot is free among the 4,294,967,232 slots available in this runtime
+    /// for this task function and generic instantiation.
     #[inline]
     pub fn spawn<T: Task>(&self, token: SpawnToken<T>) -> Result<(), SpawnError<T>> {
         self.submit(token, None)

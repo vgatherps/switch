@@ -1,5 +1,5 @@
-//! `Runtime::poll` drains `incoming` in rounds up to the poll budget;
-//! `StoredWaker::wake_deferred` and `yield_now` move a task to the next poll.
+//! `Runtime::poll` drains `incoming` in passes up to the poll budget;
+//! `StoredWaker::wake_deferred` and `yield_now` defer a task unless an ordinary wake upgrades it.
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
@@ -178,7 +178,7 @@ async fn defers(name: &'static str, wakers: Wakers, log: Log) {
     log.borrow_mut().push(name);
 }
 
-/// Wakes `wakers[index]` ordinarily, `times` times, after `rounds` self-wakes.
+/// Wakes `wakers[index]` ordinarily, `times` times, after `rounds` self-wakes (scheduling passes).
 #[switch_runtime::task]
 async fn wakes(wakers: Wakers, index: usize, times: usize, rounds: usize) {
     for _ in 0..rounds {

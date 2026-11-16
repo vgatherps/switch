@@ -15,10 +15,7 @@ const KEY_UPDATE_LEN: usize = RECORD_HEAD + 4 + 1 + RECORD_TAIL;
 const KEY_UPDATE_ROOM: usize = 2 * KEY_UPDATE_LEN;
 /// Room per frame that is not plaintext.
 pub(crate) const OVERHEAD: usize = RECORD_HEAD + RECORD_TAIL + KEY_UPDATE_ROOM;
-/// close_notify's plaintext length (an alert). Through [`FrameTx::room`],
-/// `room(CLOSE_NOTIFY_LEN)` waits for room for a sealed close_notify with the most KeyUpdates
-/// that may precede it, not for a full frame. [`TlsTx::send_close_notify`] seals first and waits
-/// for room for the bytes it actually sealed instead.
+/// close_notify's plaintext length in bytes.
 pub const CLOSE_NOTIFY_LEN: usize = 2;
 
 /// Most plaintext rustls puts in one record without a client `max_fragment_size` (TLS's 2^14).
@@ -32,10 +29,11 @@ pub(crate) fn plain_room(room: usize, max_fragment_size: Option<usize>) -> usize
     (room - OVERHEAD).min(record)
 }
 
-/// A frame holding encrypted records, ready for `try_send`. Only [`TlsTx`] makes one, and only
-/// [`TlsTx::try_send`](FrameTx::try_send) takes one, so a frame that was not sealed cannot be
-/// sent in its place. Its records used sequence numbers: dropped unsent, it breaks every later
-/// record ([`TxError::Broken`]).
+/// A frame holding encrypted records, ready for `try_send`.
+///
+/// Only [`TlsTx`] makes one, and only [`TlsTx::try_send`](FrameTx::try_send) takes one, so a
+/// frame that was not sealed cannot be sent in its place. Its records used sequence numbers:
+/// dropped unsent, it breaks every later record ([`TxError::Broken`]).
 #[derive(Debug)]
 pub struct Sealed<S>(S);
 

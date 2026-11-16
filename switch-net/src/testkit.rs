@@ -1,4 +1,4 @@
-//! A Net on a DPDK net_tap Port, for Docker tests and drivers against kernel-side peers
+//! A Net on a DPDK `net_tap` virtual card, for Docker tests against kernel-side peers
 //! (feature `testkit`). Switch is 192.0.2.2/24; the kernel netdev gets 192.0.2.1/24, where the
 //! peer listens.
 
@@ -31,7 +31,7 @@ pub enum Backend {
     Junction,
 }
 
-/// A client Net plus the optional junction host driven on the same test thread.
+/// A client Net plus an optional in-process daemon driven on the same test thread.
 pub struct TapNet {
     net: Net,
     host: Option<host::Host>,
@@ -100,9 +100,9 @@ impl Clock {
     }
 }
 
-/// Runs `body` on a Net over a fresh net_tap Port, locally or through junction.
-/// `body` must drop every handle, socket and frame it made; then the host gives its Stack
-/// back, the Port closes with every buffer returned and the vdev is removed.
+/// Runs `body` on a Net over a fresh `net_tap` card, owned here or shared through the daemon.
+/// `body` must drop every handle, socket and frame it made; then the host gives its network
+/// stack back, the card closes with every buffer returned and the virtual device is removed.
 pub fn with_tap_net<T>(backend: Backend, config: &TapConfig, body: impl FnOnce(&mut TapNet, &Clock) -> T) -> T {
     let name = |format: &str| CString::new(format.replace("{}", config.name)).unwrap();
     let (vdev, iface) = (name("net_tap_{}"), name("cdtap_{}"));

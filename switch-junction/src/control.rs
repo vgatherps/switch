@@ -162,7 +162,8 @@ pub struct UdpConfig {
     pub local: ListenEndpoint,
     /// Received datagrams the daemon's stack holds for this socket before it drops more; nonzero.
     pub rx_queue: u32,
-    /// Compute the UDP checksum of sent datagrams in software, or write 0.
+    /// Compute the UDP checksum in software, or write 0, unless the daemon's card has UDP
+    /// checksum offload enabled; then the card computes it either way.
     pub tx_checksum: bool,
     /// Allow sending to the broadcast address.
     pub broadcast: bool,

@@ -4,7 +4,7 @@ use smoltcp::iface::{OwnedIpv4, PathMtu, PathMtus, MIN_IP_MTU};
 use smoltcp::wire::{EthernetAddress, IpAddress, Ipv4Address, Ipv4Cidr};
 use std::{fmt, fs, path::Path, str::FromStr};
 
-/// Error for a port or path MTU below `MIN_IP_MTU`.
+/// Error for a card or path MTU below `MIN_IP_MTU`.
 const MTU_TOO_SMALL: &str = "must be at least 88 (48-byte minimum TCP MSS + 40 bytes of headers)";
 
 /// A loaded, validated network config file.
@@ -27,7 +27,7 @@ pub struct Config {
     /// the subnet, other than `ipv4`'s address and the subnet's network and broadcast
     /// addresses.
     pub gateway: Option<Ipv4Address>,
-    /// IPv4 addresses the Stack owns besides `ipv4`: single addresses (/32) and prefixes. Sorted,
+    /// IPv4 addresses the network stack owns besides `ipv4`: single addresses (/32) and prefixes. Sorted,
     /// none inside another (duplicates and contained entries are dropped on load). Ownership
     /// only: `ipv4` keeps routing, the subnet broadcast and the default source.
     pub owned_ipv4: Vec<Ipv4Cidr>,
@@ -46,8 +46,6 @@ pub struct Config {
 }
 
 /// The device to open. In JSON, an object with the [`PciDevice`] keys, or `{"vdev": "..."}`.
-/// A malformed `device` object fails with serde's
-/// `data did not match any variant of untagged enum Device`, which names no key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum Device {
@@ -117,9 +115,11 @@ pub struct EalConfig {
     pub extra: Vec<String>,
 }
 
-/// Why a config file was refused. `Display` gives the message, which names the key for
-/// every rule except a malformed `device` object, for example `gateway: gateway must be
-/// inside the IPv4 subnet`. A file that cannot be read gives `<path>: <io error>`.
+/// Why a config file was refused.
+///
+/// `Display` gives the message, which names the key for every rule except a malformed
+/// `device` object, for example `gateway: gateway must be inside the IPv4 subnet`.
+/// A file that cannot be read gives `<path>: <io error>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigError(pub(crate) String);
 
@@ -473,7 +473,7 @@ impl Config {
     /// The path MTU toward `addr`: the `mtu` of the longest matching prefix, capped at
     /// [`mtu`](Self::mtu). When `paths` has rules, the own subnet counts as one more rule at
     /// `mtu` unless a rule names that prefix; an unmatched destination, or any destination
-    /// with no rules, gets `mtu`. This is the lookup the Stack uses, so `path_mtu(addr) - 40`
+    /// with no rules, gets `mtu`. This is the lookup the network stack uses, so `path_mtu(addr) - 40`
     /// is the largest TCP segment payload toward `addr`, a value for `tcp::Config::mss_cap`.
     ///
     /// # Panics

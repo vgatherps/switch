@@ -1,7 +1,7 @@
 //! The messages between cephalopod's consumer (`ceph-fifo`) and its control thread
 //! (`ceph-control`), and the stream-id layout they share. A program wiring
 //! `ceph_control::Listener` to `ceph_fifo::Fifo` creates one `std::sync::mpsc` channel of
-//! [`Control`] and one of [`Retire`]. The junction daemon and its client use the same types.
+//! [`Control`] and one of [`Retire`]. The daemon and its client use the same types.
 
 /// A stream id as carried in every record: the slot index in the high 32 bits, the unique id
 /// in the low 32 bits.

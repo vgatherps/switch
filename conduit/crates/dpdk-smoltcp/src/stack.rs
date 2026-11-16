@@ -36,7 +36,7 @@ pub fn os_random_seed() -> std::io::Result<u64> {
 /// [`StackError::InvalidConfig`] naming it.
 #[derive(Debug, Clone, Copy)]
 pub struct StackConfig<'a> {
-    /// The MAC address the Stack sends from. Unicast and nonzero; normally the device's own,
+    /// The MAC address the network stack sends from. Unicast and nonzero; normally the device's own,
     /// `EthernetAddress(device_info(&eal, port_id)?.mac)`.
     pub ethernet: EthernetAddress,
     /// The interface address and its connected subnet.
@@ -47,12 +47,12 @@ pub struct StackConfig<'a> {
     /// address (a /31 has neither, RFC 3021).
     pub gateway: Option<Ipv4Address>,
     /// Per-destination path MTUs. Longest prefix wins. The interface subnet
-    /// gets an implicit Port-MTU rule unless an explicit same-prefix rule replaces it.
-    /// Results are clamped to the Port IP MTU; unmatched destinations use that MTU.
-    /// Empty paths give every destination the Port IP MTU.
+    /// gets an implicit card-MTU rule unless an explicit same-prefix rule replaces it.
+    /// Results are clamped to the card's IP MTU; unmatched destinations use that MTU.
+    /// Empty paths give every destination the card's IP MTU.
     /// TCP connects cap MSS at path MTU minus 40. Copied at `Stack::new`.
     pub paths: &'a [PathMtu],
-    /// Addresses the Stack owns besides `ipv4`'s address: single addresses
+    /// Addresses the network stack owns besides `ipv4`'s address: single addresses
     /// (/32) and prefixes, inside or outside the subnet. It answers ARP for
     /// each and accepts IPv4 traffic to each; routing, the subnet broadcast
     /// and the default source stay with `ipv4`. Duplicates and overlaps are
@@ -74,8 +74,8 @@ pub struct StackConfig<'a> {
     /// Received packets held between the RX burst and processing. Must be positive. Each
     /// `receive` or `turn` processes at most its `ingress_budget`; the rest wait here.
     pub rx_staging: usize,
-    /// Capacity of the Stack's pending TX frame queue: frames built but not yet accepted by
-    /// the PMD. Must be positive. While it is full, UDP sends return `WouldBlock` and
+    /// Capacity of the network stack's pending TX frame queue: frames built but not yet accepted by
+    /// the card. Must be positive. While it is full, UDP sends return `WouldBlock` and
     /// `send` can only flush.
     pub tx_pending: usize,
 }
@@ -86,11 +86,11 @@ pub struct StackConfig<'a> {
 /// `Debug` form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StackError {
-    /// From `new`: a [`StackConfig`] rule failed, the start time is before zero, the port's
+    /// From `new`: a [`StackConfig`] rule failed, the start time is before zero, the card's
     /// IP MTU is from 68 to 87, or a path MTU is below 88 (the smallest MTU that carries a
     /// 48-byte TCP segment).
     InvalidConfig(&'static str),
-    /// From `new`: the port's IP MTU is below 68.
+    /// From `new`: the card's IP MTU is below 68.
     IpMtuBelowIpv4Minimum { mtu: u16 },
     /// From `new`: the TX pool holds fewer than `tx_reserve(TX descriptors, tx_pending)` mbufs.
     TxPoolTooSmall { count: usize, required: usize },
@@ -99,9 +99,9 @@ pub enum StackError {
     /// From `new`: the RX pool holds fewer than `rx_reserve(RX descriptors, rx_burst, rx_staging, cache size)` mbufs.
     RxPoolTooSmall { count: usize, required: usize },
     /// From `receive` or `turn`: `now` is earlier than the last time. Nothing was done; the
-    /// Stack stays usable.
+    /// network stack stays usable.
     TimeWentBackwards { last: Instant, now: Instant },
-    /// From a drive call: the NIC driver failed, or the port could not be recovered after a
+    /// From a drive call: the card's driver failed, or the card could not be recovered after a
     /// device reset. Later calls fail too: [`Stack::into_port`], then
     /// [`Port::try_close`](crate::Port::try_close).
     Port(PortError),
@@ -142,7 +142,7 @@ pub enum AddUdpError {
     PortInUse,
     /// The port or `rx_queue` is zero.
     InvalidConfig(&'static str),
-    /// `UdpConfig::local_addr` is not an address this Stack owns.
+    /// `UdpConfig::local_addr` is not an address this network stack owns.
     Unaddressable,
 }
 
@@ -150,7 +150,7 @@ pub enum AddUdpError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UdpSendFrameError {
     Udp(UdpSendError),
-    /// The frame is not from this Stack's frame pool.
+    /// The frame is not from this network stack's frame pool.
     Foreign,
 }
 
@@ -162,21 +162,21 @@ pub struct TcpReadyKey(SocketHandle);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UdpReadyKey(smoltcp::iface::UdpHandle);
 
-/// Outcome of one `Stack::turn` or `Stack::receive`.
+/// Counters from one receive step or combined network turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Turn {
     /// Packets this call's RX burst accepted into staging. Rejected packets are counted only
     /// in `rx_rejected`.
     pub rx_received: usize,
     /// Packets this turn's RX burst released: unsupported, or a bad IPv4
-    /// header checksum reported by the NIC (see `RxBurst::rejected`).
+    /// header checksum reported by the card (see `RxBurst::rejected`).
     pub rx_rejected: usize,
     /// Staged packets handed to smoltcp this turn.
     pub rx_processed: usize,
     /// Packets still staged after ingress: the budget ran out. Receiving never
     /// waits for TX room; a reply that finds none is dropped.
     pub rx_staged: usize,
-    /// Packets the PMD accepted across this call's flushes.
+    /// Packets the card accepted across this call's flushes.
     pub tx_accepted: usize,
     /// Packets still pending after this call.
     pub tx_pending: usize,
@@ -190,18 +190,18 @@ impl Turn {
     }
 }
 
-/// Outcome of one `Stack::send` or `Stack::flush`.
+/// Counters from one network send or flush.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sent {
-    /// Packets the PMD accepted in the final flush.
+    /// Packets the card accepted in the final flush.
     pub tx_accepted: usize,
     /// Packets still pending after it.
     pub tx_pending: usize,
 }
 
-/// A TCP/UDP stack over one owned [`Port`], driven by the caller's loop.
+/// A TCP/UDP network stack over one owned card ([`Port`]), driven by the caller's loop.
 ///
-/// The Stack, its sockets, handles, and every frame and datagram it hands out stay on the
+/// The network stack, its sockets, handles, and every frame and datagram it hands out stay on the
 /// thread that started DPDK. It reads no clock and never waits: each call does the work
 /// possible now and returns.
 ///
@@ -211,7 +211,7 @@ pub struct Sent {
 ///
 /// 1. [`receive`](Self::receive)`(now, ingress_budget)`: take in arriving packets and process
 ///    up to `ingress_budget` of them; replies built while receiving (resets, immediate ACKs,
-///    ARP replies) are flushed to the NIC.
+///    ARP replies) are flushed to the card.
 /// 2. The application reads and writes its sockets.
 /// 3. [`send`](Self::send)`()`: build what the sockets want to send, including what the
 ///    application just wrote, and flush.
@@ -220,7 +220,7 @@ pub struct Sent {
 /// application then writes leaves on the next pass. Everything egress builds (data,
 /// SYN-ACKs, retransmissions, delayed ACKs, window updates) leaves only in `send` or
 /// `turn`, so keep the application step between `receive` and `send` short.
-/// [`flush`](Self::flush) only hands pending packets to the NIC.
+/// [`flush`](Self::flush) only hands pending packets to the card.
 ///
 /// After a call, `rx_staged > 0` means the ingress budget ran out: call again promptly.
 /// `tx_pending > 0` means the driver did not take everything: call `flush` until nothing is
@@ -239,7 +239,7 @@ pub struct Sent {
 ///
 /// A loop on a pinned CPU calls again at once. A loop that sleeps when a call was idle
 /// ([`Turn::moved`] false) must cap the sleep: [`poll_at`](Self::poll_at) covers socket
-/// timers only, not packets arriving at the NIC, staged or pending packets, or ARP probes.
+/// timers only, not packets arriving at the card, staged or pending packets, or ARP probes.
 /// The repository's loops sleep `min(poll_at - now, 1 ms)`, and 1 ms when it is `None`.
 ///
 /// # TCP behaviour
@@ -259,7 +259,7 @@ pub struct Sent {
 /// most out-of-order frames release them, farthest past the gap first, until the pool
 /// recovers; peers retransmit what was released. In-order data is never released.
 ///
-/// A device reset requested by the NIC driver (ENA's health watchdog, run among DPDK's
+/// A device reset requested by the card's driver (ENA's health watchdog, run among DPDK's
 /// timers once a second) is recovered at the start of the next `receive` or `turn`; see
 /// [`turn`](Self::turn). [`port_resets`](crate::port_resets) counts recoveries.
 ///
@@ -272,14 +272,15 @@ pub struct Sent {
 /// [`Offloads::tx_tcp_checksum`](crate::Offloads::tx_tcp_checksum) and
 /// [`Offloads::tx_udp_checksum`](crate::Offloads::tx_udp_checksum)).
 ///
-/// A panic unwinding out of any of them leaves the Stack unusable: drop it or
+/// A panic unwinding out of any of them leaves the network stack unusable: drop it or
 /// call `into_port`, nothing else.
 ///
-/// Every method taking a handle panics on a handle from another Stack. Other documented
+/// Every method taking a handle panics on a handle from another network stack. Other documented
 /// panics: [`add_tcp`](Self::add_tcp) with `rx_capacity` over 1 GiB or `mss_cap: Some(0)`;
 /// `tcp::tx_mbuf_budget` with an IP MTU below 68 or `mss_cap: Some(0)`;
 /// `set_initial_window(0)`, `set_ack_delay` over 60 s and `set_hop_limit(Some(0))` on a
-/// socket; a stale readiness key in a release build (see [`arm_tcp`](Self::arm_tcp)).
+/// socket; an out-of-range readiness key. Debug builds also reject stale readiness keys;
+/// in release builds a stale in-range key can arm the wrong socket (see [`arm_tcp`](Self::arm_tcp)).
 pub struct Stack {
     iface: Interface,
     /// Exactly `max_sockets` slots, never grown.
@@ -291,7 +292,7 @@ pub struct Stack {
     max_sockets: usize,
     max_udp_sockets: usize,
     ip_mtu: u16,
-    /// Holds every staged and pending packet; its Port drops after them.
+    /// Holds every staged and pending packet; its `Port` drops after them.
     device: Device,
     now: Instant,
     /// The first turn at or after this time runs DPDK's timers.
@@ -304,15 +305,15 @@ pub struct Stack {
 impl Stack {
     /// Validate `config`, then build the interface at time `now` with one IPv4
     /// address. Invalid config, or `now` before `Instant::ZERO`, returns the
-    /// Port unchanged with `InvalidConfig`.
-    /// IP MTU below 68 returns the Port with `IpMtuBelowIpv4Minimum`.
-    /// A TX pool below `tx_reserve` returns the Port with `TxPoolTooSmall`.
-    /// A frame pool below `frame_reserve` returns the Port with
-    /// `TxFramePoolTooSmall`: packets the PMD holds and pending packets can
+    /// [`Port`] unchanged with `InvalidConfig`.
+    /// IP MTU below 68 returns the `Port` with `IpMtuBelowIpv4Minimum`.
+    /// A TX pool below `tx_reserve` returns the `Port` with `TxPoolTooSmall`.
+    /// A frame pool below `frame_reserve` returns the `Port` with
+    /// `TxFramePoolTooSmall`: packets the card holds and pending packets can
     /// then never take the last frame. An RX pool below `rx_reserve` returns
-    /// the Port with `RxPoolTooSmall`: with the RX descriptors posted and the
+    /// the `Port` with `RxPoolTooSmall`: with the RX descriptors posted and the
     /// staging queue full, the pool could not stay above its low mark.
-    /// The negotiated TX descriptor count bounds sent mbufs held by NIC PMDs.
+    /// The negotiated TX descriptor count bounds sent mbufs held by card drivers.
     /// net_ring ignores that count and keeps sent mbufs on its attached ring
     /// instead: open it with TX descriptors equal to the TX ring size.
     ///
@@ -405,19 +406,19 @@ impl Stack {
         })
     }
 
-    /// One bounded turn at `now`: DPDK's timers once a second, device recovery if the PMD
+    /// One bounded turn at `now`: DPDK's timers once a second, device recovery if the driver
     /// asked for a reset, flush pending, one RX burst, maintenance, up to
     /// `ingress_budget` received packets, egress passes until one reports no
     /// socket progress or queues no frame, flush.
     ///
     /// Once a second (the first `turn` or `receive` at or after a second since the last) the
     /// turn calls `rte_timer_manage`, which runs DPDK timers due on this lcore: ENA's
-    /// health watchdog, which raises `RTE_ETH_EVENT_INTR_RESET` on a device fault. A Port
+    /// health watchdog, which raises `RTE_ETH_EVENT_INTR_RESET` on a device fault. A card
     /// with that event pending is reset, configured and started again before the RX burst:
     /// frames the device held return to their pools, staged and pending frames stay, sockets
     /// and neighbors are untouched, and TCP retransmits what the device dropped.
-    /// A failed recovery returns `StackError::Port` and leaves the Port not ready, so later
-    /// turns fail too: close the Stack.
+    /// A failed recovery returns `StackError::Port` and leaves the card not ready, so later
+    /// turns fail too: close the network stack.
     ///
     /// `now` earlier than the previous `new`/`turn`/`receive`
     /// time returns
@@ -443,7 +444,7 @@ impl Stack {
     /// At `now`: flush pending, one RX burst, maintenance, up to
     /// `ingress_budget` received packets, then flush again if frames are
     /// pending. Frames smoltcp built while processing received packets (RST,
-    /// immediate and challenge ACKs, ARP replies) are thus offered to the PMD
+    /// immediate and challenge ACKs, ARP replies) are thus offered to the card
     /// before the application step. Egress does not run: what sockets want to
     /// send, including what the application writes, waits for `send`.
     ///
@@ -487,7 +488,7 @@ impl Stack {
         })
     }
 
-    /// Push every pending frame to the PMD, burst after burst while it accepts
+    /// Push every pending frame to the card, burst after burst while it accepts
     /// everything offered. The unaccepted suffix stays pending in order;
     /// `tx_accepted` counts accepted frames and `tx_pending` counts that suffix.
     /// Retry on the caller's bounded cadence when frames remain pending.
@@ -511,7 +512,7 @@ impl Stack {
         self.iface.resolve_gateway(&mut self.device)
     }
 
-    /// Exclusive storage covering this Stack's full payload room: `len()` is the IP
+    /// Exclusive storage covering this network stack's full payload room: `len()` is the IP
     /// MTU − 28, the largest UDP payload. `None` when the pool is empty.
     /// Fill the payload, `truncate` to its length, then `freeze` to send.
     /// Dropping the frame returns it to the pool.
@@ -536,7 +537,7 @@ impl Stack {
         Ok(())
     }
 
-    /// Time check, DPDK timers once a second and recovery of a reset Port (see `turn`),
+    /// Time check, DPDK timers once a second and recovery of a reset card (see `turn`),
     /// tidying, flush, one RX burst, maintenance, then ingress. After ingress of a burst that
     /// returned packets, and on every turn after a reading below it, the RX pool is checked
     /// against the low mark (one RX ring refill plus one burst). While it is below, the TCP
@@ -592,7 +593,7 @@ impl Stack {
     }
 
     /// Egress passes at the stored time, then flush; returns the frames the
-    /// PMD accepted.
+    /// card accepted.
     fn egress(&mut self) -> Result<usize, StackError> {
         // Every pass that continues the loop queued a frame into the
         // fixed-capacity pending queue, so at most capacity + 1 passes run. A
@@ -628,7 +629,7 @@ impl Stack {
         self.max_udp_sockets
     }
 
-    /// The port's `PortConfig::tx_burst`: the most frames one flush burst offers the PMD.
+    /// The card's `PortConfig::tx_burst`: the most frames one flush burst offers the card.
     pub fn tx_burst(&self) -> usize {
         self.device.tx_burst_size()
     }
@@ -643,10 +644,10 @@ impl Stack {
     ///
     /// A non-empty DropQueue, or a dropped socket that reached CLOSED, reports
     /// the current time so the next turn processes or frees it.
-    /// It does not cover frames staged or pending in the Stack. When the last
+    /// It does not cover frames staged or pending in the network stack. When the last
     /// `turn` or `receive` reported `rx_staged > 0`, call it again promptly:
     /// the ingress budget ran out. When a call reported `tx_pending > 0`, the next
-    /// call progresses only once the PMD accepts frames or frees TX packets: retry
+    /// call progresses only once the card accepts frames or frees TX packets: retry
     /// on the caller's own bounded cadence, independent of this deadline. Pending frames leave through `flush`, or the flush inside
     /// `turn`, `receive` or `send`. When a call reported `tx_pending > 0`, call
     /// `flush` until nothing is pending, then `send`: `send` runs egress before
@@ -727,13 +728,13 @@ impl Stack {
         self.udp.get_mut(raw)
     }
 
-    /// Copy one datagram into the shared pending FIFO at this Stack's current
+    /// Copy one datagram into the shared pending FIFO at this network stack's current
     /// time, in call order with TCP frames; for payloads the caller already
     /// holds. To write a payload in place, fill a `tx_frame` and use
     /// `udp_send_frame`. `to` may be omitted for a connected socket. The packet
     /// leaves on `flush`, or the flush inside `turn`, `receive` or `send`.
     ///
-    /// The payload is copied into a frame from this Stack's frame pool, then sent as
+    /// The payload is copied into a frame from this network stack's frame pool, then sent as
     /// `udp_send_frame` sends a unique frame. Errors come in this order: the destination
     /// and size checks (`NoDestination`, `PeerMismatch`, `Unaddressable`, `TooLarge`),
     /// `WouldBlock` for an empty frame pool, the neighbor lookup (`NoRoute`,
@@ -753,7 +754,7 @@ impl Stack {
     /// | `NeighborPending` | The next hop's MAC is not known yet. An ARP request was queued and this datagram dropped: keep driving the loop, then send again. |
     /// | `WouldBlock` (pending queue) | The pending queue is full: flush, then retry. |
     ///
-    /// A learned neighbor stays usable while the Stack refreshes it, so sends through a
+    /// A learned neighbor stays usable while the network stack refreshes it, so sends through a
     /// resolved gateway do not hit `NeighborPending` unless more than `neighbor_capacity`
     /// neighbors evicted it.
     pub fn udp_send(
@@ -768,17 +769,18 @@ impl Stack {
     }
 
     /// Send `frame` as one datagram; `to` may be omitted for a connected
-    /// socket. On success the frame is the Stack's. A unique frame goes out in
-    /// place: its headers are written in front of its payload and its mbuf
+    /// socket. On success the frame belongs to the network stack. A unique frame at its original payload
+    /// start goes out in place: its headers are written in front of its payload and its mbuf
     /// joins the shared pending FIFO in call order, freed after TX completion.
-    /// A shared frame (cloned by the app) is copied into a new frame-pool frame as
-    /// `udp_send` does, and this reference is dropped. A zero-length frame is
-    /// an empty datagram.
+    /// A shared frame or one sliced to a later start is copied into a new frame-pool frame
+    /// as `udp_send` does, and this reference is dropped. A zero-length frame is an empty
+    /// datagram.
     ///
-    /// Every error returns the frame untouched. `Foreign`: the frame is from
-    /// another Stack's pool. Then `udp_send`'s errors in its order, except that
-    /// a unique frame needs no frame-pool copy and so cannot report the empty
-    /// pool; `WouldBlock` means flush, then retry.
+    /// Every error returns the frame untouched. `Foreign`: the frame is not from this
+    /// network stack's frame pool. Then `udp_send`'s errors in its order; only a unique frame at its
+    /// original payload start avoids a copy and cannot report an empty frame pool.
+    /// For other frames, `WouldBlock` can mean the frame pool is empty. Retry after capacity
+    /// returns.
     #[inline]
     pub fn udp_send_frame(
         &mut self,
@@ -813,9 +815,9 @@ impl Stack {
 
     /// Change a socket's data or settings and schedule a readiness check before the
     /// next `poll_at` call or egress pass. Connect, listen, close and abort go through
-    /// the Stack methods of those names. No public API hands out an owned socket, so
+    /// the network stack's methods of those names. No public API hands out an owned socket, so
     /// this reference cannot be overwritten with a new one; swapping it with a
-    /// socket held by another `TcpSet` or Stack is unsupported.
+    /// socket held by another `TcpSet` or network stack is unsupported.
     pub fn tcp_mut(&mut self, handle: &TcpHandle) -> &mut tcp::Socket<'static> {
         let raw = self.tcp_raw(handle);
         self.sockets.get_mut(raw)
@@ -826,7 +828,7 @@ impl Stack {
     /// unsent tail frame within one segment is copied there and freed at once; any
     /// other becomes its own send-queue entry, held until the peer ACKs its last byte,
     /// and one longer than the segment payload is cut at send. Errors return the frame
-    /// untouched: `Foreign` when it came from another Stack's `tx_frame`,
+    /// untouched: `Foreign` when it is not from this network stack's TX-frame pool,
     /// `InvalidState` unless the socket may send, `Empty` for a zero-length
     /// frame, and `Full` when it exceeds the socket's free bytes.
     pub fn tcp_send_frame(
@@ -846,7 +848,7 @@ impl Stack {
     /// | `tcp::ConnectError` | Meaning |
     /// |---|---|
     /// | `InvalidState` | The socket is not closed. |
-    /// | `Unaddressable` | A zero port on either side, an unspecified remote, a local address the Stack does not own, or no source address toward `remote`. |
+    /// | `Unaddressable` | A zero port on either side, an unspecified remote, a local address the network stack does not own, or no source address toward `remote`. |
     /// | `AddressInUse` | Another live socket, one in TIME-WAIT included, holds the same addresses and ports. |
     pub fn connect<T: Into<IpEndpoint>, U: Into<IpListenEndpoint>>(
         &mut self,
@@ -909,7 +911,7 @@ impl Stack {
     }
 
     /// Remove the socket immediately, freeing its slot and releasing its queued
-    /// TX frames (the PMD and pending queue keep their own references to frames
+    /// TX frames (the card and pending queue keep their own references to frames
     /// already sent).
     /// Discards unread received bytes and sends nothing on the wire.
     /// Frames the application still holds keep their RX mbufs until dropped.
@@ -924,8 +926,8 @@ impl Stack {
     }
 
     /// The socket's readiness key, checked against `handle` as `tcp` does: it belongs to this
-    /// Stack and names a live socket. Arming then runs on every park without repeating that
-    /// check. The key is valid for this Stack until the socket is removed; take it once per
+    /// network stack and names a live socket. Arming then runs on every park without repeating that
+    /// check. The key is valid for this network stack until the socket is removed; take it once per
     /// socket and keep it beside the handle.
     pub fn tcp_ready_key(&self, handle: &TcpHandle) -> TcpReadyKey {
         let raw = self.tcp_raw(handle);
@@ -941,7 +943,7 @@ impl Stack {
     /// returned once by [`Self::pop_fired`]; changes that do not alter readiness may fire it
     /// too, so check the socket's real state and arm again. Sending queued data, frames
     /// returning to the pool and idle calls fire nothing. `remove_tcp` disarms both halves,
-    /// and so does the Stack when it processes a dropped handle; `disarm_tcp` stops a token
+    /// and so does the network stack when it processes a dropped handle; `disarm_tcp` stops a token
     /// at once.
     ///
     /// Because `tcp_mut` fires the socket's tokens, arm after reading and writing the
@@ -949,7 +951,7 @@ impl Stack {
     /// the token it just armed.
     ///
     /// Only debug builds check that `key` still names a live socket; a key used after its
-    /// socket was removed, or on another Stack, misdirects the token to whatever socket holds
+    /// socket was removed, or on another network stack, misdirects the token to whatever socket holds
     /// that slot, where it fires spuriously, and panics if the slot does not exist.
     pub fn arm_tcp(&mut self, key: TcpReadyKey, side: ReadySide, token: u32) {
         self.sockets.arm(key.0, side, token);
@@ -969,7 +971,7 @@ impl Stack {
     }
 
     /// Arm `token` for the UDP socket's receive queue, replacing a token armed there; the next
-    /// queued datagram fires it as in [`Self::arm_tcp`]. `remove_udp`, or the Stack processing
+    /// queued datagram fires it as in [`Self::arm_tcp`]. `remove_udp`, or the network stack processing
     /// a dropped handle, disarms it. Key checks as in [`Self::arm_tcp`].
     pub fn arm_udp(&mut self, key: UdpReadyKey, token: u32) {
         self.udp.arm_rx(key.0, token);
@@ -1035,7 +1037,7 @@ impl Stack {
         self.dropped_tcp.clear();
     }
 
-    /// Mark the Port as if its PMD raised `RTE_ETH_EVENT_INTR_RESET`: the next `turn` or
+    /// Mark the card as if its driver raised `RTE_ETH_EVENT_INTR_RESET`: the next `turn` or
     /// `receive` recovers it.
     #[cfg(feature = "testing")]
     #[doc(hidden)]
@@ -1044,7 +1046,7 @@ impl Stack {
     }
 
     /// Drop sockets, interface and every staged and pending packet, then
-    /// return the Port for `Port::try_close`.
+    /// return the [`Port`] for `Port::try_close`.
     pub fn into_port(self) -> Port {
         let Self {
             iface,

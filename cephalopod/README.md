@@ -1,6 +1,6 @@
 # cephalopod
 
-Ordered messaging from many processes to one consumer over shared memory: each producer pushes into a ring for the CPU it is running on, and the consumer delivers every producer's stream in order. Junction's send path is built on it.
+Ordered messaging from many processes to one consumer over shared memory: each producer pushes into a ring for the CPU it is running on, and the consumer delivers every producer's stream in order. The daemon's send path is built on it.
 
 | Crate | What it is |
 |---|---|
@@ -23,4 +23,4 @@ make clippy        # clippy for the Linux target, warnings are errors
 make check-x86     # compile the tests for x86_64 under the amd64 image
 ```
 
-`make bench` prints the time per push for a 16-byte and a 4096-byte payload. On an M4 Pro, 14-CPU Linux VM, a 16-byte push took 4.6 ns.
+`make bench` prints the time per push for a 16-byte and a 4096-byte payload.

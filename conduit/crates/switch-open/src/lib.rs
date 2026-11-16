@@ -1,8 +1,9 @@
-//! Opens a NIC from a network config file and returns a running Stack, in one call.
+//! Opens a network card from a network config file and returns the network stack running on
+//! it, in one call.
 //!
 //! Applications reach this crate as `switch::nic` ([`open`], [`Sizing`], [`Opened`],
 //! [`OpenError`], [`OpenReport`], [`Link`] and [`offloads`]). `switch-nic`, `switch-bench` and
-//! the junction daemon use it the same way.
+//! `switch-junctiond` use it the same way.
 
 use std::thread;
 use std::time::{Duration, Instant};
@@ -27,76 +28,93 @@ const RX_BURST: u16 = 128;
 /// above that mark in practice.
 const RX_POOL: u32 = 32767;
 
-/// How many sockets the Stack has room for and how the packet-buffer pools are sized.
+/// How many sockets a program can have open and how many packet buffers it has for sending.
 ///
-/// [`open`] builds three pools from the config file and this value. A pool is a fixed set
-/// of packet buffers made once when the port opens; nothing is allocated per packet later.
-/// Each pool is a reserve, which the Stack and the NIC driver need whatever the sockets do,
-/// plus a share, which every socket and the application draw on together. Nothing is
-/// reserved per socket, so [`add_tcp`](dpdk_smoltcp::Stack::add_tcp) never fails because a
-/// pool is small; a small pool shows up later as backpressure (table below).
+/// [`open`] allocates everything this describes once, when the card opens, and none of it
+/// grows afterwards. The buffers are shared by all sockets: nothing is set aside per socket,
+/// so opening a socket never fails because buffers are short. A value that is too small
+/// shows later, as a wait or a refused send; each field says how.
 ///
-/// | Pool | Holds | Size with `open` |
-/// |---|---|---|
-/// | RX | received packets, until the application drops the frame or datagram that owns each one | 32767 buffers, always |
-/// | TX | packets the Stack builds itself (ACKs, ARP, resets) and TCP segments sent by copy | [`tx_reserve`]`(TX descriptors, tx_pending)` |
-/// | frame | data the application sends, held until the peer acknowledges it (TCP) or the NIC has sent it (UDP) | [`frame_reserve`]`(TX descriptors, tx_pending) + frame_share` |
+/// Every field is required. [`max_sockets`](Self::max_sockets),
+/// [`rx_staging`](Self::rx_staging), [`tx_pending`](Self::tx_pending) and
+/// [`neighbor_capacity`](Self::neighbor_capacity) must be positive; a zero fails `open` with
+/// [`OpenError::Stack`].
 ///
-/// The descriptor counts are the config's `descriptors` after the driver's adjustment,
-/// shown on the report's `descriptors` line. Each RX buffer has a data room of DPDK's
-/// headroom (128 bytes) plus `(mtu + 26)` rounded up to a multiple of 1024; TX and frame
-/// buffers hold headroom plus `mtu + 14`. The RX burst is 128 packets, the TX burst 32 and
-/// every pool cache 8.
+/// The values the example programs use:
 ///
-/// Every field is required. [`max_sockets`](Self::max_sockets), [`rx_staging`](Self::rx_staging),
-/// [`tx_pending`](Self::tx_pending) and [`neighbor_capacity`](Self::neighbor_capacity) must
-/// be positive; a zero fails `open` with [`OpenError::Stack`] carrying
-/// [`StackError::InvalidConfig`](dpdk_smoltcp::StackError::InvalidConfig). The fixed RX pool
-/// must cover [`rx_reserve`](dpdk_smoltcp::rx_reserve), which is
-/// `2 × max(rx descriptors, 32) + 128 + rx_staging + 12`; beyond that (about 16 000
-/// descriptors) `open` fails with `RxPoolTooSmall`.
+/// | Program | `frame_share` | `max_sockets` | `max_udp_sockets` | `rx_staging` | `tx_pending` |
+/// |---|---|---|---|---|---|
+/// | a client with one TCP connection | `tx_mbuf_budget` for its socket | 1 | 0 | 32 | 32 |
+/// | a TCP server with up to 15 connections | 16 × `tx_mbuf_budget` | 16 | 0 | 32 | 32 |
+/// | a UDP echo on one port | 32 | 1 | 1 | 32 | 32 |
 ///
-/// # When a pool runs dry
+/// # Receive buffers
 ///
-/// Nothing fails; each pool produces its own backpressure.
+/// Received packets have their own buffers, which `Sizing` does not set: 32767 of them,
+/// shared by all sockets. A buffer is in use from the moment a packet arrives until the
+/// task drops the frame or datagram that holds it. When none is free the card drops
+/// arriving packets: TCP peers retransmit, and UDP datagrams are lost. Tasks free buffers
+/// by receiving and dropping frames.
 ///
-/// | Pool | What happens | What frees it |
-/// |---|---|---|
-/// | RX | The driver has no buffer for arrivals and drops them. TCP peers retransmit; UDP senders are not told. | Reading queued data and dropping received frames the application holds. |
-/// | TX | Sockets that want to send wait for a later send step; replies built while receiving are dropped. | The driver finishing earlier sends. |
-/// | frame | `send_slice` queues what fits, possibly `Ok(0)`; [`Stack::tx_frame`](dpdk_smoltcp::Stack::tx_frame) returns `None`; [`Stack::udp_send`](dpdk_smoltcp::Stack::udp_send) returns `WouldBlock`. | Peers acknowledging TCP data, the application dropping frames, the driver finishing UDP sends. |
-///
-/// Nothing signals when frames return: retry on a later pass of the loop.
-/// [`Stack::free_frames`](dpdk_smoltcp::Stack::free_frames) says how many are free now.
+/// The card's receive ring takes part of those buffers. The 32767 must cover
+/// `2 × max(RX descriptors, 32) + 128 + rx_staging + 12`, where the descriptor count is the
+/// config's `descriptors` after the driver has adjusted it (the report's `descriptors`
+/// line). With `rx_staging: 32` that allows up to 16297 descriptors, and a larger
+/// `rx_staging` allows fewer. Past the limit `open` fails with [`OpenError::Stack`] carrying
+/// `RxPoolTooSmall`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sizing {
-    /// Frames all TCP send queues and the application may hold at once, on top of the frame
-    /// pool's reserve.
+    /// Send frames to allocate on top of the network stack's own reserve. Choose enough for
+    /// the frames tasks hold from `NetHandle::tx_frame` plus the frames of TCP data that is
+    /// queued or sent and not yet acknowledged.
     ///
-    /// A TCP socket holds up to its `tx_capacity` bytes in frames: queued data plus data sent
-    /// and not yet acknowledged. [`tcp::tx_mbuf_budget`](dpdk_smoltcp::smoltcp::socket::tcp::tx_mbuf_budget)`(&config, mtu)`
-    /// gives that count when every frame is a full segment. Sum it over the sockets that
-    /// may be sending at the same time and add the frames the application holds itself
-    /// (from [`Stack::tx_frame`](dpdk_smoltcp::Stack::tx_frame)). Small writes use more
-    /// frames for the same bytes. A one-socket client uses one socket's budget.
+    /// It is a size, not a limit that is enforced: frames are handed out for as long as the
+    /// whole pool has one free. When none is free, `tx_frame().await` waits until one comes
+    /// back, and a UDP `send` of a frame that has to be copied returns `Full`. Frames come
+    /// back when a peer acknowledges TCP data, when the card has sent a UDP datagram, and
+    /// when a task drops a frame.
+    ///
+    /// To choose it, add up
+    /// [`tcp::tx_mbuf_budget`](dpdk_smoltcp::smoltcp::socket::tcp::tx_mbuf_budget)`(&config, mtu)`
+    /// for every TCP socket that may be sending at the same time. It estimates the frames
+    /// one socket's `tx_capacity` bytes take when every frame is full, and is never less
+    /// than six. Add the frames tasks hold while they fill them, usually one per sending
+    /// task. A program that sends many small frames needs more, because a small frame uses
+    /// a whole buffer.
     pub frame_share: usize,
-    /// TCP socket slots. Must be positive. A socket whose handle was dropped keeps its slot
-    /// until its connection has closed.
+    /// TCP sockets the program can have at once. Must be positive.
+    ///
+    /// Count every connection, every `tcp_accept` that is waiting, and connections that
+    /// were dropped and are still closing: such a connection keeps its place until TCP has
+    /// finished the close. When all places are taken, `tcp_connect` and `tcp_accept` return
+    /// `SocketsFull`.
     pub max_sockets: usize,
-    /// UDP socket slots. Zero disables UDP.
+    /// UDP sockets the program can have at once. With zero, or when all are in use,
+    /// `udp_bind` returns `SocketsFull`.
     pub max_udp_sockets: usize,
-    /// Received packets the Stack may hold between taking them from the NIC and processing
-    /// them. Must be positive. Each receive step processes at most its `ingress_budget`
-    /// packets; the rest wait here. Counts towards the RX reserve. 32 suits one or a few
-    /// sockets; the benchmark server and the junction daemon use 128.
+    /// Received packets that can wait between being taken from the card and being
+    /// processed. Must be positive.
+    ///
+    /// Each receive step processes at most `NetConfig::ingress_budget` packets and leaves
+    /// the rest here for the next round. While this is full, no more are taken from the
+    /// card, and the card drops arrivals once its own ring (the config's `descriptors`) is
+    /// full too. Set it to at least `ingress_budget`. 32 suits a program with a few sockets;
+    /// `switch-bench` and `switch-junctiond` use 128.
     pub rx_staging: usize,
-    /// Packets built but not yet accepted by the NIC driver. Must be positive. While it is
-    /// full, a send step can only flush and UDP sends return `WouldBlock`. Counts towards
-    /// the TX and frame reserves. The examples use 32; the benchmark server and the daemon 64.
+    /// Packets that are built and waiting for the card to accept them. Must be positive.
+    ///
+    /// While this is full, a send step sends nothing new until the card has taken some,
+    /// a UDP `send` returns `Full`, and replies the network stack builds while receiving
+    /// (acknowledgements, ARP) are dropped. The examples use 32; `switch-bench` and
+    /// `switch-junctiond` use 64.
     pub tx_pending: usize,
-    /// ARP cache entries: how many on-link neighbors, the gateway included, the Stack
-    /// remembers. Must be positive. When full, a new neighbor evicts the one that expires
-    /// first. [`DEFAULT_NEIGHBOR_CAPACITY`](dpdk_smoltcp::DEFAULT_NEIGHBOR_CAPACITY) is 256.
+    /// Addresses on the local network, the gateway included, whose hardware address the
+    /// network stack remembers. Must be positive.
+    ///
+    /// When it is full, a new address replaces the entry that would expire first, and the
+    /// replaced one is looked up again when it is next needed.
+    /// [`DEFAULT_NEIGHBOR_CAPACITY`](dpdk_smoltcp::DEFAULT_NEIGHBOR_CAPACITY), 256, is enough
+    /// unless the program talks to more hosts than that on its own subnet.
     pub neighbor_capacity: usize,
 }
 
@@ -157,7 +175,7 @@ fn port_config(
     })
 }
 
-/// The port's link state as the NIC driver reported it when [`open`] stopped waiting.
+/// The card's link state as its driver reported it when [`open`] stopped waiting.
 /// Shown on the report's `link_speed_mbps`, `link_duplex` and `link_status` lines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Link {

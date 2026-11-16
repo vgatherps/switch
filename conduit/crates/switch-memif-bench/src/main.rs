@@ -4,7 +4,8 @@
 //! prints min, median and max per configuration.
 //!
 //! ```text
-//! switch-memif-bench peer --mode echo|sink|udp-sink --conns K --cpu C --socket NAME [--run-timeout-s S]
+//! switch-memif-bench peer --mode echo|sink --conns K --cpu C --socket NAME [--run-timeout-s S]
+//! switch-memif-bench peer --mode udp-sink --conns 1 --size N --warmup N --cpu C --socket NAME [--run-timeout-s S]
 //! switch-memif-bench client SHAPE --cpu C --socket NAME [--run-timeout-s S]
 //! switch-memif-bench run SHAPE --peer-cpu P --client-cpu C --control-cpu X [--socket NAME] [--run-timeout-s S]
 //! switch-memif-bench matrix [--reps R] [--dry-run] --peer-cpu P --client-cpu C --control-cpu X [--run-timeout-s S]
@@ -15,6 +16,12 @@
 //!
 //! Run it with bad arguments for the full usage. `run` and `matrix` exit 0 only if every run was
 //! valid and every child exited 0. See `docs/benchmarks/memif.md`.
+//!
+//! `peer` and `client` are driven by `run` over stdin and stdout; run by hand, they follow the
+//! same protocol. The peer prints `ready` once it listens. Each side prints `report <json>` when
+//! done, then waits for the line `close` on stdin before closing its port; stdin ending first is
+//! an error. Send `close` to the client first, wait for it to exit, then to the peer. A
+//! `udp-sink` peer also needs the line `sent` after the client's report, before it reports.
 
 // Protocol on stdout/stdin: the peer prints `ready` once its memif server
 // listens; each side prints `report <json>` once done and polls no more;

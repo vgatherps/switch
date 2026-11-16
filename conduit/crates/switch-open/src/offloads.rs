@@ -34,7 +34,7 @@ pub struct OffloadChoice {
     pub reason: String,
 }
 
-/// The offloads requested when the port opened, and why.
+/// The offloads requested when the card was opened, and why.
 ///
 /// `Display` prints one line per checksum offload,
 /// `<name>: requested (<reason>)` or `<name>: not requested (<reason>)`, then one line per

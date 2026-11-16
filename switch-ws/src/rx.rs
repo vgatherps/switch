@@ -7,20 +7,20 @@ use crate::utf8::Utf8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
-    /// Receives unmasked frames.
+    /// Receives unmasked WebSocket frames.
     Client,
-    /// Receives masked frames.
+    /// Receives masked WebSocket frames.
     Server,
 }
 
 /// A connection's message size limits, given to `connect`, `connect_ws` or `accept_ws`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
-    /// Largest received message, counting the data of all its frames; control frames are not
-    /// counted (they have their own 125 B limit). A frame header announcing a length that takes
-    /// the message past it fails the connection with [`ProtocolError::MessageTooBig`], before
-    /// any of that frame's data is read. The buffer for a message that spans frames grows only
-    /// as its bytes arrive.
+    /// Largest received message, counting the data of all its WebSocket frames; control
+    /// WebSocket frames have a separate 125 B limit. A WebSocket frame header announcing a
+    /// length that takes the message past it fails with [`ProtocolError::MessageTooBig`]
+    /// before any of that WebSocket frame's data is read. The message buffer grows only as
+    /// its bytes arrive.
     pub max_message: usize,
     /// Largest message `send` accepts; a larger one is refused with `TooBig` and nothing is
     /// sent.
@@ -54,26 +54,28 @@ pub enum Kind {
     Binary,
 }
 
-/// How the peer broke the WebSocket protocol, inside `Failure::Protocol`. No close frame is
-/// sent for it: the connection sends close_notify (over TLS) and FIN, then reports the failure.
+/// How the peer broke the WebSocket protocol, inside `Failure::Protocol`.
+///
+/// No WebSocket close frame is sent: the connection sends close_notify (over TLS) and FIN,
+/// then reports the failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProtocolError {
-    /// A frame with a reserved bit (RSV1 to RSV3) set; no extension is negotiated that would
+    /// A WebSocket frame with a reserved bit (RSV1 to RSV3) set; no extension is negotiated that would
     /// define one.
     ReservedBits,
-    /// A frame with an opcode RFC 6455 does not define; the opcode.
+    /// A WebSocket frame with an opcode RFC 6455 does not define; the opcode.
     UnknownOpcode(u8),
-    /// A ping, pong or close frame without FIN.
+    /// A ping, pong or close WebSocket frame without FIN.
     FragmentedControl,
-    /// A ping, pong or close frame with more than 125 B of payload.
+    /// A ping, pong or close WebSocket frame with more than 125 B of payload.
     ControlTooBig,
-    /// A continuation frame with no message in progress.
+    /// A continuation WebSocket frame with no message in progress.
     UnexpectedContinuation,
-    /// A new data frame while a fragmented message is in progress.
+    /// A new data WebSocket frame while a fragmented message is in progress.
     ExpectedContinuation,
-    /// Server role: a frame without mask.
+    /// Server role: a WebSocket frame without mask.
     UnmaskedFrame,
-    /// Client role: a masked frame.
+    /// Client role: a masked WebSocket frame.
     MaskedFrame,
     /// The 64-bit length has its top bit set.
     LengthTopBit,
@@ -81,16 +83,16 @@ pub enum ProtocolError {
     NonMinimalLength,
     /// A close payload of 1 byte.
     InvalidCloseLength,
-    /// A Text message, or a close frame's reason, that is not UTF-8.
+    /// A Text message, or a WebSocket close frame's reason, that is not UTF-8.
     InvalidUtf8,
-    /// A data frame that takes its message past [`Limits::max_message`].
+    /// A data WebSocket frame that takes its message past [`Limits::max_message`].
     MessageTooBig,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum WsError<E> {
     Protocol(ProtocolError),
-    /// The peer sent a valid close frame; see [`WsRx::peer_close`].
+    /// The peer sent a valid WebSocket close frame; see [`WsRx::peer_close`].
     Closed,
     Lower(E),
 }
@@ -621,8 +623,8 @@ impl<R: PlainRx> WsRx<R> {
     }
 }
 
-/// A received Text or Binary message. Ping, pong and close frames are handled inside `recv` and
-/// never returned.
+/// A received Text or Binary message. Ping, pong and close WebSocket frames are handled inside
+/// `recv` and never returned.
 ///
 /// It borrows the connection, so the next `recv` cannot run while it is held: copy what must
 /// outlive it. A message that arrived inside one frame (over TLS, one record) is that frame's

@@ -11,7 +11,7 @@ use std::task::{Context, Poll, Waker};
 #[path = "waker_tests.rs"]
 mod waker_tests;
 
-/// More tasks than a fresh wake queue holds, so the queues grow mid-round.
+/// More tasks than a fresh wake queue holds, so the queues grow mid-pass.
 const MANY: usize = 192;
 
 /// A runtime driven through `Runtime::poll`, and its executor for white-box checks.
@@ -183,7 +183,7 @@ fn nested_spawns_run_in_the_next_round_not_the_current_one() {
             }
         }
     }
-    /// Polled after `spawn_many` in the same round: records how many of its spawns ran.
+    /// Polled after `spawn_many` in the same pass: records how many of its spawns ran.
     #[switch_runtime::task]
     async fn observe(inner: Rc<Cell<usize>>, seen: Rc<Cell<Option<usize>>>) {
         seen.set(Some(inner.get()));
@@ -373,7 +373,7 @@ fn destructor_spawn_and_wake(target_idle: bool, self_wake: bool) {
         completed: Rc<Cell<usize>>,
         drops: Rc<Cell<usize>>,
         self_wake: bool,
-        /// Last task of its round: end the `Runtime::poll` with it.
+        /// Last task of its pass: end the `Runtime::poll` with it.
         turn: bool,
     }
     impl Future for SpawnDuringDrop {

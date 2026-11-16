@@ -1,4 +1,4 @@
-//! The junction daemon: one process that owns a network card and serves TCP and UDP sockets
+//! `switch-junctiond`: one process that owns a network card and serves TCP and UDP sockets
 //! to programs on the same machine, which connect with `switch::junction::session::Session`.
 //! Running it is described in `docs/operations/junctiond.md` in the repository.
 //!

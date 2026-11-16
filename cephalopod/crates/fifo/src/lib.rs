@@ -1,6 +1,6 @@
 //! The consumer side of cephalopod: [`Fifo`] sweeps every per-CPU ring of a
 //! `ceph_ring::Reader` and delivers each stream's records in sequence order, whichever rings
-//! they landed in. The junction daemon runs one `Fifo` for the send rings of all sessions.
+//! they landed in. The daemon runs one `Fifo` for the send rings of all sessions.
 
 use std::sync::mpsc::{Receiver, Sender};
 

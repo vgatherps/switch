@@ -1,4 +1,4 @@
-//! One `Net` (side A, 10.0.0.1) facing a raw conduit `Stack` peer (side B,
+//! One `Net` (side A, 10.0.0.1) facing a raw `Stack` peer (side B,
 //! 10.0.0.2) over two lossless net_ring links, with a switch `Runtime` whose
 //! tasks run the switch-net futures.
 

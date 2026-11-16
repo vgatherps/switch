@@ -44,10 +44,10 @@ impl From<Unavailable> for SleepError {
 /// [`Spawner::sleep`](crate::Spawner::sleep) and
 /// [`Spawner::sleep_until`](crate::Spawner::sleep_until).
 ///
-/// It resolves to `Ok(())` during the first [`Runtime::poll`](crate::Runtime::poll) whose
-/// tick is at or past the deadline; that poll wakes the polling task. A deadline already
-/// reached completes on the first poll without parking. Nothing fires between polls, so a
-/// sleep fires at the loop's first poll after the deadline.
+/// At the first [`Runtime::poll`](crate::Runtime::poll) whose tick reaches the deadline,
+/// the timer makes its task ready. The sleep resolves to `Ok(())` when that task next runs,
+/// which can be in a later call. A deadline already reached completes on the first poll
+/// without parking. Nothing fires between runtime polls.
 ///
 /// Creating a `Sleep` registers nothing; its timer is registered when it is first polled
 /// with the deadline still ahead. Dropping it cancels the timer. Each poll points the timer

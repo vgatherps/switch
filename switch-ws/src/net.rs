@@ -48,10 +48,10 @@ impl PlainTx for SwitchTx {
 /// | Error | When |
 /// |---|---|
 /// | `Config(SetupError::ForeignHandle)` | The stream does not belong to the handle's Net. Nothing was sent. |
-/// | `Config(SetupError::RoomTooSmall { room, need })` | A frame cannot carry the largest control frame: 131 B for a client, 127 B for the server, and over TLS 76 B more of record overhead. The socket's send buffer or the backend's frame size is too small, or the TLS config's `max_fragment_size` is set below 136. Nothing was sent. |
+/// | `Config(SetupError::RoomTooSmall { room, need })` | A frame's room cannot carry the largest WebSocket control frame: 131 B for a client, 127 B for the server, and over TLS 76 B more of record overhead. The socket's send buffer or the Net's frame size is too small, or a valid TLS `max_fragment_size` is below 136. Nothing was sent. |
 /// | `Failed(Failure::Dead)` | The socket had already closed or reset. |
 /// | `Handshake(msg)` | `connect` only: `host` is not a valid server name, the server negotiated a version other than TLS 1.3, or the handshake ended in an unexpected state. |
-/// | `Tls(e)` | `connect` only: the TLS handshake failed, or during the upgrade a record failed or TCP ended without close_notify. The alert (if any) and FIN went out, and the error returned once they were acknowledged or the connection ended. |
+/// | `Tls(e)` | `connect` only: rustls refused the TLS config (nothing was sent), the TLS handshake failed, or during the upgrade a record failed or TCP ended without close_notify. For handshake or receive failures, the call waits for the owed alert (if any) and FIN to be acknowledged or the connection to end. |
 /// | `Recv(e)` | TCP receive failed: a reset, or the peer's FIN during the TLS handshake or a `ws://` upgrade. |
 /// | `Send(e)` | Sending the TLS handshake, the upgrade request or the 101 response failed. |
 /// | `Upgrade(e)` | The upgrade was refused; see [`UpgradeError`]. |
@@ -61,7 +61,7 @@ impl PlainTx for SwitchTx {
 ///
 /// | Error | When |
 /// |---|---|
-/// | `Failed(f)` | The connection failed, earlier or during the call; `f` is its first failure. |
+/// | `Failed(f)` | A stored failure, or `Failed(Dead)` when the send side discovers the socket has died. `recv` can still parse buffered input after a send-side `Dead`. |
 /// | `Closed` | `send` after our close, after the peer's close arrived, or after `linger`; `close` after `linger`. |
 /// | `TooBig { max_send }` | `send` of a message over [`Limits::max_send`]. |
 /// | `InvalidText` | `send` of a Text message that is not UTF-8. |
@@ -84,10 +84,10 @@ pub enum Error {
     /// A send after a close, or a send or close after `linger`.
     Closed,
     /// The connection could not be set up (a handle from another Net, or a frame room below
-    /// the largest control frame); nothing was sent.
+    /// the largest WebSocket control frame); nothing was sent.
     Config(SetupError),
-    /// The connection failed; every later `send`, `close` and `recv` reports this first
-    /// failure.
+    /// A stored connection failure, or a send-side `Dead` result. After send-side `Dead`,
+    /// `recv` can still read a buffered peer WebSocket close frame and return `Ok(None)`.
     Failed(Failure),
     /// A Text message that is not UTF-8; nothing was sent.
     InvalidText,
@@ -177,10 +177,13 @@ impl From<Infallible> for Error {
 /// `host` is the TLS server name (checked against the certificate) and the upgrade's `Host`
 /// header; `port` is the server's port, named in `Host` only when it is not 443. `config`
 /// decides certificate checking and the crypto provider. Only TLS 1.3 is accepted (see
-/// [`tls_connect`]), and `config.max_fragment_size` must be unset or at least 136.
+/// [`tls_connect`]), and `config.max_fragment_size` must be unset or in 136..=16389.
+/// The stream and server name are checked first. If those checks succeed, values outside
+/// rustls's range 32..=16389 return `Tls(Tls(BadMaxFragmentSize))`; a valid value below 136
+/// returns `Config(RoomTooSmall)`.
 ///
-/// The call waits on the server for the handshake and the upgrade response, and a failing
-/// handshake waits until its alert and FIN are acknowledged: bound it with
+/// The call waits on the server for the handshake and upgrade response. A failing
+/// handshake waits until its alert and FIN are acknowledged or the connection ends: bound it with
 /// [`within`](switch_net::within). Dropping the future drops the stream.
 pub async fn connect(
     handle: &NetHandle,
@@ -279,9 +282,9 @@ async fn read_head(rx: &mut Raw<TcpFrame, SwitchTx>, tx: &mut SwitchTx, tcp: &mu
 /// rest of a message whose `send` was dropped. A program that only sends must still call
 /// `recv`.
 ///
-/// `send` and `recv` take `&mut self`, so they cannot run at once. On the local backend, if
-/// both ends send more than the other's receive window before reading, both wait for good;
-/// keep sends within the window or alternate them with reads. On the junction backend, `send`
+/// `send` and `recv` take `&mut self`, so they cannot run at once. When owning the card, if
+/// both ends send more than the other's receive window before reading, both can wait forever;
+/// keep sends within the window or alternate them with reads. When sharing a card, `send`
 /// waits only while the session's send ring is full.
 ///
 /// To close, call [`close`](Wss::close), then `recv` until it returns `None`, both bounded with
@@ -289,20 +292,22 @@ async fn read_head(rx: &mut Raw<TcpFrame, SwitchTx>, tx: &mut SwitchTx, tcp: &mu
 ///
 /// | Event while receiving | Sent first | `recv` returns |
 /// |---|---|---|
-/// | The server's close frame | The echo (unless our close went first), close_notify, FIN | `Ok(None)`, once the FIN is acknowledged |
+/// | The server's WebSocket close frame | The echo (unless our close went first), close_notify, FIN | `Ok(None)`, once local output is acknowledged or the connection ends |
 /// | The server breaks the protocol | close_notify, FIN | `Err(Failed(Protocol(e)))` |
 /// | A bad TLS record | The alert, FIN | `Err(Failed(Tls(Tls(e))))` |
-/// | FIN without close_notify | FIN | `Err(Failed(Tls(Truncated)))` |
-/// | close_notify or FIN without a close frame | close_notify, FIN | `Err(Failed(PeerEof))` |
-/// | A reset before the server's close | Nothing | `Err(Failed(Dead))` |
-/// | A reset after the server's close | Nothing | `Ok(None)` |
+/// | FIN without close_notify, before a WebSocket close frame | FIN | `Err(Failed(Tls(Truncated)))` |
+/// | close_notify without a WebSocket close frame | close_notify, FIN | `Err(Failed(PeerEof))` |
+/// | A reset before the server's WebSocket close frame | Nothing | `Err(Failed(Dead))` |
+/// | A reset after the server's WebSocket close frame | Nothing | `Ok(None)` |
 ///
-/// After `Ok(None)` the connection, and its Net, may be dropped: nothing is left in flight.
+/// `Ok(None)` does not wait for the server's close_notify or FIN. TLS parsing stops at its
+/// WebSocket close frame and later input is discarded. Dropping with unread TCP data can reset
+/// the connection; use [`linger`](Wss::linger) to drain until the server's FIN before dropping.
 pub struct Wss(Session<TlsRx<TcpFrame, SwitchTx>, TlsTx<SwitchTx>, TcpRx>);
 
 /// An open `ws://` connection, client (from [`connect_ws`]) or server (from [`accept_ws`]). Use
 /// it from one task. It behaves as [`Wss`] without TLS: no close_notify is sent, the TLS rows of
-/// that table do not apply, and a peer's FIN before its close frame is `PeerEof`.
+/// that table do not apply, and a peer's FIN before its WebSocket close frame is `PeerEof`.
 pub struct Ws(Session<Raw<TcpFrame, SwitchTx>, SwitchTx, TcpRx>);
 
 /// A send handle held alongside a message returned by [`Ws::recv_with_sender`].
@@ -318,18 +323,19 @@ impl WsSender<'_> {
 }
 
 impl Wss {
-    /// The next message. `Ok(None)` once the close handshake is done (ours or the server's) and
-    /// our FIN is acknowledged; after a failure, the first failure, once what is owed is
-    /// delivered (see [`Failure`]). Messages that arrive after our close, before the server's,
-    /// are returned; bytes after the server's close are read and dropped. Dropping the future
-    /// loses nothing: the next call goes on where it stopped.
+    /// The next message. `Ok(None)` after the server's WebSocket close frame, once local output
+    /// is acknowledged or the connection ends; it does not wait for the server's close_notify or
+    /// FIN. A stored failure is returned once owed output is delivered or the connection ends.
+    /// After send-side `Failed(Dead)`, buffered input can still contain the peer's WebSocket
+    /// close frame and produce `Ok(None)` instead. Messages crossing our WebSocket close frame
+    /// are returned until the server's arrives; later bytes are discarded. Cancellation loses no data.
     pub async fn recv(&mut self) -> Result<Option<Message<'_>>, Error> {
         self.0.recv().await.map_err(Error::Failed)
     }
 
     /// Sends `payload` as one message, after what earlier calls left, and returns once all of
     /// it is handed to TCP. A message that fits one frame goes out as one WebSocket frame; a
-    /// longer one is copied once into a buffer and sent a frame at a time. It is never
+    /// longer one is copied once into a buffer and sent a WebSocket frame at a time. It is never
     /// interleaved with another message. Errors are listed on [`Error`].
     ///
     /// Dropped before the message is accepted, nothing of it is sent. A message that fits one
@@ -339,7 +345,7 @@ impl Wss {
         Ok(self.0.send(kind, payload).await?)
     }
 
-    /// The server's close status and reason once its close frame arrived (at the latest when
+    /// The server's close status and reason once its WebSocket close frame arrived (at the latest when
     /// `recv` returned `None`); `None` if it sent none. A close without a status reads as 1005.
     /// A status a server may not send reads as 1002: the close handshake still completes, and
     /// 1002 is what was echoed.
@@ -347,21 +353,23 @@ impl Wss {
         peer_close(self.0.rx.peer_close()?)
     }
 
-    /// Sends a close frame (`code`, `reason`), after any message in progress, and returns once
-    /// it is handed to TCP. Receiving goes on: `recv` returns messages that crossed it on the
-    /// wire, then `None` once the server's echo arrived and close_notify and FIN are
-    /// acknowledged. A server that never echoes keeps `recv` waiting: bound it.
+    /// Sends a WebSocket close frame (`code`, `reason`), after any message in progress, and returns
+    /// once it is handed to TCP. Receiving goes on: `recv` returns messages that crossed it,
+    /// then `None` after the server's echo and local-output completion or connection end.
+    /// It does not wait for the server's FIN. A server that never echoes keeps `recv` waiting:
+    /// bound it.
     ///
     /// `code` must be one a peer may send (1000 to 1003, 1007 to 1014, 3000 to 4999) and
     /// `reason` at most 123 B; otherwise `InvalidClose`, with nothing sent. A second `close`, or
-    /// one after the server's close arrived, returns `Ok` and sends no close frame of its own.
-    /// If the future is dropped once started, the close frame stays queued and the next `recv`
-    /// sends it.
+    /// one after the server's close arrived, returns `Ok` and sends no WebSocket close frame
+    /// of its own; any queued echo of the server's close frame still goes out.
+    /// If the future is dropped once started, the WebSocket close frame stays queued and the next
+    /// `recv` sends it.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<(), Error> {
         Ok(self.0.close(code, reason).await?)
     }
 
-    /// Ends without a close frame of our own: one already sealed still goes out, but one only
+    /// Ends without our own WebSocket close frame: one already sealed still goes out, but one only
     /// queued, and the unsent rest of a dropped `send`, are dropped. Sends close_notify (unless
     /// TLS failed) and FIN, then reads and drops what the server sends until its FIN, so
     /// dropping the `Wss` afterwards sends no reset. Use it after a failure while the server may
@@ -375,8 +383,8 @@ impl Wss {
 }
 
 impl Ws {
-    /// The next message, as [`Wss::recv`]; `Ok(None)` once the close handshake is done and our
-    /// FIN is acknowledged.
+    /// The next message, as [`Wss::recv`]; `Ok(None)` after the peer's WebSocket close frame and
+    /// local-output completion or connection end, without waiting for the peer's FIN.
     pub async fn recv(&mut self) -> Result<Option<Message<'_>>, Error> {
         self.0.recv().await.map_err(Error::Failed)
     }
@@ -398,13 +406,13 @@ impl Ws {
         peer_close(self.0.rx.peer_close()?)
     }
 
-    /// Sends a close frame (`code`, `reason`), as [`Wss::close`]; `recv` returns `None` once the
-    /// peer's echo arrived and our FIN is acknowledged.
+    /// Sends a WebSocket close frame (`code`, `reason`), as [`Wss::close`]; `recv` returns `None`
+    /// after the peer's echo and local-output completion or connection end.
     pub async fn close(&mut self, code: u16, reason: &str) -> Result<(), Error> {
         Ok(self.0.close(code, reason).await?)
     }
 
-    /// Ends without a close frame of our own, as [`Wss::linger`], with FIN alone.
+    /// Ends without our own WebSocket close frame, as [`Wss::linger`], with FIN alone.
     pub async fn linger(&mut self) -> Result<(), Error> {
         self.0.linger().await.map_err(Error::Failed)
     }

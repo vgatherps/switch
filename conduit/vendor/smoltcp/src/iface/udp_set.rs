@@ -13,18 +13,25 @@ pub struct UdpHandle {
     generation: u64,
 }
 
+/// Settings for binding a UDP socket and sending its datagrams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UdpConfig {
+    /// Local UDP port; must be nonzero.
     pub port: u16,
-    /// The one local address the socket receives on and sends from, which the interface must
-    /// own; `None` binds every owned address (all-IP): it receives what no socket bound to the
-    /// datagram's destination takes, and broadcasts, and sends from the interface's address.
+    /// The one local address the socket receives on and sends from, which the network stack
+    /// must own; `None` binds every owned address (all-IP): it receives what no socket bound
+    /// to the datagram's destination takes, and broadcasts, and sends from the default address.
     pub local_addr: Option<Ipv4Address>,
+    /// Maximum received datagrams retained for this socket; must be nonzero. Counts queued
+    /// datagrams and datagrams held by the application, through their final frame handle.
+    /// Further arrivals are dropped and counted in [`UdpSocketStats::rx_dropped_full`].
     pub rx_queue: usize,
-    /// Compute the UDP checksum in software when true, or write 0 when false.
-    /// With a device whose `checksum.udp` capability has no TX, smoltcp always
-    /// writes 0; whether the checksum is filled in later depends on the device.
+    /// Request software UDP checksums when true; otherwise write 0. If the device disables
+    /// software TX checksums, this flag has no effect. A card with UDP checksum offload
+    /// enabled computes them either way.
     pub tx_checksum: bool,
+    /// Allow sending to the network stack's broadcast addresses. Does not enable multicast
+    /// or control reception of broadcast datagrams.
     pub broadcast: bool,
 }
 
@@ -54,8 +61,11 @@ pub enum UdpSendError {
     WouldBlock,
 }
 
+/// Receive-drop counters for one UDP socket.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct UdpSocketStats {
+    /// Datagrams dropped because the socket had reached [`UdpConfig::rx_queue`], including
+    /// datagrams still held by the application.
     pub rx_dropped_full: u64,
 }
 

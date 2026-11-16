@@ -15,11 +15,12 @@ use crate::{adjusted_descriptors, port_config, wait_link, Link, Sizing};
 
 /// What a successful [`open`] returns.
 pub struct Opened {
-    /// The running Stack, ready for sockets. Its start time is the first value `open` read
-    /// from the clock; every later drive call must take its time from the same clock.
+    /// The running network stack, which `Net::new` takes. Its start time is the first value
+    /// `open` read from the clock; every later round must take its time from the same clock.
     pub stack: Stack,
-    /// DPDK's process setup. Keep it alive until the port is closed: the port and every
-    /// packet buffer depend on it. Dropping it does nothing, and DPDK is never torn down.
+    /// DPDK's process-wide state (DPDK calls it the EAL). Keep it alive until the card is
+    /// closed: the card and every packet buffer depend on it. Dropping it does nothing, and
+    /// DPDK is never torn down.
     pub eal: Eal,
     /// What was opened, for printing.
     pub report: OpenReport,
@@ -40,19 +41,25 @@ pub struct Opened {
 /// | [`MacMismatch`](Self::MacMismatch) | compare a PCI card's MAC with the config | `device MAC:` | nothing |
 /// | [`Descriptors`](Self::Descriptors) | let the driver adjust the ring sizes | `descriptor adjustment:` | nothing |
 /// | [`PortConfig`](Self::PortConfig) | size the pools | `port configuration:` | nothing |
-/// | [`PortOpen`](Self::PortOpen) | open the NIC port | `port open:` | a retained `Port`, if any |
+/// | [`PortOpen`](Self::PortOpen) | open the card | `port open:` | a retained `Port`, if any |
 /// | [`Link`](Self::Link) | read the link state | `link query:` | the `Port` |
 /// | [`LinkDown`](Self::LinkDown) | wait up to 10 s for the link | `link wait:` | the `Port` |
 /// | [`Seed`](Self::Seed) | read a random seed | `stack random seed:` | the `Port` |
-/// | [`Stack`](Self::Stack) | build the Stack | `Stack::new:` | the `Port` |
+/// | [`Stack`](Self::Stack) | build the network stack | `Stack::new:` | the `Port` |
 /// | [`GatewayUnresolved`](Self::GatewayUnresolved) | resolve the gateway by ARP, up to 3 s | `gateway` | the `Stack` |
 /// | [`Receive`](Self::Receive) | resolve the gateway by ARP | `gateway receive:` | the `Stack` |
 ///
-/// From `PortOpen` on, the port exists. Dropping the carried `Port` or `Stack` stops and
-/// closes the device, reporting a failure only on stderr. To see the result, close it with
+/// From `Link` on, the card is open and the error carries it: as a `Port`, the open card,
+/// or as the `Stack` running on it. Dropping either attempts to stop and close the card,
+/// reporting a failure only on stderr. To see the result, close it with
 /// [`Port::try_close`](dpdk_smoltcp::Port::try_close) (for a `Stack`, after
 /// [`Stack::into_port`](dpdk_smoltcp::Stack::into_port)); it reports buffers still held
 /// as [`PortError::OutstandingBuffers`](dpdk_smoltcp::PortError::OutstandingBuffers).
+///
+/// `PortOpen` is different. When the settings were refused, or the setup failed and was
+/// undone, it carries no `Port`. It carries one, in `retained`, only when undoing the setup
+/// failed too. That partly opened `Port` still owns packet buffers, and dropping it
+/// reports on stderr without trying the cleanup again; close it with `try_close`.
 pub enum OpenError {
     /// The calling thread may run on more or fewer than one CPU. Start the process with
     /// `taskset -c N`, or a container with `--cpuset-cpus=N`.
@@ -91,8 +98,9 @@ pub enum OpenError {
     /// A pool size does not fit DPDK's types: a pool count above `u32`, or an MTU so large
     /// that a buffer's data room exceeds `u16` (`pool data room exceeds u16`).
     PortConfig(String),
-    /// Opening the NIC port failed. An offload the driver lacks fails here, naming it, for
-    /// example `InvalidSettings("PMD lacks the requested TX TCP checksum offload")`.
+    /// Opening the card failed. An offload the driver lacks fails here, naming it, for
+    /// example `InvalidSettings("PMD lacks the requested TX TCP checksum offload")` (PMD is
+    /// DPDK's word for a card driver).
     // The Port, Stack and failed-open payloads are boxed: an error does not carry them inline.
     PortOpen(Box<PortOpenError>),
     /// Reading the link state failed.
@@ -109,13 +117,14 @@ pub enum OpenError {
         /// The last link state the driver reported.
         link: Link,
     },
-    /// Reading the Stack's random seed from `/dev/urandom` failed.
+    /// Reading the network stack's random seed from `/dev/urandom` failed.
     Seed {
         port: Box<Port>,
         error: std::io::Error,
     },
-    /// [`Stack::new`](dpdk_smoltcp::Stack::new) refused: a zero [`Sizing`] field, a clock
-    /// that returned a time before zero, an MTU below 88, or a pool below its reserve.
+    /// The network stack refused the settings: zero `max_sockets`, `neighbor_capacity`,
+    /// `rx_staging` or `tx_pending` in [`Sizing`], a clock that returned a time before
+    /// zero, an MTU below 88, or a pool below its reserve.
     Stack {
         port: Box<Port>,
         error: StackError,
@@ -316,62 +325,68 @@ impl fmt::Display for OpenReport {
     }
 }
 
-/// Start DPDK, open the device the config names, and return a running Stack on it.
+/// Start DPDK, open the card the config names, and return the network stack running on it.
 ///
-/// Call it once per process, from the thread that will drive the Stack, with that thread
+/// Call it once per process, from the thread that will run the drive loop, with that thread
 /// already restricted to one CPU (`taskset -c N`, or `--cpuset-cpus=N` for a container).
-/// Resolve host names before calling it: name lookup goes through the kernel, which loses
-/// the interface of a real card once DPDK takes it.
 ///
-/// `config` is the loaded network config file; `sizing` sizes the socket slots and pools
-/// (see [`Sizing`]).
+/// `config` is the loaded network config file. `sizing` says how many sockets and send
+/// frames the program needs (see [`Sizing`]).
 ///
-/// `helper_cpus` says where DPDK's helper threads (interrupt and control work) may run.
-/// DPDK places them on the CPUs the starting thread may use, so `open` widens the thread's
-/// affinity while DPDK starts and restores the single CPU afterwards, also when DPDK fails:
+/// `helper_cpus` says where DPDK's own helper threads may run. They do no packet work.
 ///
-/// - `None`: if the pinned CPU is listed in `/sys/devices/system/cpu/isolated`, the
-///   helpers may use every online CPU that is not isolated (Linux trims that to the
-///   container's cpuset). Otherwise, or with no such CPU available, they share the pinned
-///   CPU. Right for most programs.
-/// - `Some(cpus)`, Linux only: the helpers may use `cpus`. For a pinned CPU that is not
-///   isolated at boot, such as in a container given several CPUs. The list must be
-///   non-empty, every CPU below `CPU_SETSIZE` and inside the process's cpuset. A list
-///   holding only the pinned CPU behaves like `None`.
+/// - `None`: if the program's CPU is isolated from the Linux scheduler (listed in
+///   `/sys/devices/system/cpu/isolated`), the helpers may use every online CPU that is not
+///   isolated and that the process is allowed. Otherwise, or with no such CPU available,
+///   they share the program's CPU. Right for most programs.
+/// - `Some(cpus)`, Linux only: the helpers may use `cpus`. For a program whose CPU is not
+///   isolated at boot and should still be left alone, such as in a container given several
+///   CPUs. The list must be non-empty, every CPU below `CPU_SETSIZE` and allowed to the
+///   process. A list holding only the program's CPU behaves like `None`.
 ///
-/// `clock` returns the Stack's time. `open` calls it for the Stack's start time and while
-/// it waits for the gateway; every later drive call must use the same clock, because the
-/// Stack refuses a time earlier than one it has seen.
+/// `clock` returns the network's time. `open` calls it for the start time and while it
+/// waits for the gateway. Every later round must use the same clock, because the network
+/// stack refuses a time earlier than one it has seen.
 ///
 /// The steps, each failing with its [`OpenError`] variant:
 ///
-/// 1. Check the thread may run on exactly one CPU, the pinned CPU.
-/// 2. Start DPDK with `--lcores=0@<cpu> --file-prefix <eal.file_prefix> --no-telemetry`,
-///    then `-a <pci>[,<devargs>]` for a PCI card or `--no-pci --vdev <spec>` for a vdev,
-///    then `eal.extra`.
-/// 3. Find the device; for a PCI card, compare its MAC with `mac`. The Stack always uses
-///    the device's MAC.
+/// 1. Check the thread may run on exactly one CPU.
+/// 2. Start DPDK on that CPU with the config's `eal` settings.
+/// 3. Find the card; for a PCI card, compare its MAC with the config's `mac`. The network
+///    stack always uses the card's own MAC.
 /// 4. Choose offloads (see [`offloads`](crate::offloads)), let the driver adjust the
-///    descriptor counts, size the pools and open the port.
-/// 5. Wait up to ten seconds of wall-clock time for the link, polling every 100 ms.
-/// 6. Build the Stack.
-/// 7. With a gateway in the config, send ARP for it and run receive steps until it
-///    answers or the clock shows three seconds since the start time. This loop spins, and
-///    it ends only when the clock advances: a clock that never moves never times out.
+///    config's `descriptors`, allocate the packet buffers and open the card.
+/// 5. Wait up to ten seconds of wall-clock time for the link.
+/// 6. Build the network stack.
+/// 7. With a gateway in the config, send ARP for it and receive until it answers or the
+///    clock shows three seconds since the start time. This wait ends only when the clock
+///    advances: a clock that never moves never times out.
 ///
 /// # Safety
-/// The ethdev must be newly created, never configured or started, and under
-/// exclusive control. EAL, packet operations and cleanup stay on its owner
-/// thread. Preserve the production pools' direct/unique/single-segment
-/// contract. The PMD must honor the requested packet profile and discharge
-/// its buffers/DMA on close. The PMD must supply only valid DPDK mbufs with
-/// valid links/refcounts, each transferring one reference; for net_ring this
-/// also applies to whoever writes the attached RX ring. TX acceptance must
-/// report at most the offered count and take the front of the offered array.
-/// EAL and retained backing survive until all obligations are discharged.
-/// Caller-owned attached rings must outlive device close and return queued
-/// packets before pool destruction. Vdevs are created by EAL from `config`
-/// and live as long as EAL.
+///
+/// `open` hands memory to DPDK and to the card's driver, where the compiler cannot check
+/// its use, and passes the contract of the layer below it on to the caller:
+///
+/// - The device the config names is new to DPDK: never configured or started, and used by
+///   nothing else, in this process or another.
+/// - DPDK, the returned stack, every socket and frame that comes from it, and their
+///   cleanup stay on the thread that called `open`.
+/// - [`Opened::eal`], and whatever else the card depends on, outlives the card: keep it
+///   until the card has been closed and every frame has been dropped.
+/// - Nothing outside switch changes the packet buffers of the card's pools through DPDK.
+///   Each stays a direct, single-segment buffer with one reference.
+/// - The card's driver (a PMD, in DPDK's words) honors the packet settings `open`
+///   requests. It hands over only valid DPDK packet buffers with valid links and reference
+///   counts, each carrying one reference. When sending, it reports at most the number of
+///   packets offered and takes them from the front of the array. On close it gives back
+///   its buffers and DMA mappings.
+/// - For a `net_ring` device, whoever writes to the attached receive ring is bound by the
+///   same rule for packet buffers. Rings the caller attached must outlive the card's
+///   close, and the packets queued in them must be returned before the pools are
+///   destroyed.
+///
+/// A device that DPDK creates from the config (a vdev such as `net_tap`) lives as long as
+/// DPDK does, which satisfies the lifetime rule for it.
 pub unsafe fn open(
     config: &Config,
     sizing: &Sizing,

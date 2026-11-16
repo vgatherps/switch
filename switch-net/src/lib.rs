@@ -1,9 +1,9 @@
 //! Async TCP and UDP sockets for tasks on the switch runtime.
 //!
 //! The loop that drives the program owns a [`Net`] and moves packets with [`round`]; tasks hold a
-//! [`NetHandle`] to open sockets and get frames to send. A `Net` either runs a [`Stack`] in this
-//! process ([`Net::new`]) or reaches the NIC through the junction daemon ([`Net::remote`]); task
-//! code is the same for both. Applications use this crate as `switch::net`.
+//! [`NetHandle`] to open sockets and get frames to send. A `Net` either owns the card
+//! ([`Net::new`]) or shares a card through the daemon ([`Net::remote`]); task code is the same
+//! for both. Applications use this crate as `switch::net`.
 
 mod drive;
 mod remote;
@@ -19,6 +19,7 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 
 pub use dpdk_smoltcp::smoltcp::phy::{ImmutableFrame, OwnedFrame};
+/// TCP socket configuration and protocol types. See [`TcpStream`] for TCP timer behavior.
 pub use dpdk_smoltcp::smoltcp::socket::tcp;
 pub use dpdk_smoltcp::smoltcp::time::Instant;
 pub use dpdk_smoltcp::smoltcp::wire::{IpEndpoint, IpListenEndpoint, Ipv4Address};
@@ -41,10 +42,11 @@ pub struct RemoteConfig {
 /// returns it.
 #[derive(Debug)]
 pub enum TurnError {
-    /// Local backend: the [`Stack`] failed, for example `StackError::TimeWentBackwards` when
-    /// `now` is earlier than the previous receive's, or a NIC port error.
+    /// When owning the card: the network stack failed, for example
+    /// `StackError::TimeWentBackwards` when `now` is earlier than the previous receive's,
+    /// or a card error.
     Stack(StackError),
-    /// Junction backend: the session with the daemon ended. The first error carries the reason;
+    /// When sharing a card: the session with the daemon ended. The first error carries the reason;
     /// every later `receive` and `send` returns
     /// [`Lost::Disconnected`](switch_junction::session::Lost::Disconnected). See [`Error::HostLost`]
     /// for what sockets do afterwards.
@@ -134,16 +136,16 @@ struct Local {
     /// and the waiters behind it are woken one `receive` later.
     frame_waiters: VecDeque<StoredWaker>,
     ingress_budget: usize,
-    /// Frames handed to the Stack since the last successful send.
+    /// Frames handed to the network stack since the last successful send.
     tx_handed: usize,
     /// `Stack::tx_burst`: from this many `tx_handed` on, each handed frame requests a turn.
     tx_burst: usize,
 }
 
 impl Local {
-    /// One frame handed to the Stack: at one TX burst since the last send, end the
+    /// One frame handed to the network stack: at one TX burst since the last send, end the
     /// running `Runtime::poll` after this task (`switch_runtime::request_turn`), so the loop
-    /// sends and the frames leave sooner.
+    /// attempts transmission sooner.
     #[inline]
     fn handed_over(&mut self) {
         self.tx_handed += 1;
@@ -358,33 +360,37 @@ fn accepting(state: tcp::State) -> bool {
 ///
 /// Each round calls [`receive`](Net::receive), polls the runtime, then calls
 /// [`send`](Net::send); [`round`] does all three. Tasks get a [`NetHandle`] from
-/// [`handle`](Net::handle). The constructor chooses the backend:
+/// [`handle`](Net::handle). Choose how the program gets its card:
 ///
-/// | | [`Net::new`] (local) | [`Net::remote`] (junction) |
+/// | | Owning the card | Sharing a card |
 /// |---|---|---|
-/// | NIC owned by | this process; the `Net` holds the [`Stack`] | the junction daemon; the `Net` holds a [`Session`](switch_junction::session::Session) |
-/// | Socket table | `max_sockets` TCP plus `max_udp_sockets` UDP sockets of the Stack | `Session::max_sockets` sockets of either kind |
+/// | Constructor | [`Net::new`] | [`Net::remote`] |
+/// | Card owned by | this process; the `Net` holds the network stack | the daemon; the `Net` holds a [`Session`](switch_junction::session::Session) |
+/// | Socket table | `max_sockets` TCP plus `max_udp_sockets` UDP sockets of the network stack | `Session::max_sockets` sockets of either kind |
+/// | TCP configuration | `rx_capacity` above 1 GiB or `mss_cap: Some(0)` panics | those settings, zero `tx_capacity`, or capacities that do not fit in `u32` return `InvalidConfig` |
+/// | Send copies | see [`TcpTx::try_send`] and [`UdpTx::send`] | into shared memory, then into the daemon's send buffers; TCP backlog can add another copy |
 /// | Teardown | [`Net::into_stack`] | [`Net::into_session`] |
 ///
-/// Behavior that differs by backend is described on [`Net::receive`], [`Net::send`],
+/// Other differences are described on [`Net::receive`], [`Net::send`],
 /// [`Net::poll_at`], [`NetHandle::tx_frame`], [`TcpTx::room`], [`TcpTx::try_send`],
 /// [`TcpTx::send_capacity`], [`UdpTx::send`], [`UdpTx::stats`] and [`Error`].
 ///
-/// No type in this module is `Send`. Every future it returns must be polled by a task of the
-/// switch runtime: under any other executor, the first poll that returns `Pending` panics with
+/// `Net`, its handles, sockets and frames are not `Send`; keep them on the thread running
+/// the loop. Every future it returns must be polled by a task of the switch runtime: under
+/// any other executor, the first poll that returns `Pending` panics with
 /// "StoredWaker needs a switch task waker".
 ///
-/// Dropping the `Net` while handles or sockets are alive keeps its backend alive in them, but
-/// nothing receives or sends any more: tasks waiting on those sockets are never woken.
+/// Dropping the `Net` while handles or sockets are alive keeps the network stack or session
+/// alive in them, but nothing receives or sends any more: waiting tasks are never woken.
 pub struct Net {
     shared: Shared,
 }
 
 impl Net {
-    /// A `Net` over a [`Stack`] running in this process.
+    /// A `Net` that owns its card through the supplied network stack.
     ///
-    /// The socket table has room for the Stack's `max_sockets` TCP and `max_udp_sockets` UDP
-    /// sockets.
+    /// The socket table has room for the network stack's `max_sockets` TCP and
+    /// `max_udp_sockets` UDP sockets.
     ///
     /// # Panics
     ///
@@ -407,7 +413,7 @@ impl Net {
         Net { shared: Rc::new(RefCell::new(Inner::Local(inner))) }
     }
 
-    /// A `Net` over a session with the junction daemon, which runs the Stack and owns the NIC.
+    /// A `Net` that shares a card through a session with the daemon.
     ///
     /// The socket table has `session.max_sockets()` slots, shared by TCP and UDP. The frame pool
     /// for [`NetHandle::tx_frame`] is allocated here: `config.tx_frames` buffers of
@@ -432,21 +438,21 @@ impl Net {
     /// has free frames. Tasks are woken even when this returns an error, because the error can
     /// come after packets were taken in.
     ///
-    /// | Backend | What it does | Errors |
+    /// | | Owning the card | Sharing a card |
     /// |---|---|---|
-    /// | local | [`Stack::receive`] at `now` with [`NetConfig::ingress_budget`]; answers what needs an immediate answer (ACKs, resets, ARP) | [`TurnError::Stack`] |
-    /// | junction | polls the session once: sends pending control messages, applies the daemon's events, collects received packets; `now` is unused | [`TurnError::HostLost`] |
+    /// | Work | [`Stack::receive`] at `now` with [`NetConfig::ingress_budget`]; offers immediate replies: resets, immediate and challenge ACKs, and ARP replies; delayed ACKs wait for `send` | polls the session once: sends pending control messages, applies the daemon's events, collects received packets; `now` is unused |
+    /// | Errors | [`TurnError::Stack`] | [`TurnError::HostLost`] |
     ///
     /// The returned [`Turn`] counts:
     ///
-    /// | Field | Local | Junction |
+    /// | Field | Owning the card | Sharing a card |
     /// |---|---|---|
     /// | `rx_received` | packets the RX burst staged | packets delivered to an open socket |
     /// | `rx_rejected` | received packets dropped as unsupported or with a bad IPv4 header checksum | 0 |
     /// | `rx_processed` | staged packets handed to TCP/IP processing | daemon events plus packets delivered |
     /// | `rx_staged` | packets still staged because the budget ran out; receive again promptly | 0 |
-    /// | `tx_accepted` | packets the NIC accepted during this call | 0 |
-    /// | `tx_pending` | packets still waiting for the NIC after this call | 0 |
+    /// | `tx_accepted` | packets the card accepted during this call | 0 |
+    /// | `tx_pending` | packets still waiting for the card after this call | 0 |
     ///
     /// If a panic unwinds out of `receive`, drop the `Net`.
     #[inline]
@@ -466,17 +472,19 @@ impl Net {
         turn.map_err(TurnError::Stack)
     }
 
-    /// The send step: what tasks queued since [`receive`](Net::receive) leaves.
+    /// The send step: attempts to transmit queued data and flush pending packets.
     ///
-    /// | Backend | What it does | Returned [`Sent`] | Errors |
-    /// |---|---|---|---|
-    /// | local | [`Stack::send`]: TCP sends queued data, retransmissions and window updates; packets go to the NIC | `tx_accepted`: packets the NIC accepted in the final flush; `tx_pending`: packets still waiting for it | [`TurnError::Stack`] |
-    /// | junction | nothing left to push: [`TcpTx::try_send`] and [`UdpTx::send`] already copied into the send ring | `tx_accepted`: records committed since the last `send`; `tx_pending`: 0 | [`TurnError::HostLost`] once the session is lost |
+    /// | | Owning the card | Sharing a card |
+    /// |---|---|---|
+    /// | Work | [`Stack::send`]: attempts queued TCP data, retransmissions and window updates, then flushes to the card | [`TcpTx::try_send`] and [`UdpTx::send`] already published their send-ring records |
+    /// | Returned [`Sent`] | `tx_accepted`: packets the card accepted in the final flush; `tx_pending`: packets still waiting for it | `tx_accepted`: records committed since the last `send`; `tx_pending`: 0 |
+    /// | Errors | [`TurnError::Stack`] | [`TurnError::HostLost`] once the session is lost |
     ///
-    /// On the local backend, frames handed to the Stack (successful `try_send` and `UdpTx::send`)
-    /// are counted from the last successful `send`. Once the count reaches the NIC port's TX
-    /// burst size ([`Stack::tx_burst`]), each further one asks the runtime to end the current
-    /// poll after that task, so the send step comes sooner.
+    /// Transmission can wait for the peer's window, congestion control or card capacity.
+    /// When owning the card, frames handed over by all tasks are counted since the last
+    /// successful `send`. The frame that brings the count to [`Stack::tx_burst`], and every
+    /// later one, asks the runtime to end the running poll after its task so the send step
+    /// can run sooner.
     ///
     /// If a panic unwinds out of `send`, drop the `Net`.
     #[inline]
@@ -491,9 +499,11 @@ impl Net {
         }
     }
 
-    /// When the local Stack's next TCP timer is due ([`Stack::poll_at`]); a loop that sleeps
-    /// while idle should wake by then. Always `None` on the junction backend, where timers run
-    /// in the daemon.
+    /// When the network stack's sockets next need a turn ([`Stack::poll_at`]): TCP timers,
+    /// segments ready to send and dropped sockets to free. Arriving, staged and pending
+    /// packets and ARP probes are not covered, so cap the sleep even when this returns `None`.
+    /// A loop that sleeps while idle should wake by this deadline. Always `None` when
+    /// sharing a card: the daemon runs TCP's timers.
     pub fn poll_at(&mut self) -> Option<Instant> {
         match &mut *self.shared.borrow_mut() {
             Inner::Local(local) => local.stack.poll_at(),
@@ -502,9 +512,9 @@ impl Net {
     }
 
     /// The [`Stack`] back, for teardown. Returns this `Net` as the error while any
-    /// [`NetHandle`], socket half or unfinished opening future is alive, and always on the
-    /// junction backend. Received frames do not hold the `Net`; they stay valid after the Stack
-    /// is gone.
+    /// [`NetHandle`], socket half or unfinished opening future is alive, and always when
+    /// sharing a card. Received frames do not hold the `Net`; they stay valid after the
+    /// network stack is gone.
     pub fn into_stack(self) -> Result<Stack, Net> {
         match Rc::try_unwrap(self.shared) {
             Ok(cell) => match cell.into_inner() {
@@ -517,7 +527,7 @@ impl Net {
 
     /// The [`Session`](switch_junction::session::Session) back, for teardown. Returns this `Net`
     /// as the error while any [`NetHandle`], socket half or unfinished opening future is alive,
-    /// and always on the local backend. The caller then finishes the session
+    /// and always when owning the card. The caller then finishes the session
     /// ([`Session::finish`](switch_junction::session::Session::finish)) and polls it until
     /// [`Session::closed`](switch_junction::session::Session::closed).
     pub fn into_session(self) -> Result<switch_junction::session::Session, Net> {
@@ -539,17 +549,12 @@ impl Net {
 /// when called, not at the first poll. The returned future waits for the outcome; dropping it
 /// before it resolves drops the socket. Each socket takes one slot in the Net's socket table
 /// until both its halves are dropped.
-///
-/// On the local backend every opening error resolves on the first poll, with no socket left
-/// behind. On the junction backend the first poll returns `SocketsFull` (no free session slot),
-/// `InvalidConfig` and `HostLost`; errors the daemon decides (`SocketsFull`, `PortInUse`,
-/// `Unaddressable`, `InvalidState`) arrive after a round trip, in a later receive step.
 #[derive(Clone)]
 pub struct NetHandle {
     shared: Shared,
 }
 
-/// A socket operation failed. The same type on both backends.
+/// A socket operation failed.
 ///
 /// `Copy`, with `Display` and `std::error::Error`. The enum is `#[repr(u32)]` with fixed
 /// discriminants, so `error as u32` is a stable code.
@@ -576,26 +581,26 @@ pub struct NetHandle {
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
-    /// No free slot in the socket table, from any opening call. On the local backend a dropped
+    /// No free slot in the socket table, from any opening call. When owning the card, a dropped
     /// TCP connection keeps its slot until it finishes closing, so a program that closes and
-    /// reconnects quickly can see this below the limit. On the junction backend it comes from
+    /// reconnects quickly can see this below the limit. When sharing a card it comes from
     /// the session at once or, when the daemon has no room, after a round trip.
     SocketsFull = 1,
     /// The local endpoint is taken: `tcp_connect` when a connection already uses the same local
     /// and remote endpoints, `udp_bind` when the address (or all-IP) and port are already bound.
-    /// On the junction backend the daemon closes dropped sockets asynchronously, so binding a
+    /// When sharing a card, the daemon closes dropped sockets asynchronously, so binding a
     /// port right after dropping its socket can return this.
     PortInUse = 2,
-    /// `udp_bind` with port 0 or `rx_queue` 0, on both backends. On the junction backend also
-    /// a `tcp::Config` with `mss_cap: Some(0)`, `rx_capacity` above 1 GiB, `tx_capacity` 0 or a
-    /// size that does not fit in `u32`, and a `UdpConfig::rx_queue` that does not fit in `u32`.
-    /// The local backend panics on those TCP settings instead (see
-    /// [`NetHandle::tcp_connect`]).
+    /// `udp_bind` with port 0 or `rx_queue` 0. When sharing a card, also a `tcp::Config`
+    /// with `mss_cap: Some(0)`, `rx_capacity` above 1 GiB, `tx_capacity` 0 or a capacity that
+    /// does not fit in `u32`, and a `UdpConfig::rx_queue` that does not fit in `u32`.
+    /// When owning the card, `rx_capacity` above 1 GiB and `mss_cap: Some(0)` panic;
+    /// a `tx_capacity` of 0 or above `u32::MAX` is accepted.
     InvalidConfig = 3,
     /// An endpoint cannot be used: a local or remote port of 0, an unspecified remote address,
-    /// or a local address the Net does not own, from the opening calls. Also from a local
-    /// `UdpTx::send` to an unusable destination. On the junction backend opening errors of this
-    /// kind come from the daemon after a round trip.
+    /// or a local address the Net does not own, from the opening calls. Also from
+    /// `UdpTx::send` to an unusable destination when owning the card. When sharing a card,
+    /// opening errors of this kind come from the daemon after a round trip.
     Unaddressable = 4,
     /// `tcp_connect`: the peer reset the connection attempt.
     Refused = 5,
@@ -606,37 +611,39 @@ pub enum Error {
     Finished = 7,
     /// The socket is in no state for the operation: `TcpRx::recv` after a reset (even one that
     /// followed a FIN) or in a state without receive; `TcpTx::room` and `try_send` after a reset,
-    /// close or `shutdown`; an opening call the Stack refuses. On the junction backend also
-    /// `UdpTx::send` on a closed socket, and TCP `recv` (after queued data), `room`, `try_send`
+    /// close or `shutdown`; an opening call the network stack refuses. When sharing a card,
+    /// also `UdpTx::send` on a closed socket, and TCP `recv` (after queued data), `room`, `try_send`
     /// and UDP `send` once the session is lost.
     InvalidState = 8,
     /// The data can never fit: `TcpTx::room` with `len` above `send_capacity()` or `u32::MAX`,
-    /// `UdpTx::send` of a datagram larger than the path allows, or on the junction backend a
+    /// `UdpTx::send` of a datagram larger than the path allows, or when sharing a card a
     /// frame larger than the session's largest record.
     TooLarge = 9,
-    /// No room now; the frame comes back with the error. TCP: wait for `room` and retry. UDP:
-    /// retry after a later send step. Locally, UDP returns it when the queue of outgoing packets
-    /// is full or a shared frame needs a copy and the frame pool is empty. On the junction
-    /// backend it means the send ring is full, and `room` on every socket of the `Net` then
-    /// waits until the next receive step.
+    /// No room now; the frame comes back with the error. TCP: wait for `room` and retry.
+    /// UDP: retry after later rounds free capacity. When owning the card, UDP returns it when
+    /// the outgoing packet queue is full, or a shared or off-start frame needs a copy and the
+    /// frame pool is empty. When sharing a card it means the send ring is full, and `room`
+    /// on every socket of the `Net` then waits until the next receive step.
     Full = 10,
     /// `TcpTx::try_send` of a zero-length frame. An empty UDP datagram is valid.
     Empty = 11,
-    /// `try_send` or `UdpTx::send` of a frame from another `Net`'s pool; checked before any
-    /// other error. [`TcpTx::is_on`] tells whether a handle's frames belong to a stream.
+    /// `try_send` or `UdpTx::send` of a frame not from this `Net`'s TX-frame pool, including
+    /// a received frame from this same `Net`. Checked before any other error.
+    /// [`TcpTx::is_on`] checks which `Net` a stream uses.
     Foreign = 12,
     /// `UdpTx::send` with `to: None`: UDP sockets here have no default destination.
     NoDestination = 13,
-    /// Not returned: this module has no connected UDP sockets. The code stays reserved.
+    /// Reserved; never returned.
     PeerMismatch = 14,
-    /// Local `UdpTx::send`: the Stack has no route to the destination. On the junction backend
-    /// the daemon drops such datagrams without reporting.
+    /// `UdpTx::send` when owning the card: the network stack has no route to the destination.
+    /// When sharing a card, the daemon drops such datagrams without reporting.
     NoRoute = 15,
-    /// Local `UdpTx::send`: the destination's hardware address is not known yet. Keep the frame
-    /// and retry after a later receive step has taken in the ARP reply. On the junction backend
-    /// the daemon drops such datagrams without reporting.
+    /// `UdpTx::send` when owning the card: the destination's hardware address is not known
+    /// yet. Keep the frame and retry after later receive steps can take in an ARP reply.
+    /// A reply is not guaranteed. When sharing a card, the daemon drops such datagrams
+    /// without reporting.
     NeighborPending = 16,
-    /// Junction backend: the session with the daemon is gone. Returned by opens that were
+    /// When sharing a card: the session with the daemon is gone. Returned by opens that were
     /// waiting and by every later `tcp_connect`, `tcp_accept` and `udp_bind`. After the loss,
     /// TCP `recv` returns queued data and then `InvalidState`; `room`, `try_send` and UDP `send`
     /// return `InvalidState`; `delivered` resolves; UDP `recv` waits forever; `tx_frame` still
@@ -757,7 +764,7 @@ impl NetHandle {
     /// The future resolves to the [`TcpStream`] once the handshake completes, to
     /// [`Error::Refused`] if the peer reset the attempt, or to [`Error::Closed`] if it ended
     /// another way. Other errors: `SocketsFull`, `PortInUse`, `Unaddressable`, `InvalidState`,
-    /// and on the junction backend `InvalidConfig` and `HostLost`.
+    /// and when sharing a card `InvalidConfig` and `HostLost`.
     ///
     /// `local.port` must be nonzero: there is no ephemeral port allocator. `local.addr: None`
     /// uses any of the Net's addresses. A port of 0 on either side, an unspecified remote
@@ -765,8 +772,8 @@ impl NetHandle {
     ///
     /// # Panics
     ///
-    /// On the local backend, at the call, if `config.rx_capacity` exceeds 1 GiB or
-    /// `config.mss_cap` is `Some(0)`. The junction backend returns `InvalidConfig` instead.
+    /// When owning the card, at the call, if `config.rx_capacity` exceeds 1 GiB or
+    /// `config.mss_cap` is `Some(0)`. Sharing a card returns `InvalidConfig` instead.
     pub fn tcp_connect(
         &self,
         config: tcp::Config,
@@ -793,18 +800,17 @@ impl NetHandle {
     /// Opens a TCP socket listening on `local`; it becomes one accepted connection.
     ///
     /// There is no accept queue. To serve many connections on a port, call `tcp_accept` again
-    /// as soon as one completes. Several sockets may listen on one port. On the local backend a
-    /// SYN goes to a listener bound to its destination address if one exists, otherwise to an
-    /// all-IP listener (`addr: None`) on the port; among several in the chosen group, the one in
-    /// the lowest slot takes it.
+    /// as soon as one completes. Several sockets may listen on one port. When owning the card,
+    /// a SYN goes to a listener bound to its destination address if one exists, otherwise to an
+    /// all-IP listener (`addr: None`) on the port.
     ///
     /// A reset during the handshake returns the socket to listening and the future keeps
     /// waiting. If the connection already closed when the future completes, it still resolves
     /// to a stream: data the peer sent is readable, then `recv` reports the end, and
     /// [`TcpTx::max_segment_payload`] is `None`.
     ///
-    /// Errors: `Unaddressable` for port 0, `SocketsFull`, `InvalidState`, and on the junction
-    /// backend `InvalidConfig` and `HostLost`.
+    /// Errors: `Unaddressable` for port 0, `SocketsFull`, `InvalidState`, and when sharing
+    /// a card `InvalidConfig` and `HostLost`.
     ///
     /// # Panics
     ///
@@ -851,12 +857,12 @@ impl NetHandle {
         }
     }
 
-    /// Binds a UDP socket as `config` says. The future resolves on its first poll on the local
-    /// backend, and once the daemon confirms on the junction backend.
+    /// Binds a UDP socket as `config` says. When owning the card, the future resolves on its
+    /// first poll; when sharing a card, once the daemon confirms.
     ///
-    /// Errors, local order: `InvalidConfig` (port 0 or `rx_queue` 0), `Unaddressable`
+    /// Errors when owning the card, in order: `InvalidConfig` (port 0 or `rx_queue` 0), `Unaddressable`
     /// (`local_addr` is not a unicast address the Net owns), `PortInUse` (that address, or
-    /// all-IP, already bound on the port), `SocketsFull`. The junction backend returns the same
+    /// all-IP, already bound on the port), `SocketsFull`. Sharing a card returns the same
     /// kinds, plus `HostLost`.
     pub fn udp_bind(&self, config: UdpConfig) -> Binding {
         Binding { socket: Some(self.open_udp(config)) }
@@ -882,14 +888,13 @@ impl NetHandle {
     /// length, then `freeze` for [`TcpTx::try_send`] or [`UdpTx::send`]. Dropping a frame
     /// returns it to its pool.
     ///
-    /// | Backend | Pool | `len()` |
+    /// | | Owning the card | Sharing a card |
     /// |---|---|---|
-    /// | local | the Stack's frame pool, shared by every socket; a sent TCP frame stays in its socket until the peer acknowledges it | IP MTU − 28, the largest UDP payload |
-    /// | junction | the Net's own [`RemoteConfig::tx_frames`] buffers; a sent frame is copied and returns at once | `Session::frame_capacity()` |
+    /// | Pool | the network stack's frame pool, shared by every socket; with `switch::nic::open`, `Sizing::frame_share` adds buffers beyond its reserve; see [`TcpTx::try_send`] for retention and copying | the Net's own [`RemoteConfig::tx_frames`] buffers; a sent frame is copied and returns at once |
+    /// | `len()` | IP MTU − 28, the largest UDP payload | `Session::frame_capacity()` |
     ///
     /// While the pool is empty the task waits in line. Each [`Net::receive`] wakes as many
-    /// waiting tasks, oldest first, as the pool has free frames; one that finds its frame taken
-    /// by another task waits again at the back.
+    /// waiting tasks, oldest first, as the pool has free frames.
     pub fn tx_frame(&self) -> TxFrameWait<'_> {
         TxFrameWait { handle: self }
     }
@@ -947,7 +952,7 @@ fn poll_op<R>(
 }
 
 /// One half of a socket's entry. Dropping it clears the half's parked task;
-/// dropping the last half drops the conduit socket.
+/// dropping the last half drops the socket.
 struct Half {
     shared: Shared,
     index: u32,
@@ -1096,9 +1101,20 @@ impl Future for Binding {
 /// each half allows one waiting operation at a time.
 ///
 /// Dropping both halves closes the socket like Linux `close()`: a reset if received data is
-/// unread, otherwise a FIN. Dropping only one half leaves the other working. On the local
-/// backend the slot stays taken until the connection finishes closing; on the junction backend
+/// unread, otherwise a FIN. Dropping only one half leaves the other working. When owning the
+/// card, the slot stays taken until the connection finishes closing; when sharing a card,
 /// the daemon closes it asynchronously.
+///
+/// TCP timers run when the network stack is driven; when sharing a card, the daemon drives it.
+///
+/// | Behavior | Timing |
+/// |---|---|
+/// | Retransmission timeout | 300 ms before the first round-trip sample; then the smoothed round-trip time plus the larger of four times its variation and 50 ms. Each timeout doubles the wait, up to 60 s. |
+/// | Giving up | No retry limit while the program keeps the connection open. Gracefully dropped connections reset at 8 retransmission back-offs. Once dropped and waiting for the peer's FIN after our FIN was acknowledged, a connection has a 60 s timeout. |
+/// | Delayed acknowledgement | 10 ms; an acknowledgement can be sent sooner. |
+/// | Keep-alive | None; an idle connection sends nothing. |
+/// | TIME-WAIT | 10 s after both sides complete an active or simultaneous close; further packets can extend it. This is not a countdown from [`TcpTx::shutdown`]. |
+/// | Reusing endpoints | The same local-address/port and remote-address/port pair stays in use until closing and TIME-WAIT finish. A connection still held while waiting for the peer's FIN can wait indefinitely. |
 pub struct TcpStream {
     rx: TcpRx,
     tx: TcpTx,
@@ -1126,7 +1142,7 @@ impl TcpRx {
     ///
     /// - [`Error::Finished`] after the peer's FIN, with no reset.
     /// - [`Error::InvalidState`] after the peer's reset (even one that followed a FIN), in a
-    ///   state without receive, or on the junction backend once the session is lost.
+    ///   state without receive, or when sharing a card once the session is lost.
     ///
     /// Dropping the future loses no data.
     pub fn recv(&mut self) -> Recv<'_> {
@@ -1185,28 +1201,33 @@ impl TcpTx {
     /// - `Err(TooLarge)` on the first poll if `len` exceeds [`send_capacity`](TcpTx::send_capacity)
     ///   or `u32::MAX`; it would never fit. Checked before the socket state.
     /// - `Err(InvalidState)` once the socket cannot send: reset, closed, after
-    ///   [`shutdown`](TcpTx::shutdown), or on the junction backend once the session is lost.
-    /// - `Ok(())` otherwise, with a different promise per backend. Local: `len` bytes fit in the
-    ///   socket's free send buffer, and a `try_send` of a frame that size succeeds until the next
-    ///   [`Net::receive`]. Junction: a hint only. It waits only after some socket of this `Net`
-    ///   got [`Error::Full`] since the last receive step, and `try_send` can still return `Full`.
+    ///   [`shutdown`](TcpTx::shutdown), or when sharing a card once the session is lost.
+    /// - `Ok(())` otherwise. When owning the card, `len` bytes fit beside all queued and
+    ///   unacknowledged bytes. A nonempty frame of that length from this Net's TX-frame pool
+    ///   will not return `Full` before the next [`Net::receive`]. No frame is reserved.
+    ///   When sharing a card, this is a hint: it waits only after some socket of this `Net`
+    ///   got [`Error::Full`] since the last receive step; `try_send` can still return `Full`.
     pub fn room(&mut self, len: usize) -> Room<'_> {
         Room { tx: self, len }
     }
 
-    /// Queues `frame` without waiting; it leaves in the next [`Net::send`].
+    /// Queues `frame` without waiting; [`Net::send`] attempts to transmit queued data.
     ///
-    /// Errors, checked in this order, each returning the same frame: `Foreign` (the frame is
-    /// from another `Net`), `InvalidState` (the socket cannot send), `Empty` (zero length),
-    /// `Full` (no room now; wait for [`room`](TcpTx::room) and retry). On the junction backend
+    /// Errors, checked in this order, each returning the same frame: `Foreign` (not from this
+    /// Net's TX-frame pool), `InvalidState` (the socket cannot send), `Empty` (zero length),
+    /// `Full` (no room now; wait for [`room`](TcpTx::room) and retry). When sharing a card,
     /// `Full` means the send ring is full, and `TooLarge` that the frame exceeds the session's
     /// largest record.
     ///
-    /// Local backend: the socket holds the frame until the peer acknowledges its last byte. A
-    /// frame that fits into the end of the previous unsent frame within one segment is copied
-    /// there and freed at once. A frame longer than the segment size goes out in several
-    /// segments. Junction backend: the bytes are copied into the send ring and the frame returns
-    /// to the pool at once.
+    /// When owning the card, the socket holds the frame until its last byte is acknowledged.
+    /// If the previous frame is still unsent, has no other handle, and has room for this one
+    /// within one segment, this frame is copied there and freed at once. Otherwise, a
+    /// transmission sends it in place only if it has one
+    /// remaining handle, retains its original payload start, starts at that segment's stream
+    /// offset and fits the segment allowed by the peer's window and congestion control.
+    /// Other transmissions copy the segment payload; retransmissions can copy it again.
+    /// When sharing a card, bytes are copied into the send ring and the frame returns to its
+    /// pool at once. The daemon copies them into its frame pool, possibly through its backlog first.
     pub fn try_send(&mut self, frame: ImmutableFrame) -> Result<(), (ImmutableFrame, Error)> {
         let mut inner = self.0.shared.borrow_mut();
         let Inner::Local(inner) = &mut *inner else {
@@ -1219,8 +1240,8 @@ impl TcpTx {
         Ok(())
     }
 
-    /// The largest `len` [`room`](TcpTx::room) accepts. Local: the socket's send buffer,
-    /// `tcp::Config::tx_capacity`. Junction: the session's largest record minus 16 bytes.
+    /// The largest `len` [`room`](TcpTx::room) accepts. When owning the card: the socket's
+    /// `tcp::Config::tx_capacity`. When sharing a card: the session's largest record minus 16 bytes.
     pub fn send_capacity(&self) -> usize {
         let mut inner = self.0.shared.borrow_mut();
         let Inner::Local(inner) = &mut *inner else {
@@ -1231,10 +1252,10 @@ impl TcpTx {
         stack.tcp(handle).send_capacity()
     }
 
-    /// The segment size the connection settled on, read when the stream was handed to the task.
+    /// The connection's maximum segment payload, read when the stream was handed to the task.
     /// `None` if an accepted connection had already closed by then; otherwise it stays `Some`
-    /// after close or reset. On the local backend, filling a frame with at most this many
-    /// bytes keeps it to one segment.
+    /// after close or reset. This is a ceiling: the peer's window and congestion control can
+    /// split a smaller frame too.
     pub fn max_segment_payload(&self) -> Option<usize> {
         self.1
     }
@@ -1261,8 +1282,8 @@ impl TcpTx {
 
     /// Waits until the peer has acknowledged every byte and the FIN after
     /// [`shutdown`](TcpTx::shutdown), or the connection closed and nothing more can be delivered;
-    /// on the junction backend also once the session is lost. Until then the queued bytes exist
-    /// only in the socket: a local Stack torn down earlier never sends them.
+    /// when sharing a card also once the session is lost. Until then queued bytes can remain
+    /// unsent: tearing down an owned network stack earlier loses them.
     pub fn delivered(&mut self) -> Delivered<'_> {
         Delivered { tx: self }
     }
@@ -1338,10 +1359,10 @@ impl Drop for Room<'_> {
 
 /// Received in-order TCP data.
 ///
-/// The frame stays valid after its socket, the `Net` and the Stack are gone. While held it
-/// keeps its buffer: on the local backend a buffer of the Stack's RX pool (the TCP window does
-/// not shrink, so later data still arrives); on the junction backend space in the session's
-/// receive ring, shared by every socket of the session.
+/// The frame stays valid after its socket, the `Net` and the network stack are gone. While
+/// held it keeps its buffer: when owning the card, a buffer of the network stack's RX pool
+/// (the TCP window does not shrink, so later data still arrives); when sharing a card, space
+/// in the session's receive ring, shared by every socket of the session.
 #[derive(Debug)]
 pub struct TcpFrame {
     frame: OwnedFrame,
@@ -1358,27 +1379,28 @@ impl TcpFrame {
         &self.frame
     }
 
-    /// The received bytes, writable.
+    /// Borrows the received bytes mutably to edit them in place.
     pub fn payload_mut(&mut self) -> &mut [u8] {
         &mut self.frame
     }
 
-    /// The NIC's receive timestamp of the packet that carried the data, raw in the driver's
+    /// The card's receive timestamp of the packet that carried the data, raw in the driver's
     /// units; 0 when there is none.
     pub fn rx_timestamp(&self) -> u64 {
         self.rx_timestamp
     }
 
-    /// The payload as a plain [`OwnedFrame`], which can be frozen and cloned without copying.
+    /// Gives up this wrapper for an [`OwnedFrame`] that can be frozen and cloned without copying.
     /// Read [`rx_timestamp`](TcpFrame::rx_timestamp) first; the frame does not carry it.
     pub fn into_frame(self) -> OwnedFrame {
         self.frame
     }
 }
 
-/// A bound UDP socket. [`split`](UdpSocket::split) gives a receive half and a send half.
-/// Dropping both unbinds the port; on the junction backend the daemon does that
-/// asynchronously.
+/// A bound UDP socket.
+///
+/// [`split`](UdpSocket::split) gives a receive half and a send half. Dropping both unbinds the
+/// port; when sharing a card, the daemon does that asynchronously.
 pub struct UdpSocket {
     rx: UdpRx,
     tx: UdpTx,
@@ -1400,7 +1422,7 @@ impl UdpSocket {
 pub struct UdpRx(Half);
 
 impl UdpRx {
-    /// Waits for the next queued [`Datagram`]; never fails. On the junction backend it keeps
+    /// Waits for the next queued [`Datagram`]; never fails. When sharing a card it keeps
     /// waiting after the session is lost.
     pub fn recv(&mut self) -> UdpRecv<'_> {
         UdpRecv { rx: self }
@@ -1411,19 +1433,22 @@ impl UdpRx {
 pub struct UdpTx(Half);
 
 impl UdpTx {
-    /// Sends `frame` as one datagram to `to`; it leaves in the next [`Net::send`]. A zero-length
-    /// frame is an empty datagram. Every error returns the same frame.
+    /// Queues `frame` as one datagram to `to`; transmission can wait for card capacity.
+    /// A zero-length frame is an empty datagram. Every error returns the same frame.
     ///
-    /// | Backend | Errors |
-    /// |---|---|
-    /// | local | `Foreign`, then `NoDestination`, `Unaddressable`, `TooLarge`, `Full` (no free frame to copy a shared frame into), `NoRoute`, `NeighborPending`, `Full` (outgoing queue full) |
-    /// | junction | `Foreign`, `InvalidState` (socket closed or session lost), `NoDestination`, `Full` (send ring full), `TooLarge` |
+    /// | | Owning the card | Sharing a card |
+    /// |---|---|---|
+    /// | Errors, in order | `Foreign`, `NoDestination`, `Unaddressable`, `TooLarge`, `Full` (no frame for a copy), `NoRoute`, `NeighborPending`, `Full` (outgoing queue full) | `Foreign`, `InvalidState` (socket closed or session lost), `NoDestination`, `Full` (send ring full), `TooLarge` |
     ///
-    /// `to: None` always gives `NoDestination`. Retry `Full` after a later send step and
-    /// `NeighborPending` after a later receive step. On the local backend a frame held only
-    /// here is sent in place; a cloned frame is copied into a new pool frame first. On the
-    /// junction backend every send is copied into the send ring, and the daemon drops a datagram
-    /// it cannot route, resolve or address without reporting it.
+    /// `to: None` gives `NoDestination` after the preceding checks. Retry `Full` after later
+    /// rounds free capacity and `NeighborPending` after later receive steps can take in an ARP
+    /// reply; neither recovery is guaranteed.
+    ///
+    /// When owning the card, a frame with one remaining handle and its original payload start
+    /// is sent in place. A shared frame, or one sliced away from that start, is copied into
+    /// another pool frame. When sharing a card, every send is copied into the send ring, then
+    /// into the daemon's frame pool. The daemon drops a datagram it cannot route, resolve or
+    /// address without reporting it.
     pub fn send(&mut self, to: Option<IpEndpoint>, frame: ImmutableFrame) -> Result<(), (ImmutableFrame, Error)> {
         let mut inner = self.0.shared.borrow_mut();
         let Inner::Local(inner) = &mut *inner else {
@@ -1437,8 +1462,8 @@ impl UdpTx {
     }
 
     /// The socket's receive drop counters; `rx_dropped_full` counts datagrams dropped because
-    /// `UdpConfig::rx_queue` was full. On the local backend that queue counts datagrams waiting
-    /// for `recv` and those the program still holds. On the junction backend the daemon applies
+    /// `UdpConfig::rx_queue` was full. When owning the card that queue counts datagrams waiting
+    /// for `recv` and those the program still holds. When sharing a card the daemon applies
     /// `rx_queue` itself and this always returns zeros. Borrows the whole `Net`: keep it off a
     /// hot path.
     pub fn stats(&self) -> UdpSocketStats {
@@ -1482,9 +1507,9 @@ impl Drop for UdpRecv<'_> {
 
 /// A received UDP datagram.
 ///
-/// The frame stays valid after its socket, the `Net` and the Stack are gone. While held it
-/// keeps its buffer: on the local backend a buffer of the Stack's RX pool and one place in the
-/// socket's `rx_queue`; on the junction backend space in the session's receive ring.
+/// The frame stays valid after its socket, the `Net` and the network stack are gone. While
+/// held it keeps its buffer: when owning the card, a buffer of the network stack's RX pool and
+/// one place in the socket's `rx_queue`; when sharing a card, space in the session's receive ring.
 #[derive(Debug)]
 pub struct Datagram {
     frame: OwnedFrame,
@@ -1503,7 +1528,7 @@ impl Datagram {
         &self.frame
     }
 
-    /// The datagram's payload, writable.
+    /// Borrows the datagram's payload mutably to edit it in place.
     pub fn payload_mut(&mut self) -> &mut [u8] {
         &mut self.frame
     }
@@ -1518,13 +1543,13 @@ impl Datagram {
         self.dst_addr
     }
 
-    /// The NIC's receive timestamp, raw in the driver's units; 0 when there is none.
+    /// The card's receive timestamp, raw in the driver's units; 0 when there is none.
     pub fn rx_timestamp(&self) -> u64 {
         self.rx_timestamp
     }
 
-    /// The payload as a plain [`OwnedFrame`]. Read the addresses and timestamp first; the frame
-    /// does not carry them.
+    /// Gives up this wrapper for an [`OwnedFrame`] that can be frozen and cloned without copying.
+    /// Read the addresses and timestamp first; the frame does not carry them.
     pub fn into_frame(self) -> OwnedFrame {
         self.frame
     }

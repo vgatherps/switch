@@ -1,6 +1,6 @@
 //! A Unix-socket service that gives each connecting cephalopod producer its stream id and the
 //! path of the shared ring file, and tells the consumer's `ceph_fifo::Fifo` when streams open
-//! and close. For standalone cephalopod programs; the junction daemon assigns sessions over
+//! and close. For standalone cephalopod programs; `switch-junctiond` assigns sessions over
 //! its own control socket and does not use this crate.
 
 use ceph_proto::{Control, Retire, pack};

@@ -1,4 +1,4 @@
-//! Conduit-only: local TX burst threshold and urgent Runtime turns.
+//! Owning the card: TX burst threshold and urgent Runtime polls.
 
 //! Once a poll's tasks hand the Stack one `tx_burst` of frames, the poll ends before its next
 //! task (`switch_runtime::request_turn`); the Net's send then sends them, and the next poll goes on

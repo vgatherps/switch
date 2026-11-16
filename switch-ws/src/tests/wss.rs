@@ -227,8 +227,8 @@ fn echo() {
     }
 }
 
-/// Fragmented messages both ways, with a ping between the server's fragments answered by the
-/// client between its own.
+/// Fragmented messages in both directions; the client answers a ping received between the
+/// server's fragments before sending its own message.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn fragments_and_ping() {

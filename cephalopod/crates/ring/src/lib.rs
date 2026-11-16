@@ -2,7 +2,7 @@
 //! consumer. One shared file holds a ring for every possible CPU; a [`Writer`] pushes into the
 //! ring of the CPU its thread is running on, so writers never contend, and the single
 //! [`Reader`] reads every ring. Used by `ceph-fifo`, which restores each stream's order, and by
-//! junction's send path: every session holds a `Writer` and the daemon holds the `Reader`.
+//! the daemon's send path: every session holds a `Writer` and the daemon holds the `Reader`.
 
 use std::io;
 use std::os::fd::BorrowedFd;
@@ -62,7 +62,7 @@ pub struct Header {
     pub len: usize,
 }
 
-/// Why a push was not committed. Nothing was written.
+/// Why a push was not committed. No record was published.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PushError {
     /// The ring of the CPU the thread is running on has no room. Space returns after the

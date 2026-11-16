@@ -9,7 +9,7 @@
 //!   one bare `Stack::turn`. The floor for the idle cases.
 //! - net_turn_idle/{udp,tcp}/N: N sockets on a Net, a switch task parked in
 //!   `recv` on each (UDP: bound sockets; TCP: connections established to a
-//!   raw conduit Stack peer). Nothing arrives, no token fires: one
+//!   raw network stack peer). Nothing arrives, no token fires: one
 //!   receive, which finds an empty fired list, and one send.
 //! - net_turn_ready/{udp,tcp}/N: the same, with one datagram (UDP) or one
 //!   1-byte segment (TCP) for the middle socket on the Net's RX ring before

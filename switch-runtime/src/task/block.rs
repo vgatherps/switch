@@ -73,7 +73,7 @@ struct Slot<Fut> {
 pub(crate) struct Shape<Fut>(PhantomData<Fut>);
 
 impl<Fut: Future<Output = ()>> Shape<Fut> {
-    /// Rounded to 16 so a header and the start of its future share a cache line.
+    /// Slot stride rounded up to a multiple of 16 bytes.
     const STRIDE: usize = size_of::<Slot<Fut>>().div_ceil(16) * 16;
     const DATA_OFF: usize = META.div_ceil(align_of::<Slot<Fut>>()) * align_of::<Slot<Fut>>();
     pub(crate) const SLOTS: usize = if Self::DATA_OFF < BLOCK {

@@ -97,8 +97,7 @@ unsafe fn wake_by_ref(header: *const ()) {
 unsafe fn drop(_: *const ()) {}
 
 /// A copyable handle that wakes one task, for futures that park the task polling them
-/// (sockets, channels). `wake` queues the task directly, with no call through a waker
-/// vtable.
+/// (sockets, channels).
 ///
 /// A `StoredWaker` may outlive its task. Waking it then does nothing, or gives one extra
 /// poll to a newer task that took the old task's place. Neither `Send` nor `Sync`: it is
@@ -144,10 +143,10 @@ impl StoredWaker {
     }
 
     /// Wake the task for the next [`crate::Runtime::poll`], not this one: unlike
-    /// [`Self::wake`], it is not polled again in the current poll's later rounds,
+    /// [`Self::wake`], it is not polled again in the current poll's later passes,
     /// unless an ordinary wake already queued it (then this does nothing). A
     /// later ordinary wake on the task's thread (any `Waker`, `StoredWaker::wake`
-    /// or `RemoteWaker`) upgrades the task: it runs in this poll's next round
+    /// or `RemoteWaker`) upgrades the task: it runs in this poll's next pass
     /// after all. A `RemoteWaker` wake from another thread lands at the start of
     /// the next poll, when the deferred task runs anyway.
     #[inline]
@@ -156,9 +155,11 @@ impl StoredWaker {
     }
 }
 
-/// Lets the runtime's other tasks run: the first poll wakes the task for the
-/// next [`crate::Runtime::poll`] ([`StoredWaker::wake_deferred`]) and returns
-/// `Pending`, the second returns `Ready`.
+/// Lets the loop and the runtime's other tasks run.
+///
+/// Normally resumes in the next [`Runtime::poll`](crate::Runtime::poll). An ordinary wake
+/// already queued, or a later ordinary wake on this thread, can resume it in the same poll;
+/// see [`StoredWaker::wake_deferred`].
 ///
 /// # Panics
 /// When polled outside a switch task, like [`StoredWaker::new`].

@@ -1,4 +1,4 @@
-//! Junction transport. Socket slots and generations remain owned by Session.
+//! Transport for sharing a card through the daemon. `Session` owns socket slots and generations.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;

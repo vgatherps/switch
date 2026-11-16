@@ -1,4 +1,4 @@
-//! One echo on the Net against a raw conduit Stack peer, criterion group "echo": `tcp/64`
+//! One echo on the Net against a raw network stack peer, criterion group "echo": `tcp/64`
 //! echoes 64 B of TCP payload as `switch-bench/src/serve.rs`'s tcp echo does; `ws/64` echoes one 64 B
 //! binary message through switch-ws (`accept_ws`, `recv_with_sender`), as serve.rs's ws echo does.
 //!

@@ -1,4 +1,5 @@
-//! Readiness and entry-reuse contracts on both backends; ACK-credit parking is conduit-only.
+//! Readiness and entry-reuse contracts while owning or sharing a card; ACK-credit parking
+//! is tested only while owning the card.
 
 //! Which parked tasks a `Net::receive` wakes: only those whose socket's readiness
 //! token fired and whose socket is ready, also after their entry was
