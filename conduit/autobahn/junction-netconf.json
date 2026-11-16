@@ -1,7 +1,7 @@
 {
   "version": 1,
   "device": {"vdev": "net_tap_echo,iface=cdtap_echo,mac=02:00:00:00:00:fe"},
-  "mac": "02:00:00:00:00:01",
+  "mac": null,
   "ipv4": "192.0.2.2/24",
   "gateway": null,
   "mtu": 1500,

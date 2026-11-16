@@ -13,6 +13,7 @@ Used by `switch-nic`. Depends on [`switch-netconf`](../switch-netconf/README.md)
 - `unsafe fn open(&Config, &Sizing, Option<&[usize]>, &mut impl FnMut() -> Instant) -> Result<Opened, OpenError>`: builds the EAL arguments from the config (main lcore on the one allowed CPU, `--file-prefix`, `-a <pci>,<devargs>` or `--vdev`), initializes EAL, sizes the pools, picks offloads, opens the `Port` and `Stack` (with the config's `owned_ipv4`), waits for link, and resolves the gateway if one is configured. The safety contract is in the doc comment.
 - `Opened { stack, eal, report }` and `OpenReport` (its `Display` prints the lines `switch-nic` shows: link status, `gateway: <ip> at <mac> after <n> ms`, ...). `OpenError` names the failing step.
 - `Sizing`: required fields `frame_share` (frames all sockets together may hold beyond the frame reserve; nothing is reserved per socket), `max_sockets` and `max_udp_sockets` (zero disables UDP). See [Packet-buffer pools](../../../book/src/nic/pools.md) for pool sizing.
+- A vdev config must use `"mac": null`; `switch-netconf` rejects a non-null value because this check applies only to PCI devices. The Stack uses the MAC reported by the device.
 - `offloads`: resolves `Offloads::Auto` and explicit settings against what the PMD advertises.
 
 `open` fails with `OpenError::NotPinned` unless the process may run on exactly one CPU, so run under `taskset -c N` or `docker --cpuset-cpus=N`. [Opening the NIC from code](../../../book/src/nic/open.md) includes `examples/setup.rs` directly.

@@ -56,7 +56,7 @@ A PCI card is an object with six keys:
 
 A tap device, or any other virtual DPDK device, is an object with one key, `vdev`, holding the device string DPDK understands: `"net_tap0,iface=cdnic0"` creates a tap device that Linux shows as the interface `cdnic0`. The part before the first comma is the device name `open` looks up after EAL has created it.
 
-`mac` is the card's Ethernet address as a string (`"0a:12:34:56:78:9a"`) or `null`. The key must be present either way. A PCI card requires a value, and `open` fails with a MAC mismatch if the card reports a different one, which catches a config written for another card. For a tap device write `null`. The Stack always uses the address the device itself reports; the config value is only a check, and only for PCI cards.
+`mac` is the card's Ethernet address as a string (`"0a:12:34:56:78:9a"`) or `null`. The key must be present either way. A PCI card requires a value, and `open` fails with a MAC mismatch if the card reports a different one, which catches a config written for another card. Every vdev, including a tap device, requires `null`; the loader rejects non-null values because `mac` applies to PCI devices. The Stack always uses the address the device itself reports; the config value is only a check.
 
 ## Addresses
 

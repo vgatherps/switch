@@ -280,7 +280,11 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
         Device::Vdev { vdev } if vdev.is_empty() => {
             return Err(error("device.vdev", "must not be empty"))
         }
-        Device::Vdev { .. } => {}
+        Device::Vdev { .. } => {
+            if config.mac.is_some() {
+                return Err(error("mac", "applies to PCI devices; use null for a vdev"));
+            }
+        }
     }
     if config.mac.is_some_and(|mac| !mac.is_unicast()) {
         return Err(error("mac", "Ethernet address must be unicast"));
@@ -547,6 +551,23 @@ mod tests {
         assert!(vdev.to_string().contains(
             "offloads: {\"rx_checksum\":true,\"tx_tcp_checksum\":false,\"tx_udp_checksum\":true}\n"
         ));
+    }
+
+    #[test]
+    fn config_load_rejects_a_vdev_mac() {
+        let mut value = example();
+        value["device"] = json!({"vdev": "net_tap0,iface=cdnic0"});
+        let path = std::env::temp_dir().join(format!(
+            "netconf-vdev-mac-{}.json", std::process::id()
+        ));
+        std::fs::write(&path, value.to_string()).unwrap();
+        let error = Config::load(&path).unwrap_err().to_string();
+        assert!(error.contains("mac") && error.contains("applies to PCI devices"), "{error}");
+        value["mac"] = Value::Null;
+        std::fs::write(&path, value.to_string()).unwrap();
+        let config = Config::load(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(config.mac, None);
     }
 
     #[test]
