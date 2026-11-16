@@ -11,13 +11,23 @@ use crate::remote::Mailbox;
 use crate::task::SpawnToken;
 use crate::task::join::JoinHandle;
 
-/// Runtime state or supplied-clock error.
+/// Why [`Runtime::poll`] returned no report, or (as [`SpawnError::reason`]) why a spawn was
+/// refused.
+///
+/// Implements `Debug` but not `Display` or `std::error::Error`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeError {
+    /// The runtime was shut down or dropped. Permanent.
     Closed,
+    /// A task of this runtime panicked in an earlier poll. Permanent; the runtime can still
+    /// be shut down or dropped.
     Panicked,
+    /// The tick passed to [`Runtime::poll`] is lower than the latest accepted one. No task
+    /// ran and nothing changed; a later poll with a valid tick proceeds normally.
     TimeRegressed {
+        /// The latest accepted tick.
         current: u64,
+        /// The tick that was passed.
         supplied: u64,
     },
 }
@@ -37,17 +47,24 @@ impl From<Unavailable> for RuntimeError {
     }
 }
 
+/// What one [`Runtime::poll`] did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PollReport {
-    /// Calls made to task futures during this turn.
+    /// Calls this poll made into task futures. A task woken twice in one poll counts twice.
     pub tasks_polled: usize,
-    /// All live tasks, including tasks waiting on timers or other wakes.
+    /// Tasks that have not finished, including tasks parked on a timer or waiting for a
+    /// wake. Zero once every spawned task has finished.
     pub live_tasks: usize,
 }
 
-/// A rejected task submission and the original token.
+/// A spawn the runtime refused, with the token handed back unspawned.
+///
+/// Implements `Debug` (which omits the token) but not `Display` or `std::error::Error`.
 pub struct SpawnError<T> {
+    /// [`RuntimeError::Closed`] or [`RuntimeError::Panicked`]. A spawn is never refused for
+    /// lack of space: task storage grows as needed.
     pub reason: RuntimeError,
+    /// The task, not started. Dropping it drops its arguments.
     pub token: SpawnToken<T>,
 }
 
@@ -126,37 +143,80 @@ impl Control {
     }
 }
 
-/// Caller-driven owner of local tasks and timers.
+/// Owner of a set of tasks and timers, run by the program calling [`Runtime::poll`].
 ///
-/// The supplied tick is the runtime's only clock. `Runtime` is `!Send + !Sync`.
+/// The tick passed to `poll` is the runtime's only clock: a `u64` in a unit the program
+/// chooses, which must never decrease. Timers ([`Sleep`](crate::Sleep)) fire against it.
+/// Network timeouts given as `Duration`s convert by counting nanoseconds, so a network
+/// program passes monotonic nanoseconds.
+///
+/// A `Runtime` is neither `Send` nor `Sync`: it is created, polled and dropped on one
+/// thread, and its tasks run on that thread. Tasks are started through a [`Spawner`].
+///
+/// Task storage grows as tasks are spawned, so the number of live tasks has no limit. Each
+/// task's future must fit in a 64 KiB block; a larger one is a compile error. That memory
+/// is never returned to the system, also after the runtime is dropped, so a program
+/// creates one runtime and keeps it until it exits.
+///
+/// Dropping a `Runtime` is the same as [`Runtime::shutdown`]. Dropping it from the
+/// destructor of one of its own tasks while that shutdown runs aborts the process.
 pub struct Runtime {
     control: Rc<Control>,
 }
 
 impl Runtime {
-    /// Create a runtime whose accepted clock starts at `initial_tick`.
+    /// Creates a runtime whose latest accepted tick is `initial_tick`. A
+    /// [`Spawner::sleep`] created before the first poll counts from it.
     pub fn new(initial_tick: u64) -> Self {
         Self {
             control: Control::new(initial_tick),
         }
     }
 
-    /// Return a local capability for submitting tasks and creating sleeps.
+    /// A handle for spawning tasks and creating sleeps on this runtime. Spawners are cheap
+    /// to clone; every clone refers to this runtime.
     pub fn spawner(&self) -> Spawner {
         Spawner {
             control: self.control.clone(),
         }
     }
 
-    /// Advance to `now` and poll ready tasks in rounds.
+    /// Advances the runtime's clock to `now` and runs the tasks that are ready, then
+    /// returns. It never waits; a task that blocks the thread blocks this call.
     ///
-    /// Equal ticks are accepted. A lower tick returns `TimeRegressed` before state changes.
-    /// This method never waits, though future code can block. First it finishes the
-    /// round a [`request_turn`](crate::request_turn) stopped, if any; then the next round
-    /// polls the tasks woken or spawned before this call, then those deferred with
-    /// `wake_deferred`; tasks woken or spawned in a round run in the next. Rounds continue
-    /// until no task is woken or 1024 tasks were polled; the limit is checked between
-    /// rounds. `request_turn` from a task ends this call after that task's poll.
+    /// One poll, in order:
+    ///
+    /// 1. A closed or panicked runtime returns [`RuntimeError::Closed`] or
+    ///    [`RuntimeError::Panicked`].
+    /// 2. `now` lower than the latest accepted tick returns
+    ///    [`RuntimeError::TimeRegressed`], with no other effect. An equal tick is accepted.
+    /// 3. Tasks woken from other threads since the last poll become ready, then the tasks
+    ///    deferred in the last poll ([`yield_now`](crate::yield_now),
+    ///    [`StoredWaker::wake_deferred`](crate::StoredWaker::wake_deferred)).
+    /// 4. The clock moves to `now`. Every [`Sleep`](crate::Sleep) whose deadline is at or
+    ///    before `now` wakes its task; these become ready after the tasks already ready,
+    ///    earliest deadline first.
+    /// 5. If the last poll was ended by [`request_turn`](crate::request_turn), the tasks
+    ///    left in its round run first.
+    /// 6. Ready tasks run in rounds. A round runs each task that was ready when the round
+    ///    started, until it returns `Pending` or finishes; a task woken or spawned during a
+    ///    round runs in the next one. Rounds continue until no task is ready, or until 1024
+    ///    task polls were made. The limit is checked between rounds, so one poll can make
+    ///    more than 1024. A task that calls `request_turn` ends the poll as soon as it
+    ///    returns. Ready tasks left over run in the next poll.
+    ///
+    /// Tasks are never interrupted: a task keeps the thread until it awaits something not
+    /// yet available, or finishes.
+    ///
+    /// # Panics
+    ///
+    /// A panic in a task unwinds out of `poll` with the task's original payload. That task
+    /// is ended and its [`JoinHandle`] resolves to `Err(Canceled)` at once. The runtime
+    /// then refuses work: `poll` returns [`RuntimeError::Panicked`], spawns fail with that
+    /// reason, and sleeps fail with [`SleepError::Panicked`](crate::SleepError::Panicked).
+    /// The other tasks stay until the runtime is shut down or dropped.
+    ///
+    /// Panics if called from inside a poll of the same runtime.
     pub fn poll(&mut self, now: u64) -> Result<PollReport, RuntimeError> {
         let root = self.control.open_core()?;
         unsafe {
@@ -185,7 +245,21 @@ impl Runtime {
         }
     }
 
-    /// Close the runtime and drop its remaining tasks, in an unspecified order.
+    /// Closes the runtime and drops every remaining task, in an unspecified order. A task's
+    /// future is dropped with everything it owns, sockets included.
+    ///
+    /// Afterwards:
+    ///
+    /// | Call | Result |
+    /// |---|---|
+    /// | [`Runtime::poll`] | `Err(RuntimeError::Closed)` |
+    /// | [`Spawner::spawn`], [`Spawner::spawn_join`] | [`SpawnError`] with reason `Closed` |
+    /// | [`Spawner::sleep`], [`Spawner::sleep_until`], awaiting a [`Sleep`](crate::Sleep) | `Err(SleepError::Closed)` |
+    /// | awaiting the [`JoinHandle`] of an unfinished task | `Err(Canceled)` |
+    /// | a wake from another thread ([`RemoteWaker`](crate::RemoteWaker) or a task's `Waker`) | dropped |
+    ///
+    /// Calling it again does nothing. A task destructor run here must not drop the
+    /// `Runtime`: that aborts the process.
     pub fn shutdown(&mut self) {
         self.control.shutdown();
     }
@@ -200,10 +274,8 @@ impl Drop for CleanupContinuation<'_> {
     }
 }
 
-/// Dropping a `Runtime` shuts it down: its remaining tasks are dropped, in an
-/// unspecified order. Dropping the `Runtime` from a task destructor that its own
-/// cleanup runs (after `shutdown`, or a shutdown a task factory requested)
-/// aborts the process.
+/// Shuts the runtime down, as [`Runtime::shutdown`]. Dropping the `Runtime` from a task
+/// destructor that this shutdown runs aborts the process.
 impl Drop for Runtime {
     fn drop(&mut self) {
         let _continuation = CleanupContinuation(&self.control);
@@ -211,14 +283,25 @@ impl Drop for Runtime {
     }
 }
 
+/// A handle for spawning tasks on a [`Runtime`] and creating its sleeps. From
+/// [`Runtime::spawner`].
+///
+/// Cheap to clone; a task that spawns other tasks or sleeps usually takes a `Spawner` as an
+/// argument. It cannot poll or shut down the runtime. Neither `Send` nor `Sync`.
 #[derive(Clone)]
-/// Local capability to submit tasks and create runtime-bound sleeps.
 pub struct Spawner {
     control: Rc<Control>,
 }
 
 impl Spawner {
-    /// Create a sleep for an absolute runtime tick.
+    /// A sleep that completes once the runtime's tick reaches `deadline`. A deadline at or
+    /// before the current tick completes on its first poll.
+    ///
+    /// # Errors
+    ///
+    /// [`SleepError::Closed`](crate::SleepError::Closed) or
+    /// [`SleepError::Panicked`](crate::SleepError::Panicked) when the runtime no longer
+    /// takes work.
     pub fn sleep_until(
         &self,
         deadline: u64,
@@ -227,7 +310,15 @@ impl Spawner {
         Ok(crate::sleep::Sleep::new(deadline, self.control.clone()))
     }
 
-    /// Create a sleep after `ticks` from the latest accepted runtime tick.
+    /// A sleep whose deadline is the latest accepted tick plus `ticks`: the tick of the
+    /// running poll, else of the last poll, else the runtime's initial tick. No clock is
+    /// read.
+    ///
+    /// # Errors
+    ///
+    /// [`SleepError::DeadlineOverflow`](crate::SleepError::DeadlineOverflow) when the
+    /// deadline does not fit in a `u64`; `Closed` or `Panicked` when the runtime no longer
+    /// takes work.
     pub fn sleep(&self, ticks: u64) -> Result<crate::sleep::Sleep, crate::sleep::SleepError> {
         let root = self.control.open_core()?;
         let deadline = unsafe { (*root).timers.current_tick() }
@@ -236,19 +327,31 @@ impl Spawner {
         Ok(crate::sleep::Sleep::new(deadline, self.control.clone()))
     }
 
-    /// Submit a task function's token, detached: its return value is dropped
-    /// when it completes. A closed or panicked runtime returns the token.
+    /// Starts a task, detached: its return value is dropped when it completes.
     ///
-    /// If the task's construction shuts down or drops the runtime, the runtime
-    /// closes at once and its tasks, this one included, are dropped when the
-    /// construction returns, before `spawn` returns `Ok`.
+    /// The task does not run inside `spawn`. It first runs in the next [`Runtime::poll`],
+    /// or, when a running task spawns it, in a later round of the current poll. For a task
+    /// function written as a plain `fn` returning a future, the function's body runs here,
+    /// to build the future.
+    ///
+    /// If that body shuts down or drops the runtime, the runtime closes at once and its
+    /// tasks, this one included, are dropped before `spawn` returns `Ok`.
+    ///
+    /// # Errors
+    ///
+    /// A closed or panicked runtime returns [`SpawnError`] with the token.
+    ///
+    /// # Panics
+    ///
+    /// At most 65,535 distinct threads in a process can spawn tasks; a spawn on the next
+    /// new thread panics.
     #[inline]
     pub fn spawn<T: Task>(&self, token: SpawnToken<T>) -> Result<(), SpawnError<T>> {
         self.submit(token, None)
     }
 
-    /// As [`Self::spawn`], and returns a [`JoinHandle`] that resolves to the
-    /// task's return value. Allocates one oneshot channel.
+    /// As [`Self::spawn`], and also returns a [`JoinHandle`] that resolves to the task's
+    /// return value. Allocates once per spawn.
     pub fn spawn_join<T: Task>(
         &self,
         token: SpawnToken<T>,

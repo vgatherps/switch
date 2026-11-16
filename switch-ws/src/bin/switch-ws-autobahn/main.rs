@@ -2,7 +2,7 @@
 //!
 //! Usage: `switch-ws-autobahn server --expect-connections N | client --expect-cases N [--backend conduit|junction] [--junction-socket PATH] -- <tester> [args...]`
 //!
-//! Book: See the switch book, chapter "Protocol conformance: Autobahn and TLS-Anvil".
+//! See `docs/contributing/conformance.md`.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;

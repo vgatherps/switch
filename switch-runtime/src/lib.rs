@@ -1,56 +1,10 @@
 //! # switch-runtime
 //!
-//! A caller-driven, single-threaded async runtime. Your program owns the loop: the runtime runs tasks only inside [`Runtime::poll`], never sleeps, never reads a clock and never starts a thread. It is the task runtime under `switch-net`, whose `round` receives packets, polls this runtime, then sends.
-//!
-//! ```rust
-//! use switch_runtime::Runtime;
-//!
-//! #[switch_runtime::task]
-//! async fn hello(name: &'static str) {
-//!     println!("Hello, {name}!");
-//! }
-//!
-//! let mut runtime = Runtime::new(100);
-//! let spawner = runtime.spawner();
-//! spawner.spawn(hello("switch")).unwrap();
-//!
-//! while runtime.poll(100).unwrap().live_tasks != 0 {}
-//! ```
-//!
-//! A [`Runtime`] owns tasks and timers. A [`Spawner`], from [`Runtime::spawner`] and cheap to clone, starts tasks and creates [`Sleep`] futures; it cannot poll or shut the runtime down. A task is one call of a function marked `#[switch_runtime::task]`: calling the function packages its arguments into a [`SpawnToken`], and [`Spawner::spawn`] starts it. [`Spawner::spawn_join`] also returns a [`JoinHandle`] for the task's value.
-//!
-//! Each call to [`Runtime::poll`] passes the current tick, a `u64` that is the runtime's only clock. Ticks must never go backwards. Their unit is yours, but `switch_net::within` and other `Duration`-based waits need monotonic nanoseconds.
-//!
-//! Create one runtime, keep it for the life of the process, and poll it from the thread that created it. Memory for tasks is never returned, even after a runtime is dropped. A task's `Waker` may be cloned, dropped and woken on any thread; a wake from another thread takes effect at the runtime's next poll. `Runtime` and `Spawner` stay on their thread:
-//!
-//! ```compile_fail
-//! fn require_send<T: Send>() {}
-//! require_send::<switch_runtime::Runtime>();
-//! ```
-//!
-//! Joining a task's value:
-//!
-//! ```rust
-//! #[switch_runtime::task]
-//! async fn double(value: u32) -> u32 {
-//!     value * 2
-//! }
-//!
-//! #[switch_runtime::task]
-//! async fn report(handle: switch_runtime::JoinHandle<u32>) {
-//!     assert_eq!(handle.await, Ok(42));
-//! }
-//!
-//! let mut runtime = switch_runtime::Runtime::new(0);
-//! let spawner = runtime.spawner();
-//! let handle = spawner.spawn_join(double(21)).unwrap();
-//! spawner.spawn(report(handle)).unwrap();
-//! while runtime.poll(0).unwrap().live_tasks != 0 {}
-//! ```
-//!
-//! What one poll does, in order, is documented on [`Runtime::poll`].
-//!
-//! Book: see the switch book, part "The switch runtime".
+//! The caller-driven, single-threaded async runtime of switch. Tasks run only inside
+//! [`Runtime::poll`], which the program calls with the current tick; the runtime never
+//! sleeps, reads a clock or starts a thread. Applications reach these items at the root of
+//! the `switch` crate (`switch::Runtime`, `switch::task`); the network crates of the
+//! workspace depend on this crate directly.
 
 // `#[task]` expansions name the crate `::switch_runtime`, here too (`boxed`, tests).
 extern crate self as switch_runtime;
@@ -66,9 +20,10 @@ mod timer_registration;
 mod timer_wheel;
 mod waker;
 
-/// A task whose future is heap-allocated: one allocation per spawn, and one dynamic call per
-/// poll. For slow-path spawns only, where writing a task function is not practical; normal
-/// code writes a `#[switch_runtime::task]` function, whose future lives in its pool's slot.
+/// Turns a boxed future into a [`SpawnToken`], for spawns where writing a
+/// [`#[task]`](../switch/attr.task.html) function is not practical. It costs one heap allocation per
+/// spawn and one dynamic call per poll; a task function's future is stored in place, with
+/// neither.
 #[task]
 pub fn boxed(future: std::pin::Pin<Box<dyn Future<Output = ()>>>) -> impl Future<Output = ()> {
     future
@@ -88,6 +43,43 @@ pub use task::private as __private;
 
 #[cfg(doctest)]
 mod api_guards {
+    //! Spawning, running and joining:
+    //!
+    //! ```rust
+    //! #[switch_runtime::task]
+    //! async fn double(value: u32) -> u32 {
+    //!     value * 2
+    //! }
+    //!
+    //! #[switch_runtime::task]
+    //! async fn report(handle: switch_runtime::JoinHandle<u32>) {
+    //!     assert_eq!(handle.await, Ok(42));
+    //! }
+    //!
+    //! let mut runtime = switch_runtime::Runtime::new(0);
+    //! let spawner = runtime.spawner();
+    //! let handle = spawner.spawn_join(double(21)).unwrap();
+    //! spawner.spawn(report(handle)).unwrap();
+    //! while runtime.poll(0).unwrap().live_tasks != 0 {}
+    //! ```
+    //!
+    //! ```compile_fail
+    //! fn require_send<T: Send>() {}
+    //! require_send::<switch_runtime::Runtime>();
+    //! ```
+    //! ```compile_fail
+    //! fn require_send<T: Send>() {}
+    //! require_send::<switch_runtime::JoinHandle<u8>>();
+    //! ```
+    //! ```compile_fail
+    //! fn require_send<T: Send>() {}
+    //! require_send::<switch_runtime::StoredWaker>();
+    //! ```
+    //! ```compile_fail
+    //! fn require_sync<T: Sync>() {}
+    //! require_sync::<switch_runtime::StoredWaker>();
+    //! ```
+    //!
     //! A task future that does not fit a 64 KiB task block is a compile-time error:
     //!
     //! ```compile_fail,E0080

@@ -1,95 +1,26 @@
 # cephalopod
 
-See [cephalopod: many writers, one reader](../book/src/blocks/cephalopod.md)
-in the switch book. Generate the API reference with `cargo doc -p ceph-fifo --no-deps`.
+Ordered messaging from many processes to one consumer over shared memory: each producer pushes into a ring for the CPU it is running on, and the consumer delivers every producer's stream in order. Junction's send path is built on it.
 
-FIFO messaging from many processes to one consumer over shared memory.
-
-Each producer gets its own stream. The consumer receives every stream in order. Producers
-write to a queue local to the CPU they are on, so they never contend with each other, and the
-consumer's work grows with the number of cores, not the number of producers.
-
-## Usage
-
-Producer:
-
-```rust
-let session = connect(Path::new("/tmp/myqueue.sock"))?;
-let writer = Writer::attach(&session.path)?;
-let mut seq = 0;
-for msg in messages {
-    loop {
-        match writer.try_push(msg, session.stream, seq) {
-            Ok(()) => break,
-            Err(PushError::Full) => std::hint::spin_loop(),
-            Err(PushError::TooLarge) => panic!("message larger than max_record"),
-        }
-    }
-    seq += 1;
-}
-while writer.try_finish(session.stream, seq) == Err(PushError::Full) {}
-while !session.closed() {}
-```
-
-Consumer:
-
-```rust
-let reader = Reader::create(Config {
-    ring_size: 2 << 20,
-    max_record: 4096,
-    dir: "/dev/hugepages".into(),
-})?;
-let (control_tx, control_rx) = mpsc::channel();
-let (retire_tx, retire_rx) = mpsc::channel();
-let listener = Listener::bind(Path::new("/tmp/myqueue.sock"), reader.name(), 1024, control_tx, retire_rx)?;
-std::thread::spawn(move || listener.run().expect("control thread failed"));
-let mut fifo = Fifo::new(reader, 1024, control_rx, retire_tx);
-loop {
-    if let Some(m) = fifo.next_message() {
-        handle(m.stream(), m.seq(), m.payload(), m.end());
-    }
-}
-```
-
-`try_push` returns `Full` when the queue has no room; retry. `try_finish` ends the stream;
-`session.closed()` turns true once the consumer has handled the last message. On the consumer
-side, dropping a message consumes it.
-
-`try_push_with_header(header, payload, stream, seq)` writes `header ++ payload` into one
-record and publishes it once. The header must be a multiple of 8 bytes and at most 32 bytes
-(otherwise it panics); `max_record` limits the combined length. Neither slice needs headroom.
-
-Runnable versions: `crates/fifo/examples/sequencer.rs` and `crates/fifo/examples/player.rs`.
-
-## Performance
-
-M4 Pro, 14-CPU Linux VM:
-
-| | |
+| Crate | What it is |
 |---|---|
-| push, 16-byte payload | 4.6 ns |
-| consume, per message, 8 producers | 1.6 to 1.9 ns |
-| idle sweep over 14 rings | 9.5 ns |
+| `ceph-ring` | the per-CPU rings: `Writer` for producers, `Reader` for the consumer |
+| `ceph-fifo` | `Fifo`, which restores each stream's order on the consumer side |
+| `ceph-control` | a Unix-socket service that hands producers their stream ids |
+| `ceph-proto` | the messages between `ceph-control` and `ceph-fifo` |
+| `ceph-rseq` | the record layout and the restartable-sequence push inside `ceph-ring` |
 
-## Tests
+API reference: `cargo doc --no-deps -p ceph-ring -p ceph-fifo -p ceph-control -p ceph-proto`. Runnable consumer and producer: `crates/fifo/examples/sequencer.rs` and `crates/fifo/examples/player.rs`.
 
+From this directory (Linux in Docker, via `scripts/test-linux.sh`):
+
+```sh
+make test          # tests of the five crates
+make test-release  # the same, release build
+make e2e           # one sequencer process, four player processes
+make bench         # push_bench
+make clippy        # clippy for the Linux target, warnings are errors
+make check-x86     # compile the tests for x86_64 under the amd64 image
 ```
-make test        # in Docker
-make e2e
-make bench
-make clippy
-```
 
-## How it works
-
-One ring per CPU. A producer pushes into the ring of the CPU it is running on, inside an rseq
-critical section: if the kernel preempts or migrates it mid-push, the push is abandoned and
-retried. So each ring has exactly one writer at any instant and one reader, with no locks and
-no atomic read-modify-writes. A push is a few plain stores plus one release store of the
-record's tag, which is the commit.
-
-Rings live in a file in a directory you choose: `/dev/shm` for normal pages, a hugetlbfs mount such as `/dev/hugepages` for 2 MiB pages.
-
-The consumer sweeps the rings from one core, reading tags to find committed records, and
-publishes its read positions once per sweep. Its per-message cost is a couple of nanoseconds;
-the fixed cost of a sweep is one cache line per ring.
+`make bench` prints the time per push for a 16-byte and a 4096-byte payload. On an M4 Pro, 14-CPU Linux VM, a 16-byte push took 4.6 ns.

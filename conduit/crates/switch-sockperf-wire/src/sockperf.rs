@@ -1,6 +1,11 @@
+/// Bytes in a sockperf message header. Bytes 8 and 9 hold the flags and bytes 10 to 13 the whole
+/// message's length, both big-endian.
 pub const HEADER: usize = 14;
+/// The largest message: 65507 bytes, the largest UDP payload.
 pub const MAX_MESSAGE: usize = 65507;
 
+/// A datagram that is not exactly one message, or a length field below [`HEADER`] or above the
+/// limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Malformed;
 
@@ -13,6 +18,8 @@ fn length(header: &[u8], max: usize) -> Result<usize, Malformed> {
     }
 }
 
+/// Accepts a datagram that is exactly one message: at least [`HEADER`] bytes, with a length field
+/// equal to the datagram's length and at most [`MAX_MESSAGE`].
 pub fn validate_udp(message: &[u8]) -> Result<(), Malformed> {
     if message.len() < HEADER || length(message, MAX_MESSAGE)? != message.len() {
         return Err(Malformed);
@@ -20,7 +27,13 @@ pub fn validate_udp(message: &[u8]) -> Result<(), Malformed> {
     Ok(())
 }
 
-/// A validated complete message is changed only when a reply was requested.
+/// Turns a message that passed [`validate_udp`] or came from [`Framer::push`] into its reply in
+/// place, and returns `true`, when its flags ask for a reply (`flags & 7 == 3`): the reply clears
+/// the lowest flag bit. Otherwise it changes nothing and returns `false`.
+///
+/// # Panics
+///
+/// If `message` is shorter than 10 bytes.
 pub fn reply(message: &mut [u8]) -> bool {
     let flags = u16::from_be_bytes([message[8], message[9]]);
     if flags & 7 != 3 {
@@ -30,12 +43,18 @@ pub fn reply(message: &mut [u8]) -> bool {
     true
 }
 
+/// Cuts a TCP byte stream into sockperf messages.
 pub struct Framer {
     partial: Vec<u8>,
     max: usize,
 }
 
 impl Framer {
+    /// A framer that rejects messages longer than `max` bytes.
+    ///
+    /// # Panics
+    ///
+    /// If `max` is below [`HEADER`].
     pub fn new(max: usize) -> Self {
         assert!(max >= HEADER);
         Self {
@@ -44,11 +63,15 @@ impl Framer {
         }
     }
 
+    /// Drops the partial message kept from earlier [`push`](Self::push) calls.
     pub fn reset(&mut self) {
         self.partial.clear();
     }
 
-    /// Deliver complete frames in order; retain only the trailing partial frame.
+    /// Appends `bytes` to the stream and calls `complete` with each whole message, in order; the
+    /// trailing partial message is kept for the next call. Returns [`Malformed`] when a length
+    /// field is below [`HEADER`] or above the framer's limit; the framer then still holds the bad
+    /// header, so call [`reset`](Self::reset) before reusing it.
     pub fn push(
         &mut self,
         mut bytes: &[u8],

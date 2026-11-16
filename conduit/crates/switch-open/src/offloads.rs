@@ -1,21 +1,51 @@
+//! Which offloads [`open`](crate::open) requests, and why.
+//!
+//! The config's `offloads` is an explicit object or `"auto"`. An explicit object is
+//! requested exactly as written; if the driver lacks a requested offload, opening fails
+//! with [`OpenError::PortOpen`](crate::OpenError::PortOpen) naming it, never falling back to
+//! the CPU. `"auto"` requests a subset of what the driver advertises, chosen by driver name:
+//!
+//! | Driver | Requests | Reason printed |
+//! |---|---|---|
+//! | `net_ena`, `net_ice` | each checksum offload the driver advertises | `ena: requested because advertised` or `ena: not advertised` (`ice:` likewise) |
+//! | `net_i40e` | `rx_checksum` if advertised; no TX offloads | `i40e: requested because advertised` or `i40e: not advertised`; `i40e: vector TX allows no checksum offloads` |
+//! | `net_ixgbe` | nothing | `ixgbe: off until verified on an Intel host`; `ixgbe: vector TX needs zero TX offloads` |
+//! | any other, `net_tap` included | nothing | `unknown driver <name>: none requested; set offloads explicitly` |
+//!
+//! RX checksum counts as advertised only when the driver advertises all of the IPv4, TCP and
+//! UDP receive checksum bits. `rx_timestamps` is never chosen by `"auto"`; it is requested
+//! as the config gives it, and with it on `net_ice` adds the note
+//! `ice: RX timestamp forces scalar RX` and `net_ena` the note
+//! `ena: stamps are device ns on the Time Sync clock`.
+
 use std::fmt;
 
 use switch_netconf::Offloads as Setting;
 use dpdk_smoltcp::{DeviceInfo, Offloads};
 
+/// One checksum offload's decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OffloadChoice {
+    /// `rx_checksum`, `tx_tcp_checksum` or `tx_udp_checksum`.
     pub name: &'static str,
+    /// Whether it is requested from the driver.
     pub requested: bool,
+    /// Why: `explicit` for an explicit config, otherwise the reasons in the table above.
     pub reason: String,
 }
 
-/// The exact offloads to request from `Port::open` and why each checksum bit is on or off.
+/// The offloads requested when the port opened, and why.
+///
+/// `Display` prints one line per checksum offload,
+/// `<name>: requested (<reason>)` or `<name>: not requested (<reason>)`, then one line per
+/// note.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OffloadPlan {
+    /// The exact offloads requested, RX timestamps included.
     pub offloads: Offloads,
-    /// rx_checksum, tx_tcp_checksum, tx_udp_checksum, in that order.
+    /// `rx_checksum`, `tx_tcp_checksum`, `tx_udp_checksum`, in that order.
     pub choices: [OffloadChoice; 3],
+    /// Driver notes about RX timestamps, empty when there are none.
     pub notes: Vec<String>,
 }
 

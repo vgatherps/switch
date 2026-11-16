@@ -1,29 +1,12 @@
 # ceph-rseq
 
-The record layout and the restartable-sequence (rseq) critical section that writes one record into a per-CPU ring. Linux only for the writer; the constants and layout helpers compile everywhere.
+The record layout of cephalopod's per-CPU rings and the restartable-sequence (rseq) critical section that writes one record into the ring of the current CPU. Only `ceph-ring` uses it; the writer needs Linux with glibc on x86_64 or aarch64.
 
-Used by `ceph-ring`, which wraps it in `Writer::try_push`. See the [cephalopod README](../../README.md) for the overall design.
+API reference: `cargo doc --no-deps -p ceph-rseq`.
 
-## Contents
-
-- Layout: `HEADER_LEN` (32 bytes) with field offsets `TAG_OFFSET`, `LEN_OFFSET`, `STREAM_OFFSET`, `SEQ_OFFSET`; `record_total(len)` (header plus payload padded to 8); `tag_for(pos)` (`pos | 1`, the committed tag).
-- Argument types: `Private` (a CPU's cached head and tail), `RingArgs`, `RecordArgs`, `ThreadArea`; `registered()` reports whether the thread has an rseq registration.
-- `unsafe fn push_record(area, rings, record) -> Push`: appends one record to the current CPU's ring inside a single rseq critical section. `Push` is `Done`, `Full` (nothing written) or `Aborted` (preempted, migrated or signalled; retry). The caller must uphold the contract in its doc comment, including that positions never wrap.
-
-The commit is one release store of the tag, so a reader never sees a partly written record.
-
-## Constraints
-
-- Linux with GNU libc, on x86_64 or aarch64; other Linux targets fail with `compile_error!`.
-- The critical section is hand-written assembly.
-
-## Build and test
-
-`ceph-rseq` has unit tests in `src/lib.rs` for publication boundaries, payload copying, stale tags, and interrupted writers. The `ceph-ring` and `ceph-fifo` tests also exercise it. From `cephalopod/`:
+From `cephalopod/` (Linux in Docker):
 
 ```sh
-make test      # Linux tests in Docker, all five ceph crates
-make check-x86 # compile the tests for x86_64 under the amd64 image
+make test       # all five ceph crates, including this crate's unit tests
+make check-x86  # compile the tests for x86_64 under the amd64 image
 ```
-
-`make test` uses `rust:1.93.0-bookworm` with `--privileged` and reserves hugepages inside the container (`scripts/test-linux.sh`).

@@ -1,4 +1,5 @@
-//! The `switch-junctiond` daemon; its usage is in the `switch_junctiond` crate documentation.
+//! The `switch-junctiond` daemon. Its flags, startup and shutdown are described in
+//! `docs/operations/junctiond.md` in the repository.
 
 #[cfg(target_os = "linux")]
 mod daemon;

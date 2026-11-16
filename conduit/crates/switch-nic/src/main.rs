@@ -1,4 +1,4 @@
-//! The `switch-nic` command: opens one NIC port from a network config file with `switch_open::open`, on the one CPU the process may run on, and runs one mode. `info` prints the open report, hugepage use and the card's counters, then closes the port; it is the check that a machine is ready. `sockperf-server` answers sockperf 3.10 clients over UDP and TCP until `--seconds` pass or SIGINT/SIGTERM arrives. `feed` reads the Binance bookTicker WebSocket over TLS through the configured gateway. Every result line on stdout is `switch-nic: <key>: <value>`; DPDK's messages go to stderr. Exit status: 0 success, 2 packet buffers still held when the port closed, 3 argument, setup or run error, 101 panic.
+//! The `switch-nic` command: opens one NIC port from a network config file, on the one CPU the process may run on, and runs one mode. `info` prints what the card offers and closes it; it is the check that a machine is ready. `sockperf-server` answers sockperf 3.10 clients over UDP and TCP. `feed` reads Binance's bookTicker WebSocket over TLS through the configured gateway. Exit status: 0 success, 2 packet buffers still held when the port closed, 3 argument, setup or run error, 101 panic.
 //!
 //! ```text
 //! switch-nic --config FILE <MODE> [MODE OPTIONS]
@@ -7,7 +7,7 @@
 //!   feed [--host H] [--port P] [--path P] [--print N] [--seconds S]
 //! ```
 //!
-//! See the switch book, chapter "switch-nic: checking a NIC and serving load".
+//! The modes, their options and their output are described in `docs/operations/switch-nic.md`.
 mod args;
 mod feed;
 mod hugepages;

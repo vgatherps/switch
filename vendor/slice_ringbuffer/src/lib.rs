@@ -1,41 +1,13 @@
-//! Single-producer, single-consumer shared-memory record ring.
-//!
-//! This is junction's receive ring: the daemon writes each received TCP chunk or UDP datagram as one record, and the application's session reads it back as a `switch_frame::OwnedFrame` that points straight into shared memory. Each record carries a [`PacketMeta`] and a payload, and the data region is a mirrored mapping (`shared_memory::DoubleMapping`), so every payload is one contiguous slice. Applications see only `PacketMeta`, re-exported by `switch-junction`.
-//!
-//! [`RingWriter::create`] lays the ring out on a fresh backing (length zero); the size must be a power of two, a multiple of the backing's page size, and at most 2 GiB, and the largest payload is `size - 40` bytes ([`RingWriter::max_payload`]). [`RingWriter::reserve`] returns a record to fill, or `None` when the ring is full; [`Reserved::commit`] publishes it, and dropping it uncommitted publishes nothing. [`RingReader::open`] claims the ring's only reader place, permanently: any later open fails with `AlreadyExists`. [`RingReader::next`] returns the next record and its frame.
-//!
-//! Dropping a frame does not return its space. [`RingReader::reclaim`] returns released records in order and stops at the first one still held, so one long-held frame keeps every later record from being reused. Frames may be dropped in any order and stay valid after the reader, writer and backings are dropped. `RingWriter` is `Send`; `RingReader` and its frames stay on the thread that opened the reader. The reader trusts the writer: corrupt cursors or lengths make `next` and `reclaim` panic.
-//!
-//! ```
-//! use shared_memory::{unique_name, Backing};
-//! use slice_ringbuffer::{PacketMeta, RingReader, RingWriter};
-//!
-//! let name = unique_name("/junction-ring-")?;
-//! let mut producer = Backing::create_shm(&name)?;
-//! let size = producer.page_size()?;
-//! let mut writer = RingWriter::create(&mut producer, size)?;
-//!
-//! // Normally the other process.
-//! let consumer = Backing::open_shm(&name)?;
-//! let mut reader = RingReader::open(&consumer)?;
-//!
-//! let meta = PacketMeta::new(0, 0, 0, [0; 4], 0, [0; 4], 0);
-//! let mut record = writer.reserve(5, meta).expect("ring has room");
-//! record.payload().copy_from_slice(b"hello");
-//! record.commit();
-//!
-//! let (_meta, frame) = reader.next().expect("one record");
-//! assert_eq!(&*frame, b"hello");
-//! drop(frame);
-//! reader.reclaim();
-//! # Ok::<(), std::io::Error>(())
-//! ```
-//!
-//! See the switch book, chapter "Shared memory and the receive ring".
-//!
-//! # For implementers
-//!
-//! Memory ordering: header and payload writes, then head Release, then reader head Acquire. After publication, each plain reference count is accessed only on the reader's thread; the writer never reads it. Frame release, then reclaim, then tail Release, then writer tail Acquire orders those accesses before reuse. Concurrent initialization through other backing handles or processes is outside the contract.
+//! Junction's receive ring: one writer (the daemon) and one reader (an application's
+//! session) over shared memory. Each record is a [`PacketMeta`] and a payload, and the reader
+//! gets each payload back as a frame that points into the ring. Applications see only
+//! `PacketMeta`, as `switch::junction::rx::PacketMeta`.
+
+// Memory ordering: header and payload writes, then head Release, then reader head Acquire.
+// After publication, each plain reference count is accessed only on the reader's thread; the
+// writer never reads it. Frame release, then reclaim, then tail Release, then writer tail
+// Acquire orders those accesses before reuse. Concurrent initialization through other backing
+// handles or processes is outside the contract.
 
 use switch_frame::OwnedFrame;
 use shared_memory::{Backing, DoubleMapping, Mapping};
@@ -69,22 +41,30 @@ struct RecordHeader {
     meta: PacketMeta,
 }
 
-/// Packet metadata stored immediately before a record's payload.
+/// Where a received packet came from, delivered with each packet.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct PacketMeta {
+    /// The receiving socket's slot.
     pub slot: u32,
+    /// The receiving socket's generation.
     pub generation: u32,
+    /// `TCP` (1) for a chunk of a TCP connection's data, `UDP` (2) for a whole datagram.
     pub kind: u8,
     _pad0: [u8; 3],
+    /// The sender's IPv4 address, for UDP; zero for TCP.
     pub src_addr: [u8; 4],
+    /// The sender's port, for UDP; zero for TCP.
     pub src_port: u16,
     _pad1: u16,
+    /// The address the datagram was sent to, for UDP; zero for TCP.
     pub dst_addr: [u8; 4],
+    /// The network card's hardware receive timestamp, as the driver reports it; 0 for none.
     pub rx_timestamp: u64,
 }
 
 impl PacketMeta {
+    /// Metadata with the given fields, for the writer.
     pub fn new(
         slot: u32,
         generation: u32,
@@ -138,7 +118,32 @@ fn stride(len: usize) -> usize {
     (HEADER_SIZE + len + 7) & !7
 }
 
-/// The sole producer of a ring.
+/// The only writer of a ring. Can move to another thread.
+///
+/// ```
+/// use shared_memory::{unique_name, Backing};
+/// use slice_ringbuffer::{PacketMeta, RingReader, RingWriter};
+///
+/// let name = unique_name("/junction-ring-")?;
+/// let mut producer = Backing::create_shm(&name)?;
+/// let size = producer.page_size()?;
+/// let mut writer = RingWriter::create(&mut producer, size)?;
+///
+/// // Normally the other process.
+/// let consumer = Backing::open_shm(&name)?;
+/// let mut reader = RingReader::open(&consumer)?;
+///
+/// let meta = PacketMeta::new(0, 0, 0, [0; 4], 0, [0; 4], 0);
+/// let mut record = writer.reserve(5, meta).expect("ring has room");
+/// record.payload().copy_from_slice(b"hello");
+/// record.commit();
+///
+/// let (_meta, frame) = reader.next().expect("one record");
+/// assert_eq!(&*frame, b"hello");
+/// drop(frame);
+/// reader.reclaim();
+/// # Ok::<(), std::io::Error>(())
+/// ```
 pub struct RingWriter {
     header: Mapping,
     data: DoubleMapping,
@@ -151,9 +156,12 @@ pub struct RingWriter {
 unsafe impl Send for RingWriter {}
 
 impl RingWriter {
-    /// Initializes a fresh backing. The caller retains ownership of its name/unlink.
-    /// Size must be a power of two, a backing-page multiple, and at most 2 GiB
-    /// so every payload length is representable in the record header.
+    /// Lays a ring of `size` bytes out on a fresh backing: one page of header, then the
+    /// records, mapped twice back to back so every payload is one contiguous slice. The caller
+    /// keeps the backing and its name.
+    ///
+    /// Fails with `InvalidInput` if the backing's length is not zero, or if `size` is not a
+    /// power of two, not a multiple of the backing's page size, or larger than 2 GiB.
     pub fn create(backing: &mut Backing, size: usize) -> io::Result<RingWriter> {
         if backing.len()? != 0 {
             return Err(io::Error::new(
@@ -195,12 +203,17 @@ impl RingWriter {
         })
     }
 
+    /// The largest payload: `size` minus the 40-byte record header. Each record takes its
+    /// header plus its payload rounded up to 8 bytes.
     pub fn max_payload(&self) -> usize {
         self.size - HEADER_SIZE
     }
 
-    /// Returns an unpublished record, or None when the ring is full.
-    /// Panics if len exceeds max_payload().
+    /// A record of `len` payload bytes to fill, or `None` when the ring has no room until the
+    /// reader reclaims space.
+    ///
+    /// # Panics
+    /// Panics if `len` is larger than [`max_payload`](Self::max_payload).
     pub fn reserve(&mut self, len: usize, meta: PacketMeta) -> Option<Reserved<'_>> {
         assert!(len <= self.max_payload(), "payload exceeds ring capacity");
         let required = stride(len) as u64;
@@ -243,7 +256,8 @@ impl RingWriter {
     }
 }
 
-/// An unpublished record. Dropping it publishes nothing.
+/// A reserved record. [`commit`](Self::commit) makes it visible to the reader; dropping it
+/// without committing publishes nothing.
 pub struct Reserved<'a> {
     writer: &'a mut RingWriter,
     record: NonNull<RecordHeader>,
@@ -251,6 +265,7 @@ pub struct Reserved<'a> {
 }
 
 impl Reserved<'_> {
+    /// The record's payload bytes, to fill before committing.
     pub fn payload(&mut self) -> &mut [u8] {
         // SAFETY: the reserved stride owns exactly len payload bytes contiguously;
         // the exclusive borrow prevents simultaneous header/payload access.
@@ -262,6 +277,7 @@ impl Reserved<'_> {
         }
     }
 
+    /// Makes the record visible to the reader.
     pub fn commit(self) {
         self.writer.head = self.writer.head.wrapping_add(stride(self.len) as u64);
         // SAFETY: the header remains mapped and head is an initialized atomic.
@@ -298,7 +314,12 @@ impl Shared {
     }
 }
 
-/// The sole consumer; held frames may be released in any order.
+/// The only reader of a ring, and the frames it hands out.
+///
+/// The reader, and every frame it returns, stays on the thread that opened it. Frames can be
+/// dropped in any order and stay valid after the reader, the writer and both backings are
+/// dropped. The reader trusts the writer: corrupt cursors or lengths in the shared memory make
+/// [`next`](Self::next) and [`reclaim`](Self::reclaim) panic.
 pub struct RingReader {
     shared: Rc<Shared>,
     read: u64,
@@ -307,7 +328,9 @@ pub struct RingReader {
 }
 
 impl RingReader {
-    /// Opens an initialized ring without retaining the backing. One reader per ring, ever.
+    /// Opens the ring in `backing` and claims its reader place, for the life of the ring: a
+    /// second open fails with `AlreadyExists`, even after the first reader is dropped. Fails
+    /// with `InvalidData` if the backing does not hold a valid ring. Does not keep `backing`.
     pub fn open(backing: &Backing) -> io::Result<RingReader> {
         let page = backing.page_size()?;
         let header = Mapping::new(backing.fd(), 0, page)?;
@@ -360,7 +383,8 @@ impl RingReader {
         Rc::strong_count(&self.shared) - 1
     }
 
-    /// Takes the next published record, or None if none is available.
+    /// The next committed record and a frame over its payload, or `None` if there is none.
+    /// Never waits.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<(PacketMeta, OwnedFrame)> {
         if self.read == self.cached_head {
@@ -397,7 +421,9 @@ impl RingReader {
         Some((unsafe { record.as_ref() }.meta, frame))
     }
 
-    /// Publishes only the contiguous released prefix of records already read.
+    /// Returns space to the writer: every record already read whose frames are all dropped,
+    /// in order, stopping at the first record that still has a live frame. One long-held
+    /// frame keeps every later record's space from being reused.
     pub fn reclaim(&mut self) {
         let old_tail = self.tail;
         while self.tail != self.read {

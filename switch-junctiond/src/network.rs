@@ -198,7 +198,8 @@ impl Network {
         self.state.udp_rx_dropped
     }
 
-    /// Drops every remaining socket handle and returns the Stack (test teardown).
+    /// Drops every remaining socket handle and returns the Stack. The daemon calls this when it
+    /// stops, before closing the port; tests call it for teardown.
     pub fn into_stack(self) -> Stack {
         let NetworkState { stack, sockets, .. } = self.state;
         drop(sockets);

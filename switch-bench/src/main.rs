@@ -1,4 +1,22 @@
-//! The `switch-bench` binary; the crate documentation (`src/lib.rs`) describes its commands.
+//! The `switch-bench` command. `sweep` is the coordinator: it starts the `gen` generator
+//! processes, runs each rate on all of them and prints one JSON line per step and a summary line.
+//! `serve` is the switch echo server, on a card it owns (`--backend conduit`) or through
+//! `switch-junctiond` (`--backend junction`); `kernel-serve` is a Linux kernel-socket echo server
+//! for comparison.
+//!
+//! ```text
+//! switch-bench sweep --proto udp|tcp|ws --gens G --gen-cmd CMD --senders N
+//!                    (--rate-min PPS --rate-max PPS | --rates PPS,PPS,...)
+//!                    [--step-ms 2000] [--warmup-ms 500] [--drain-ms 200] [--budget-us W]
+//! switch-bench gen   [--backend conduit --config F | --backend junction --junction-socket PATH]
+//!                    --proto udp|tcp|ws --target IP:PORT --senders N --size S [--local-port 40000]
+//! switch-bench serve [--backend conduit --config F | --backend junction --junction-socket PATH]
+//!                    --proto udp|tcp|ws --port P
+//! switch-bench kernel-serve --proto udp|tcp|ws --bind IP --port P
+//! ```
+//!
+//! The command reference is in `docs/benchmarks/local.md`; the benchmark itself in
+//! `docs/benchmarks/README.md`.
 
 use std::collections::HashMap;
 use std::ffi::OsString;

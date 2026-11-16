@@ -1,30 +1,8 @@
-//! Per-CPU shared-memory rings: many writers, one reader.
-//!
-//! `ceph-ring` carries messages from many threads and processes to one consumer. One shared file holds a ring for every possible CPU; a [`Writer`] always pushes into the ring of the CPU its thread is running on, so writers never contend, and the single [`Reader`] reads every ring. Each record carries a stream id and a sequence number, which `ceph-fifo` uses to restore each producer's order. junction's send path is built on this crate: every `Session` holds a `Writer`, and the daemon holds the `Reader`.
-//!
-//! [`Reader::create`] makes the file in [`Config::dir`] (on macOS, a POSIX shared-memory object instead) and owns its name, which it removes on drop. It panics if `ring_size` is not a power of two and a multiple of the directory's page size, or if `max_record` exceeds `ring_size - 40`. [`Writer::attach`] maps the file at the path from [`Reader::name`] and checks its layout, including the number of rings. [`Writer::try_push`] returns [`PushError::Full`] when the current CPU's ring has no room and [`PushError::TooLarge`] when the payload exceeds `max_record`; [`Writer::try_push_with_header`] prefixes up to 32 bytes (a multiple of 8) of header without first copying header and payload into one buffer. [`Writer::try_finish`] pushes the stream's end record ([`END_OF_STREAM`]). `Writer` is `Send + Sync`.
-//!
-//! On Linux, a push runs in a restartable-sequence (rseq) critical section: if the thread is preempted or moved to another CPU mid-push, the push is abandoned and retried on the new CPU's ring. This needs glibc on x86_64 or aarch64, and `attach` returns `Unsupported` when glibc has not registered rseq for the calling thread. On macOS every push takes a spinlock on a single ring; that mode is for development and prints a warning. The consumer advances metadata but never writes into a ring.
-//!
-//! ```no_run
-//! use ceph_ring::{PushError, Writer};
-//!
-//! # fn main() -> std::io::Result<()> {
-//! # let (path, stream) = (String::new(), 0u64);
-//! // `path` and `stream` come from the consumer, for example through `ceph_control::connect`.
-//! let writer = Writer::attach(&path)?;
-//! loop {
-//!     match writer.try_push(b"hello", stream, 0) {
-//!         Ok(()) => break,
-//!         Err(PushError::Full) => std::hint::spin_loop(),
-//!         Err(PushError::TooLarge) => panic!("payload too large"),
-//!     }
-//! }
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! See the switch book, chapter "cephalopod: many writers, one reader".
+//! Per-CPU shared-memory rings that carry records from many threads and processes to one
+//! consumer. One shared file holds a ring for every possible CPU; a [`Writer`] pushes into the
+//! ring of the CPU its thread is running on, so writers never contend, and the single
+//! [`Reader`] reads every ring. Used by `ceph-fifo`, which restores each stream's order, and by
+//! junction's send path: every session holds a `Writer` and the daemon holds the `Reader`.
 
 use std::io;
 use std::os::fd::BorrowedFd;
@@ -64,13 +42,19 @@ struct ShmHeader {
     lock: AtomicU32,
 }
 
+/// Layout of the shared file, chosen by the consumer.
 pub struct Config {
+    /// Bytes per ring: a power of two and a multiple of `dir`'s page size.
     pub ring_size: usize,
+    /// The largest record payload, header included for
+    /// [`try_push_with_header`](Writer::try_push_with_header); at most `ring_size - 40`.
     pub max_record: usize,
-    /// Directory that holds the shared file. Ignored on macOS.
+    /// Directory that holds the shared file: `/dev/shm` for normal pages, or a hugetlbfs mount
+    /// such as `/dev/hugepages` for huge pages. Ignored on macOS.
     pub dir: PathBuf,
 }
 
+/// A committed record's stream, sequence number and payload length.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Header {
     pub stream: u64,
@@ -78,9 +62,14 @@ pub struct Header {
     pub len: usize,
 }
 
+/// Why a push was not committed. Nothing was written.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PushError {
+    /// The ring of the CPU the thread is running on has no room. Space returns after the
+    /// consumer has taken records and published its position; retry with the same sequence
+    /// number.
     Full,
+    /// The record is longer than `max_record`; retrying will not help.
     TooLarge,
 }
 
@@ -188,7 +177,11 @@ struct Cursor {
     dirty: bool,
 }
 
-/// Owns the shared object and removes it on drop.
+/// The consumer: creates the shared file, reads every ring, and removes the file's name when
+/// dropped. Writers already attached keep working after that.
+///
+/// The reader trusts the writers: it reads layout and lengths straight from the shared file.
+/// It never writes into a ring.
 pub struct Reader {
     map: Map,
     backing: Backing,
@@ -199,12 +192,14 @@ pub struct Reader {
 // SAFETY: `Reader` owns its mappings and cursor state; moving it transfers the sole consumer.
 unsafe impl Send for Reader {}
 
+/// A committed record, borrowed from its ring.
 pub struct Record<'a> {
     pub stream: u64,
     pub seq: u64,
     pub payload: &'a [u8],
 }
 
+/// The headers of a ring's committed records, from [`Reader::committed`].
 pub struct Committed<'a> {
     ring: &'a Ring,
     pos: u64,
@@ -223,6 +218,13 @@ impl Iterator for Committed<'_> {
 }
 
 impl Reader {
+    /// Creates the shared file in [`Config::dir`] (on macOS, a POSIX shared-memory object, and
+    /// `dir` is ignored) with one ring per possible CPU: on Linux, the highest CPU number in
+    /// `/sys/devices/system/cpu/possible` plus one; on macOS, one (two with feature `test-util`).
+    ///
+    /// # Panics
+    /// Panics if `ring_size` is not a power of two and a multiple of the page size of `dir`,
+    /// or if `max_record` is larger than `ring_size - 40`.
     pub fn create(cfg: Config) -> io::Result<Reader> {
         let Config {
             ring_size,
@@ -277,10 +279,12 @@ impl Reader {
         })
     }
 
+    /// The number of rings.
     pub fn nr_rings(&self) -> usize {
         self.cursors.len()
     }
 
+    /// The path writers pass to [`Writer::attach`].
     pub fn name(&self) -> &str {
         self.backing.name()
     }
@@ -388,6 +392,36 @@ impl Reader {
     }
 }
 
+/// A producer's handle on the shared file. `Send` and `Sync`: one `Writer` can serve several
+/// threads, and each push goes to the ring of the CPU the calling thread is on.
+///
+/// The library does not number records. Each stream's records must be committed in sequence
+/// order, which one pushing thread per stream guarantees; the sequence number advances only
+/// after a successful push; and sequence numbers stay below 2^63, because the top bit marks
+/// the end record.
+///
+/// On Linux a push runs as a restartable sequence: if the thread is preempted or moved to
+/// another CPU mid-push, the push starts again on the new CPU's ring. On macOS every push
+/// takes a spinlock on a single ring and the first push prints a warning; that mode is for
+/// development.
+///
+/// ```no_run
+/// use ceph_ring::{PushError, Writer};
+///
+/// # fn main() -> std::io::Result<()> {
+/// # let (path, stream) = (String::new(), 0u64);
+/// // `path` and `stream` come from the consumer, for example through `ceph_control::connect`.
+/// let writer = Writer::attach(&path)?;
+/// loop {
+///     match writer.try_push(b"hello", stream, 0) {
+///         Ok(()) => break,
+///         Err(PushError::Full) => std::hint::spin_loop(),
+///         Err(PushError::TooLarge) => panic!("payload too large"),
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
 pub struct Writer {
     #[allow(dead_code)] // keeps the mappings referenced by `table` alive
     map: Map,
@@ -403,6 +437,12 @@ unsafe impl Send for Writer {}
 unsafe impl Sync for Writer {}
 
 impl Writer {
+    /// Maps the shared file at `path`, from [`Reader::name`].
+    ///
+    /// Fails with `InvalidData` when the file has no ring layout, an invalid one, or one made
+    /// for a different number of CPUs. On Linux, fails with `Unsupported` when glibc has not
+    /// registered restartable sequences for the process; a push from a thread that has no
+    /// registration panics.
     pub fn attach(path: &str) -> io::Result<Writer> {
         #[cfg(target_os = "linux")]
         if !ceph_rseq::registered() {
@@ -459,11 +499,14 @@ impl Writer {
         })
     }
 
+    /// Commits `payload` as one record of `stream` with sequence number `seq`, into the ring
+    /// of the current CPU.
     pub fn try_push(&self, payload: &[u8], stream: u64, seq: u64) -> Result<(), PushError> {
         self.try_push_with_header(&[], payload, stream, seq)
     }
 
-    /// Pushes `header` followed by `payload` as one record.
+    /// Pushes `header` followed by `payload` as one record, so a caller can prefix its own
+    /// fields without first copying the payload. `max_record` limits the two together.
     ///
     /// # Panics
     ///
@@ -482,8 +525,8 @@ impl Writer {
         self.push(header, payload, stream, seq)
     }
 
-    /// Pushes the stream's last record with an empty payload. The player must keep its socket
-    /// open until the sequencer closes it; `try_finish` only enqueues the end record.
+    /// Pushes the stream's end record: an empty payload with sequence number `seq` (one past
+    /// the last record) and [`END_OF_STREAM`] set. It only places the record in a ring.
     pub fn try_finish(&self, stream: u64, seq: u64) -> Result<(), PushError> {
         self.try_push(&[], stream, seq | END_OF_STREAM)
     }

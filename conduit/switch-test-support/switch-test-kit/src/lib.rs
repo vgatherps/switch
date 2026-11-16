@@ -39,7 +39,7 @@
 //! and `close` them. A fixture dropped without `close` cleans up and then, unless the test is
 //! already panicking, fails the test. Fixture names must be unique among live fixtures.
 //!
-//! See the switch book, chapter "Writing tests that use DPDK".
+//! See `docs/contributing/writing-tests.md`.
 
 use std::cell::OnceCell;
 

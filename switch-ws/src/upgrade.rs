@@ -9,36 +9,48 @@ use sha1::{Digest, Sha1};
 /// Most bytes of an upgrade head (request or response) accepted.
 const MAX_HEAD: usize = 16 * 1024;
 
-/// Why an upgrade failed.
+/// Why a WebSocket upgrade failed, inside `Error::Upgrade`. The clients (`connect`,
+/// `connect_ws`) check the server's response; the server (`accept_ws`) checks the client's
+/// request and sends nothing back when it refuses one.
+///
+/// Both sides read the head through its blank line, at most 16 KiB, and parse at most 32
+/// header lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpgradeError {
-    /// The head is over `MAX_HEAD` bytes.
+    /// The head is over 16 KiB (16384 B, the blank line included).
     HeadTooBig,
-    /// The stream ended before the head did.
+    /// `wss://` only: the server sent close_notify before the head ended. (Over `ws://` a FIN
+    /// there is `Error::Recv`.)
     Closed,
-    /// Not HTTP: httparse's reason.
+    /// The head is not valid HTTP, or has more than 32 header lines; httparse's reason.
     Malformed(String),
-    /// A head without its blank line.
+    /// The head parsed as incomplete.
     Incomplete,
-    /// The response's status is not 101.
+    /// Client: the response's status is not 101; the status.
     Status(Option<u16>),
-    /// The request is not a GET.
+    /// Server: the request is not a GET; the method.
     Method(Option<String>),
-    /// The request is not HTTP/1.1.
+    /// Server: the request is not HTTP/1.1.
     NotHttp11,
+    /// Server: the request has no `Host` header.
     NoHost,
+    /// No `Upgrade: websocket` header (either side).
     NoUpgradeWebsocket,
+    /// No `upgrade` token in the `Connection` headers (either side).
     NoConnectionUpgrade,
-    /// The request's `Sec-WebSocket-Version` is not 13.
+    /// Server: the request's `Sec-WebSocket-Version` is missing or not 13.
     Version,
+    /// Server: the request has no `Sec-WebSocket-Key`.
     NoKey,
-    /// The request's key is not base64 of 16 bytes.
+    /// Server: the request's key is not base64 of 16 bytes.
     BadKey,
-    /// The response's `Sec-WebSocket-Accept` does not answer our key.
+    /// Client: the response's `Sec-WebSocket-Accept` is missing or does not answer our key.
     WrongAccept,
-    /// The response selects an extension or subprotocol we did not offer (the header named).
+    /// Client: the response selects an extension or subprotocol, which we never offer; the
+    /// header named.
     Unrequested(&'static str),
-    /// A header that must occur once occurs more than once (the header named).
+    /// `Sec-WebSocket-Key` (server) or `Sec-WebSocket-Accept` (client) occurs more than once;
+    /// the header named.
     Duplicate(&'static str),
 }
 

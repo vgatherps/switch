@@ -32,8 +32,12 @@ pub fn os_random_seed() -> std::io::Result<u64> {
     Ok(u64::from_le_bytes(bytes))
 }
 
+/// What [`Stack::new`] builds. A rule broken here fails `new` with
+/// [`StackError::InvalidConfig`] naming it.
 #[derive(Debug, Clone, Copy)]
 pub struct StackConfig<'a> {
+    /// The MAC address the Stack sends from. Unicast and nonzero; normally the device's own,
+    /// `EthernetAddress(device_info(&eal, port_id)?.mac)`.
     pub ethernet: EthernetAddress,
     /// The interface address and its connected subnet.
     pub ipv4: Ipv4Cidr,
@@ -63,25 +67,43 @@ pub struct StackConfig<'a> {
     /// [`DEFAULT_NEIGHBOR_CAPACITY`] is 256. When the cache is full, a new
     /// neighbor evicts the one that expires first.
     pub neighbor_capacity: usize,
+    /// TCP socket slots. Must be positive.
     pub max_sockets: usize,
     /// How many UDP sockets may be added. Zero disables UDP sockets.
     pub max_udp_sockets: usize,
+    /// Received packets held between the RX burst and processing. Must be positive. Each
+    /// `receive` or `turn` processes at most its `ingress_budget`; the rest wait here.
     pub rx_staging: usize,
-    /// Capacity of the Stack's pending TX frame queue: frames built but not
-    /// yet accepted by the PMD.
+    /// Capacity of the Stack's pending TX frame queue: frames built but not yet accepted by
+    /// the PMD. Must be positive. While it is full, UDP sends return `WouldBlock` and
+    /// `send` can only flush.
     pub tx_pending: usize,
 }
 
+/// Why [`Stack::new`] or a drive call failed.
+///
+/// `new` returns the `Port` with the error, so it can be closed. `Display` prints the
+/// `Debug` form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StackError {
+    /// From `new`: a [`StackConfig`] rule failed, the start time is before zero, the port's
+    /// IP MTU is from 68 to 87, or a path MTU is below 88 (the smallest MTU that carries a
+    /// 48-byte TCP segment).
     InvalidConfig(&'static str),
+    /// From `new`: the port's IP MTU is below 68.
     IpMtuBelowIpv4Minimum { mtu: u16 },
+    /// From `new`: the TX pool holds fewer than `tx_reserve(TX descriptors, tx_pending)` mbufs.
     TxPoolTooSmall { count: usize, required: usize },
-    /// The frame pool holds fewer than `frame_reserve(TX descriptors, tx_pending)` mbufs.
+    /// From `new`: the frame pool holds fewer than `frame_reserve(TX descriptors, tx_pending)` mbufs.
     TxFramePoolTooSmall { count: usize, required: usize },
-    /// The RX pool holds fewer than `rx_reserve(RX descriptors, rx_burst, rx_staging, cache size)` mbufs.
+    /// From `new`: the RX pool holds fewer than `rx_reserve(RX descriptors, rx_burst, rx_staging, cache size)` mbufs.
     RxPoolTooSmall { count: usize, required: usize },
+    /// From `receive` or `turn`: `now` is earlier than the last time. Nothing was done; the
+    /// Stack stays usable.
     TimeWentBackwards { last: Instant, now: Instant },
+    /// From a drive call: the NIC driver failed, or the port could not be recovered after a
+    /// device reset. Later calls fail too: [`Stack::into_port`], then
+    /// [`Port::try_close`](crate::Port::try_close).
     Port(PortError),
 }
 
@@ -110,10 +132,15 @@ impl fmt::Display for AddTcpError {
 
 impl std::error::Error for AddTcpError {}
 
+/// Why [`Stack::add_udp`] refused a socket. Checked in this order: `InvalidConfig`,
+/// `Unaddressable`, `PortInUse`, `Full`. Nothing changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddUdpError {
+    /// Every one of the `max_udp_sockets` slots is taken.
     Full,
+    /// That address (or all addresses) and port are already bound.
     PortInUse,
+    /// The port or `rx_queue` is zero.
     InvalidConfig(&'static str),
     /// `UdpConfig::local_addr` is not an address this Stack owns.
     Unaddressable,
@@ -138,7 +165,8 @@ pub struct UdpReadyKey(smoltcp::iface::UdpHandle);
 /// Outcome of one `Stack::turn` or `Stack::receive`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Turn {
-    /// Packets this turn's RX burst staged.
+    /// Packets this call's RX burst accepted into staging. Rejected packets are counted only
+    /// in `rx_rejected`.
     pub rx_received: usize,
     /// Packets this turn's RX burst released: unsupported, or a bad IPv4
     /// header checksum reported by the NIC (see `RxBurst::rejected`).
@@ -171,11 +199,69 @@ pub struct Sent {
     pub tx_pending: usize,
 }
 
-/// smoltcp interface, sockets and device over one owned Port, driven by
-/// caller-supplied time.
+/// A TCP/UDP stack over one owned [`Port`], driven by the caller's loop.
 ///
-/// Socket handles own their sockets and queue cleanup when dropped.
-/// Handles may outlive the Stack; dropping them afterwards is harmless.
+/// The Stack, its sockets, handles, and every frame and datagram it hands out stay on the
+/// thread that started DPDK. It reads no clock and never waits: each call does the work
+/// possible now and returns.
+///
+/// # The drive loop
+///
+/// Nothing happens between calls. Each pass of the loop does, in order:
+///
+/// 1. [`receive`](Self::receive)`(now, ingress_budget)`: take in arriving packets and process
+///    up to `ingress_budget` of them; replies built while receiving (resets, immediate ACKs,
+///    ARP replies) are flushed to the NIC.
+/// 2. The application reads and writes its sockets.
+/// 3. [`send`](Self::send)`()`: build what the sockets want to send, including what the
+///    application just wrote, and flush.
+///
+/// [`turn`](Self::turn)`(now, ingress_budget)` does both steps in one call; what the
+/// application then writes leaves on the next pass. Everything egress builds (data,
+/// SYN-ACKs, retransmissions, delayed ACKs, window updates) leaves only in `send` or
+/// `turn`, so keep the application step between `receive` and `send` short.
+/// [`flush`](Self::flush) only hands pending packets to the NIC.
+///
+/// After a call, `rx_staged > 0` means the ingress budget ran out: call again promptly.
+/// `tx_pending > 0` means the driver did not take everything: call `flush` until nothing is
+/// pending, then `send`.
+///
+/// # Time
+///
+/// `new`, `receive` and `turn` take the current time as a [`smoltcp::time::Instant`], in
+/// microseconds. The start time must be zero or more; after it, time must never go back
+/// (equal times are allowed), or the call returns [`StackError::TimeWentBackwards`] having
+/// done nothing. `send` and `flush` reuse the last time. Use one clock for every call, for
+/// example microseconds elapsed since a `std::time::Instant` taken just before `new`, not
+/// `smoltcp::time::Instant::now()`, which reads the wall clock.
+///
+/// # Sleeping
+///
+/// A loop on a pinned CPU calls again at once. A loop that sleeps when a call was idle
+/// ([`Turn::moved`] false) must cap the sleep: [`poll_at`](Self::poll_at) covers socket
+/// timers only, not packets arriving at the NIC, staged or pending packets, or ARP probes.
+/// The repository's loops sleep `min(poll_at - now, 1 ms)`, and 1 ms when it is `None`.
+///
+/// # TCP behaviour
+///
+/// | | |
+/// |---|---|
+/// | Retransmission timeout | 300 ms until the round-trip time is measured; then the smoothed round-trip time plus the larger of four times its variation and 50 ms. Each timeout doubles it, up to 60 s. |
+/// | Delayed ACK | 10 ms; `set_ack_delay(None)` turns it off, `ack_now()` sends an owed ACK at the next egress |
+/// | TIME-WAIT | 10 s |
+/// | Keepalive | none; an idle connection sends nothing |
+/// | Nagle's algorithm | none; queued data may leave at the next egress |
+/// | Congestion control | Cubic, initial window 1 MiB (`set_initial_window`) |
+/// | TCP timestamps option | never negotiated |
+/// | Out-of-order data | at most 1024 frames per socket past its first gap; further out-of-order segments are refused and counted in `rx_refused_segments()` |
+///
+/// When the RX pool falls below one RX ring refill plus one burst, the sockets holding the
+/// most out-of-order frames release them, farthest past the gap first, until the pool
+/// recovers; peers retransmit what was released. In-order data is never released.
+///
+/// A device reset requested by the NIC driver (ENA's health watchdog, run among DPDK's
+/// timers once a second) is recovered at the start of the next `receive` or `turn`; see
+/// [`turn`](Self::turn). [`port_resets`](crate::port_resets) counts recoveries.
 ///
 /// # Panics
 ///
@@ -188,6 +274,12 @@ pub struct Sent {
 ///
 /// A panic unwinding out of any of them leaves the Stack unusable: drop it or
 /// call `into_port`, nothing else.
+///
+/// Every method taking a handle panics on a handle from another Stack. Other documented
+/// panics: [`add_tcp`](Self::add_tcp) with `rx_capacity` over 1 GiB or `mss_cap: Some(0)`;
+/// `tcp::tx_mbuf_budget` with an IP MTU below 68 or `mss_cap: Some(0)`;
+/// `set_initial_window(0)`, `set_ack_delay` over 60 s and `set_hop_limit(Some(0))` on a
+/// socket; a stale readiness key in a release build (see [`arm_tcp`](Self::arm_tcp)).
 pub struct Stack {
     iface: Interface,
     /// Exactly `max_sockets` slots, never grown.
@@ -649,6 +741,21 @@ impl Stack {
     /// Flush at least every `StackConfig::tx_pending` sends. A full pending queue does
     /// not block ingress; replies that find no room are dropped.
     /// A send loop must call `receive` or `turn` to take ARP replies and advance time.
+    ///
+    /// | Error | Meaning |
+    /// |---|---|
+    /// | `NoDestination` | `to` is `None` and the socket has no peer. |
+    /// | `PeerMismatch` | `to` differs from the connected peer. |
+    /// | `Unaddressable` | The destination is unspecified, multicast, one of our own addresses, port 0, or the broadcast address without `UdpConfig::broadcast`. |
+    /// | `TooLarge` | The payload is longer than the destination's path MTU − 28. Nothing is fragmented. |
+    /// | `WouldBlock` (frame pool) | The frame pool is empty; retry once frames return. |
+    /// | `NoRoute` | The destination is off the subnet with no gateway, or there is no source address for it. |
+    /// | `NeighborPending` | The next hop's MAC is not known yet. An ARP request was queued and this datagram dropped: keep driving the loop, then send again. |
+    /// | `WouldBlock` (pending queue) | The pending queue is full: flush, then retry. |
+    ///
+    /// A learned neighbor stays usable while the Stack refreshes it, so sends through a
+    /// resolved gateway do not hit `NeighborPending` unless more than `neighbor_capacity`
+    /// neighbors evicted it.
     pub fn udp_send(
         &mut self,
         handle: &UdpHandle,
@@ -730,8 +837,17 @@ impl Stack {
         self.tcp_mut(handle).send_frame(frame)
     }
 
-    /// `tcp::Socket::connect` with this interface's context; refuses a live exact tuple.
-    /// A failed connect leaves the socket unchanged.
+    /// Start connecting: queue a SYN to `remote` from `local` (a port, or an address and
+    /// port). It leaves at the next egress; watch `tcp(&handle).state()` for the handshake.
+    /// There is no automatic port choice, so the local port must be nonzero.
+    ///
+    /// A failed connect leaves the socket unchanged:
+    ///
+    /// | `tcp::ConnectError` | Meaning |
+    /// |---|---|
+    /// | `InvalidState` | The socket is not closed. |
+    /// | `Unaddressable` | A zero port on either side, an unspecified remote, a local address the Stack does not own, or no source address toward `remote`. |
+    /// | `AddressInUse` | Another live socket, one in TIME-WAIT included, holds the same addresses and ports. |
     pub fn connect<T: Into<IpEndpoint>, U: Into<IpListenEndpoint>>(
         &mut self,
         handle: &TcpHandle,
@@ -742,9 +858,15 @@ impl Stack {
         self.sockets.connect(raw, self.iface.context(), remote, local)
     }
 
-    /// `tcp::Socket::listen`, refusing an explicit local address that is
-    /// neither `StackConfig::ipv4`'s address nor in `StackConfig::owned_ipv4`
-    /// (`Unaddressable`). A failed listen leaves the socket unchanged.
+    /// Wait for one incoming connection on `local` (a port for every owned address, or an
+    /// address and port). There is no accept queue: the socket itself becomes the
+    /// connection. To accept several at once, listen on the same port with several sockets;
+    /// to accept again, call `listen` once the socket is `Closed`.
+    ///
+    /// A failed listen leaves the socket unchanged. `ListenError::Unaddressable`: port 0,
+    /// or an address that is neither `StackConfig::ipv4`'s nor in `owned_ipv4`.
+    /// `ListenError::InvalidState`: the socket is open and not already listening on that
+    /// endpoint (listening again on the same endpoint is `Ok`).
     pub fn listen<T: Into<IpListenEndpoint>>(
         &mut self,
         handle: &TcpHandle,
@@ -760,6 +882,21 @@ impl Stack {
 
     /// `tcp::Socket::close`: send FIN after the queued data, or, in LISTEN and
     /// SYN-SENT, close at once; in SYN-RECEIVED, reset.
+    ///
+    /// The ways to end a connection:
+    ///
+    /// | Call | On the wire | Unread data | Slot |
+    /// |---|---|---|---|
+    /// | `close` | FIN after the queued data | stays readable | kept; drive until `Closed`, then reuse or remove |
+    /// | [`abort`](Self::abort) | one reset at the next egress, for an open connection | discarded | kept, `Closed` at once |
+    /// | [`remove_tcp`](Self::remove_tcp) | nothing | discarded | freed at once |
+    /// | drop the [`TcpHandle`] | reset if unread in-order data remains, else FIN; nothing from `SynSent` | discarded | held until the connection has closed |
+    ///
+    /// A dropped handle is processed at the start of the next `turn`, `receive`, `send`,
+    /// `add_tcp` or `add_udp`. Its connection then ends on its own: after TIME-WAIT (10 s),
+    /// after 60 s in FIN-WAIT-2 with no FIN from the peer, or after 8 retransmission
+    /// backoffs if the peer stops answering. Until then its slot counts against
+    /// `max_sockets`. None of these calls cancels packets already in the pending queue.
     pub fn close(&mut self, handle: &TcpHandle) {
         let raw = self.tcp_raw(handle);
         self.sockets.close(raw);
@@ -796,13 +933,20 @@ impl Stack {
         TcpReadyKey(raw)
     }
 
-    /// Arm `token` for `side` of the socket, replacing a token armed there. The next change
-    /// that can make the socket readable, writable or change its state fires it: a received
-    /// segment, `tcp_mut` (also through `tcp_send_frame`, `connect`, `listen`), or a state
-    /// change in egress (close timers, TIME-WAIT end). A fired
-    /// token is disarmed and returned once by [`Self::pop_fired`]; changes that do not alter
-    /// readiness may fire it too. `remove_tcp` disarms both halves, and so does the Stack when it
-    /// processes a dropped handle; `disarm_tcp` stops a token at once.
+    /// Arm `token` for `side` of the socket, replacing a token armed there. `ReadySide::Rx`
+    /// is for code waiting to receive, `ReadySide::Tx` for code waiting to send. The next
+    /// change that can make the socket readable, writable or change its state fires it: a
+    /// received segment, `tcp_mut` (also through `tcp_send_frame`, `connect`, `listen`), or a
+    /// state change in egress (close timers, TIME-WAIT end). A fired token is disarmed and
+    /// returned once by [`Self::pop_fired`]; changes that do not alter readiness may fire it
+    /// too, so check the socket's real state and arm again. Sending queued data, frames
+    /// returning to the pool and idle calls fire nothing. `remove_tcp` disarms both halves,
+    /// and so does the Stack when it processes a dropped handle; `disarm_tcp` stops a token
+    /// at once.
+    ///
+    /// Because `tcp_mut` fires the socket's tokens, arm after reading and writing the
+    /// socket, or disarm before and arm after: otherwise the application's own `recv` fires
+    /// the token it just armed.
     ///
     /// Only debug builds check that `key` still names a live socket; a key used after its
     /// socket was removed, or on another Stack, misdirects the token to whatever socket holds

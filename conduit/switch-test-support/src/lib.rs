@@ -18,7 +18,7 @@
 //! The block is not compiled here because `switch-test-kit` needs DPDK and this crate does not.
 //! `#[pinned_test(bound_ms = 5000)]` gives a body a 5-second bound instead of the default.
 //!
-//! See the switch book, chapter "Writing tests that use DPDK".
+//! See `docs/contributing/writing-tests.md`.
 use std::any::Any;
 use std::backtrace::Backtrace;
 use std::cell::{Cell, RefCell};

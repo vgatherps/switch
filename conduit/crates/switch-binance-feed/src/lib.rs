@@ -1,6 +1,6 @@
-//! Client of Binance's bookTicker stream: TLS 1.3 and WebSocket (switch-ws's wss client over
-//! switch-tls) on one switch-net TCP socket, run as a switch task. It is a worked example of the
-//! protocol crates and the market-data feed behind `switch-nic feed`.
+//! A client of Binance's bookTicker stream over `wss://`, run as one switch task on a `Net`.
+//! `switch-nic feed` runs it on a real NIC; the `switch-binance-feed` binary runs it on a tap
+//! device. Applications do not depend on this crate.
 //!
 //! [`feed`] is the whole client as one `#[switch_runtime::task]`: it connects within
 //! [`CONNECT_LIMIT`], reads updates until its `stop` oneshot fires, then runs the WebSocket close
@@ -10,20 +10,7 @@
 //! [`client_config`], [`socket`] and [`Clock`] are the setup pieces. Runtime ticks are monotonic
 //! nanoseconds ([`Clock::ns`]).
 //!
-//! The `switch-binance-feed` binary runs the feed on a tap device behind a helper process (the
-//! tester) that gives the tap's kernel side its address and NATs the feed's traffic out:
-//!
-//! ```text
-//! switch-binance-feed [--host HOST] [--port PORT] [--path PATH] [--print N] -- <tester> [args...]
-//! ```
-//!
-//! Defaults: host `stream.binance.com`, port 9443, path `/ws/btcusdt@bookTicker`, 10 updates
-//! printed; each option at most once. Exit status: 0 the tester exited 0; 1 the tester failed;
-//! 2 packet buffers still in use at port close; 3 bad arguments, setup, feed or teardown error;
-//! 101 panic. Statuses 2 and 3 take precedence over the tester's. Run it with no arguments for
-//! the full usage, or through `make -C conduit docker-binance BINANCE_SECONDS=30`.
-//!
-//! Book: See the switch book, chapter "Walkthrough: a market-data feed".
+//! The output lines are described in `docs/operations/switch-nic.md` (section `feed`).
 
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -197,13 +184,16 @@ pub fn socket(mss_cap: Option<u16>) -> tcp::Config {
 }
 // ANCHOR_END: socket
 
+/// Why [`connect`] or [`feed`] failed.
 #[derive(Debug)]
 pub enum FeedError {
     /// The Stack refused the socket (no free slot, pools too small) or the connect.
     Open(Error),
     /// TCP closed before it was established.
     Closed {
+        /// The server's endpoint.
         addr: SocketAddrV4,
+        /// `true` when the server answered the SYN with a reset (connection refused).
         reset_by_peer: bool,
     },
     /// TLS, the WebSocket upgrade or protocol, or TCP under them.
@@ -213,6 +203,7 @@ pub enum FeedError {
         step: &'static str,
         limit: Duration,
     },
+    /// A text message that is not a bookTicker JSON object.
     Parse {
         text: String,
         error: serde_json::Error,

@@ -1,9 +1,9 @@
-//! TLS 1.3 over switch-net TCP: [`tls_connect`] runs the handshake (a rare path, which
-//! allocates), then [`Tls`] holds the two halves and the TCP receive half feeding them. Its
-//! futures run as switch tasks. switch-net's frames are this crate's [`RxFrame`]/[`TxFrame`].
+//! The TLS client on a TCP stream. [`tls_connect`] runs the handshake on a connected
+//! [`TcpStream`] and returns a [`Tls`]: read with [`Tls::ready`] and [`TlsRx::current`], write
+//! with [`send_bytes`], end with [`Tls::close`].
 //!
-//! TCP receive and send failures carry [`switch_net::Error`]; [`Error`] retains their TLS
-//! context. Frame sizing uses the stream's cached negotiated MSS.
+//! Each of these waits on the server, and a silent server keeps it waiting. Bound them with
+//! [`within`](switch_net::within).
 
 use std::fmt;
 use std::future::{Future, poll_fn};
@@ -40,15 +40,16 @@ impl TxFrame for switch_net::OwnedFrame {
     }
 }
 
-/// Why a [`SwitchTx`] (and so a connection) could not be set up. Nothing was sent.
+/// Why a connection could not be set up. Nothing was sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetupError {
-    /// The stream is not on `handle`'s Net: its frames would be refused as foreign.
+    /// The stream does not belong to the Net of the handle passed with it.
     ForeignHandle,
-    /// A frame holds `room` bytes (the backend's frame capacity, clamped to the send buffer),
-    /// fewer than the `need` bytes the caller's largest frame takes.
+    /// A frame can carry `room` bytes, fewer than the `need` bytes the connection's largest
+    /// frame takes. `room` is bounded by the backend's frame size, the socket's send buffer
+    /// and, over TLS, the config's `max_fragment_size`.
     RoomTooSmall { room: usize, need: usize },
-    /// The socket closed or reset before a frame could be taken.
+    /// The socket had already closed or reset.
     Dead,
 }
 
@@ -146,11 +147,21 @@ impl FrameTx for SwitchTx {
     }
 }
 
+/// Why [`tls_connect`], [`Tls::ready`] or [`Tls::close`] failed.
+///
+/// | Error | From | When |
+/// |---|---|---|
+/// | `Setup(e)` | `tls_connect` | The connection could not be set up; nothing was sent. |
+/// | `Handshake(msg)` | `tls_connect` | `host` is not a valid server name (nothing was sent), the server negotiated a version other than TLS 1.3, or the handshake ended in a state other than application traffic. |
+/// | `Tls(Tls(e))` | `tls_connect`, `ready` | rustls refused `config` (nothing was sent), rejected the server's handshake, or rejected a received record. In the last two cases the alert rustls queued and a FIN went out, and the call returned once the server acknowledged them or the connection ended. |
+/// | `Tls(Truncated)` | `ready` | TCP ended without the server's close_notify. A FIN went out, as above. |
+/// | `Recv(e)` | `tls_connect`, `ready` | TCP receive failed: a reset, or the server's FIN during the handshake. |
+/// | `Send(e)` | `tls_connect`, `close` | Sending failed; see [`TxError`]. |
 #[derive(Debug)]
 pub enum Error {
     /// TCP receive failed.
     Recv(NetError),
-    /// The TLS handshake or a received record failed.
+    /// The TLS handshake or a received record failed, or the stream was truncated.
     Tls(TlsError),
     /// Sending failed (TLS or TCP).
     Send(TxError<NetError>),
@@ -175,8 +186,9 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// A TLS 1.3 connection over switch-net TCP, after the handshake: the receive half, the send
-/// half, and the TCP receive half that feeds `rx`.
+/// A TLS 1.3 connection after the handshake, from [`tls_connect`]: the receive half `rx`, the
+/// send half `tx` (write with [`send_bytes`]), and the TCP receive half that feeds `rx`. Use it
+/// from one task.
 pub struct Tls {
     pub rx: TlsRx<TcpFrame, SwitchTx>,
     pub tx: TlsTx<SwitchTx>,
@@ -184,11 +196,15 @@ pub struct Tls {
 }
 
 impl Tls {
-    /// Waits until `rx` holds plaintext to read through `rx.current()`/`rx.consume` (`Ok(true)`),
-    /// or the server closed with close_notify (`Ok(false)`). A TLS error first sends the alert
-    /// rustls queued for it, then FIN, and returns once the server acked them (or the connection
-    /// ended): until then an erroring call stays pending, so the caller bounds it. The TCP stream
-    /// ending without close_notify is truncation.
+    /// Waits until `rx` holds plaintext (`Ok(true)`): read it with [`TlsRx::current`] and mark
+    /// what was used with [`TlsRx::consume`]. `Ok(false)` once the server sent close_notify, and
+    /// on every call after.
+    ///
+    /// On a bad record, or TCP ending without close_notify, it sends the alert rustls queued (if
+    /// any) and FIN, and returns the error once the server acknowledged them or the connection
+    /// ended; a silent server keeps it waiting, so bound it. Later calls return the same error.
+    /// A TCP reset returns `Recv` at once. Dropping the future while it waits for data loses
+    /// nothing.
     pub async fn ready(&mut self) -> Result<bool, Error> {
         loop {
             let failed = match self.rx.chunk(&mut self.tx).map(|run| run.is_some()) {
@@ -211,9 +227,13 @@ impl Tls {
         }
     }
 
-    /// Sends close_notify, then FIN, and returns once the server acked them (or the connection
-    /// ended), so the connection may be dropped then; until then it stays pending, so the caller
-    /// bounds it. This call does not receive application data.
+    /// Sends close_notify, then FIN, and returns once the server acknowledged them or the
+    /// connection ended; the `Tls` may be dropped then. A silent server keeps it waiting, so
+    /// bound it. It does not read: data the server sends meanwhile stays unread.
+    ///
+    /// Fails with `Send(TxError::Closed)` if close_notify was already sent,
+    /// `Send(TxError::Received(e))` after a receive error, and `Send(TxError::Lower(e))` if the
+    /// socket closed or reset.
     pub async fn close(&mut self) -> Result<(), Error> {
         self.tx.send_close_notify().await.map_err(Error::Send)?;
         self.tx.shutdown();
@@ -252,14 +272,24 @@ async fn send_sealed<L: FrameTx>(lower: &mut L, mut sealed: L::Sealed, len: usiz
     Ok(())
 }
 
-/// The TLS handshake for `host` on `stream`. If rustls rejects the server's handshake, the alert
-/// it queued goes out, then FIN, and the error returns once the server acked them (or the
-/// connection ended): until then a failing handshake stays pending, so the caller bounds it.
-/// `min_plain` is the largest plaintext record the caller will send (0 counts as 1); a frame
-/// that cannot carry it as one record (its room, or the client's `max_fragment_size`) is
-/// `Setup(RoomTooSmall)` before the ClientHello.
-/// A negotiated version other than TLS 1.3 is refused with `Handshake`, even if `config`
-/// permits it.
+/// Runs the TLS 1.3 handshake for `host` on `stream`, a connected stream from `handle`'s Net,
+/// and returns the connection. Errors are listed on [`Error`].
+///
+/// `host` is the server name sent in the handshake and checked against the certificate.
+/// `config` decides certificate checking and the crypto provider; this function adds neither.
+/// Only TLS 1.3 is accepted: a handshake that negotiates another version, which `config` may
+/// allow, fails with `Handshake`.
+///
+/// `min_plain` is the largest plaintext the caller will send as one record (0 counts as 1);
+/// [`send_bytes`] splits larger writes, so 1 suits a caller that sends only through it. One
+/// frame must hold such a record: `min_plain` plus 76 B of record overhead must fit the
+/// backend's frame size and the socket's send buffer, `min_plain` must be at most 16384, and
+/// `config.max_fragment_size`, if set, at least `min_plain + 5`. Otherwise the result is
+/// `Setup(RoomTooSmall)`, before anything is sent.
+///
+/// The handshake waits on the server. A rejected handshake also waits, until the alert and FIN
+/// it sends are acknowledged or the connection ends. Bound the call with
+/// [`within`](switch_net::within); dropping the future drops the stream.
 pub async fn tls_connect(
     handle: &NetHandle,
     stream: TcpStream,
@@ -353,7 +383,12 @@ pub async fn tls_connect(
     })
 }
 
-/// Sends `bytes` through `lower`, a frame at a time, each sent once there is room for it.
+/// Sends `bytes` through `lower` (for TLS, `&mut tls.tx`), a frame and one record at a time,
+/// waiting for TCP room for each. The error is `lower`'s, [`TxError`] for TLS.
+///
+/// Dropped before it returns, it may have sent a prefix of `bytes` in whole records. Dropped
+/// while a sealed record waits for room, it breaks the connection: later sends fail with
+/// [`TxError::Broken`].
 pub async fn send_bytes<L: FrameTx>(lower: &mut L, bytes: &[u8]) -> Result<(), L::Error> {
     let (head, room) = lower.plain();
     for piece in bytes.chunks(room) {

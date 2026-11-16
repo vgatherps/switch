@@ -1,17 +1,10 @@
-//! Raw bindings to DPDK 25.11.3, plus C shims for the DPDK functions that exist only as inline C.
+//! Raw bindings to DPDK 25.11.3, plus C shims for the DPDK functions that exist only as
+//! inline C. Builds only on Linux with DPDK 25.11.3 installed, or in the repository's
+//! Docker image.
 //!
-//! `build.rs` finds `libdpdk` through pkg-config and generates the bindings with bindgen, so this crate builds only on Linux with DPDK 25.11.3 installed (or in the repository's Docker image). The bindings and shims are `unsafe` building blocks for `switch-buffer` and `dpdk-smoltcp`; application code does not call them.
-//!
-//! The one item meant for applications is [`only_allowed_cpu`]. DPDK pins its main thread to a CPU you name on its command line; this function returns the one CPU the calling thread is allowed to run on, so the process's CPU set (`taskset -c N`, or a container's `--cpuset-cpus=N`) chooses it. It returns [`AffinityError::NotOne`] when the thread may run on more or fewer than one CPU.
-//!
-//! ```rust,no_run
-//! let cpu = switch_dpdk_sys::only_allowed_cpu()?;
-//! let lcores = format!("--lcores=7@{cpu}");
-//! // pass `lcores` and `--main-lcore=7` to dpdk_smoltcp::Eal::init
-//! # Ok::<(), switch_dpdk_sys::AffinityError>(())
-//! ```
-//!
-//! See the switch book, chapter "The pinned CPU and helper threads".
+//! The bindings and shims are `unsafe` building blocks for `switch-buffer` and
+//! `dpdk-smoltcp`; applications do not call them. A program that starts DPDK by hand uses
+//! [`only_allowed_cpu`] to find the CPU for DPDK's `--lcores=<id>@<cpu>`.
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]

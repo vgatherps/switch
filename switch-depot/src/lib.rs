@@ -1,8 +1,7 @@
 //! # switch-depot
 //!
-//! A growable allocator of slot numbers, used inside `switch` to number the task slots of each task function's pool. Application code does not use it directly.
-//!
-//! [`DynDepot`] hands out `u32` slot numbers starting at 0, always the lowest free one, so slots that were never used go out in increasing order. It has no capacity: when every slot is taken, it grows by 64. `free` returns a slot for reuse. It keeps no handles or generations, so the caller must free each slot exactly once; a double free is caught only by a debug assertion. Internally, a bitmap of free slots and a summary bitmap above it find the lowest free slot quickly.
+//! A growable allocator of `u32` slot numbers. The runtime under the `switch` crate uses it
+//! to number task slots; applications do not use it.
 //!
 //! ```rust
 //! use switch_depot::DynDepot;
@@ -15,10 +14,11 @@
 //! assert_eq!(depot.alloc(), 1); // the lowest free slot comes back first
 //! assert_eq!(depot.alloc(), 3);
 //! ```
-//!
-//! Book: see the switch book, chapter "Panics, errors and shutdown", section "How task storage works".
 
-/// Slot numbers from 0, lowest free first, growing on demand; no handles or generations.
+/// Slot numbers from 0, always the lowest free one first, so slots never used go out in
+/// increasing order. No capacity: it grows by 64 slots when every slot is taken.
+///
+/// It keeps no handles or generations: the caller frees each slot it got exactly once.
 #[derive(Debug, Default)]
 pub struct DynDepot {
     free: Vec<u64>,
@@ -26,6 +26,7 @@ pub struct DynDepot {
 }
 
 impl DynDepot {
+    /// An empty depot. Allocates nothing until the first [`alloc`](Self::alloc).
     pub const fn new() -> Self {
         Self {
             free: Vec::new(),
@@ -33,7 +34,11 @@ impl DynDepot {
         }
     }
 
-    /// The lowest free slot, now taken; adds 64 slots when none is free.
+    /// Takes and returns the lowest free slot, growing by 64 slots when none is free.
+    ///
+    /// # Panics
+    ///
+    /// When the next slot numbers would not fit in a `u32`.
     #[inline]
     pub fn alloc(&mut self) -> u32 {
         let Some(top) = self.summary.iter().position(|&bits| bits != 0) else {
@@ -65,8 +70,12 @@ impl DynDepot {
         end - 64
     }
 
-    /// Returns a slot `alloc` handed out and nobody freed since. Panics if `alloc` never
-    /// reached it.
+    /// Returns a slot that [`alloc`](Self::alloc) handed out and that was not freed since.
+    ///
+    /// # Panics
+    ///
+    /// If `alloc` never reached `slot`. A double free panics only in debug builds; in
+    /// release builds it goes undetected.
     #[inline]
     pub fn free(&mut self, slot: u32) {
         let word = slot as usize / 64;

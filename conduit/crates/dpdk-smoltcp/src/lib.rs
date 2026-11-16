@@ -1,49 +1,11 @@
-//! A TCP/UDP stack for one DPDK NIC port, driven from one thread.
+//! A synchronous TCP/UDP stack for one DPDK NIC port, IPv4 over Ethernet, driven from one
+//! thread with no async runtime.
 //!
-//! This crate runs a TCP/IP stack (a vendored, modified smoltcp, re-exported as [`smoltcp`]) over a NIC that DPDK drives from userspace. Received data reaches your code as references into the NIC's own packet buffers, and data you send can be written in place into buffers the NIC sends from. `switch-net` builds async sockets on it, and the junction daemon runs one for many applications. Use this crate directly when you want a synchronous loop with no async runtime, or are building your own layer on top.
-//!
-//! [`Eal::init`] starts DPDK once per process. [`Port::open`] configures one NIC port with three pools of packet buffers (RX, TX and frame). [`Stack::new`] builds the stack over that port. Sockets are named by [`TcpHandle`] and [`UdpHandle`], which belong to the Stack that made them. The Stack reads no clock and never waits: your loop calls [`Stack::turn`] (or [`Stack::receive`], then your work, then [`Stack::send`]) with the current time in microseconds, and each call does the work possible now. The `Eal`, `Port`, `Stack`, handles and every frame stay on the thread that started EAL. Most programs open the Stack with `switch_open::open` from a network config file instead of calling `Eal::init` and `Port::open` themselves.
-//!
-//! ```rust,no_run
-//! use std::net::SocketAddrV4;
-//! use std::time::Instant as WallInstant;
-//!
-//! use dpdk_smoltcp::smoltcp::socket::tcp::{self, State};
-//! use dpdk_smoltcp::smoltcp::time::Instant;
-//! use dpdk_smoltcp::Stack;
-//!
-//! /// Connect, send one line, print what comes back, close when the server closes.
-//! /// `stack` was created at `Instant::ZERO` just after `start` was taken.
-//! fn talk(stack: &mut Stack, start: WallInstant, server: SocketAddrV4) -> Result<(), Box<dyn std::error::Error>> {
-//!     let clock = || Instant::from_micros(i64::try_from(start.elapsed().as_micros()).unwrap());
-//!     let handle = stack.add_tcp(tcp::Config { rx_capacity: 65536, tx_capacity: 65536, mss_cap: None })?;
-//!     // There is no ephemeral port allocator; the local port must be nonzero.
-//!     stack.connect(&handle, server, 40000)?;
-//!     let line = b"hello\n";
-//!     // `send_slice` queues what fits, possibly nothing; keep going until the line is queued.
-//!     let mut queued = 0;
-//!     loop {
-//!         stack.receive(clock(), 32)?;
-//!         let socket = stack.tcp_mut(&handle);
-//!         while socket.may_recv() {
-//!             let Some(frame) = socket.recv()? else { break };
-//!             println!("{:?}", frame.payload());
-//!         }
-//!         if queued < line.len() && socket.may_send() {
-//!             queued += socket.send_slice(&line[queued..])?;
-//!         }
-//!         if socket.state() == State::CloseWait {
-//!             stack.close(&handle);
-//!         }
-//!         if stack.tcp(&handle).state() == State::Closed {
-//!             return Ok(());
-//!         }
-//!         stack.send()?;
-//!     }
-//! }
-//! ```
-//!
-//! See the switch book, part "The Stack without async", starting at chapter "Programming the Stack directly".
+//! [`Stack`] is the stack. Its methods are the reference for programs that drive it
+//! directly: the drive calls ([`Stack::receive`], [`Stack::send`], [`Stack::turn`]), time,
+//! sockets and readiness tokens. Applications usually get a `Stack` from `switch::nic::open`
+//! and hand it to `switch::net`; [`Eal::init`], [`Port::open`] and [`Stack::new`] build one
+//! by hand. The TCP/IP code is a vendored, modified smoltcp, re-exported as [`smoltcp`].
 
 #[cfg(doctest)]
 mod api_guards {
@@ -91,7 +53,7 @@ mod api_guards {
     //! ```
     //! Removing a socket from any `TcpSet` drops it, so no admitted socket can be taken out and
     //! written over another one through `Stack::tcp_mut`:
-    //! ```compile_fail,E0308
+    //! ```compile_fail,E0609
     //! use dpdk_smoltcp::smoltcp::{iface::{SocketHandle, TcpSet}, socket::tcp};
     //! fn removed(set: &mut TcpSet<'static>, h: SocketHandle) -> tcp::Socket<'static> {
     //!     set.remove(h).0
@@ -101,6 +63,62 @@ mod api_guards {
     //! use dpdk_smoltcp::smoltcp::{iface::{SocketHandle, TcpSet}, socket::tcp};
     //! fn taken(set: &mut TcpSet<'static>, h: SocketHandle) -> tcp::Socket<'static> {
     //!     set.take(h).0
+    //! }
+    //! ```
+    //! `Eal`, `TcpHandle` and `UdpHandle` stay on the thread that made them:
+    //! ```compile_fail
+    //! use dpdk_smoltcp::Eal;
+    //! fn requires_send<T: Send>() {}
+    //! requires_send::<Eal>();
+    //! ```
+    //! ```compile_fail
+    //! use dpdk_smoltcp::Eal;
+    //! fn requires_sync<T: Sync>() {}
+    //! requires_sync::<Eal>();
+    //! ```
+    //! ```compile_fail,E0277
+    //! use dpdk_smoltcp::TcpHandle;
+    //! fn needs_send<T: Send>(_: T) {}
+    //! fn f(h: TcpHandle) { needs_send(h); }
+    //! ```
+    //! `remove_tcp` and `remove_udp` consume the handle, and handles are not `Clone`:
+    //! ```compile_fail,E0382
+    //! use dpdk_smoltcp::{Stack, TcpHandle};
+    //! fn f(stack: &mut Stack, h: TcpHandle) {
+    //!     stack.remove_tcp(h);
+    //!     stack.tcp(&h);
+    //! }
+    //! ```
+    //! ```compile_fail,E0382
+    //! use dpdk_smoltcp::{Stack, TcpHandle};
+    //! fn f(stack: &mut Stack, h: TcpHandle) {
+    //!     stack.remove_tcp(h);
+    //!     stack.remove_tcp(h);
+    //! }
+    //! ```
+    //! ```compile_fail,E0599
+    //! use dpdk_smoltcp::TcpHandle;
+    //! fn f(h: TcpHandle) { h.clone(); }
+    //! ```
+    //! ```no_run
+    //! use dpdk_smoltcp::{Stack, TcpHandle};
+    //! fn f(stack: &mut Stack, h: TcpHandle) {
+    //!     let state = stack.tcp(&h).state();
+    //!     stack.remove_tcp(h);
+    //! }
+    //! ```
+    //! ```compile_fail,E0382
+    //! use dpdk_smoltcp::{Stack, UdpHandle};
+    //! fn f(stack: &mut Stack, h: UdpHandle) {
+    //!     stack.remove_udp(h);
+    //!     stack.udp(&h);
+    //! }
+    //! ```
+    //! ```compile_fail,E0382
+    //! use dpdk_smoltcp::{Stack, UdpHandle};
+    //! fn f(stack: &mut Stack, h: UdpHandle) {
+    //!     stack.remove_udp(h);
+    //!     stack.remove_udp(h);
     //! }
     //! ```
 }

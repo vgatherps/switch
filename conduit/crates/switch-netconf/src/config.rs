@@ -7,59 +7,99 @@ use std::{fmt, fs, path::Path, str::FromStr};
 /// Error for a port or path MTU below `MIN_IP_MTU`.
 const MTU_TOO_SMALL: &str = "must be at least 88 (48-byte minimum TCP MSS + 40 bytes of headers)";
 
+/// A loaded, validated network config file.
+///
+/// Every key is required except `owned_ipv4`; unknown keys are rejected, and `version`
+/// must be 1. [`Config::load`] and [`Config::from_json`] apply the checks listed in
+/// `docs/operations/config.md`. The fields are public: a `Config` built by hand is not
+/// checked, and [`Config::path_mtu`] panics on an invalid path table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, try_from = "JsonConfig", into = "JsonConfig")]
 pub struct Config {
+    /// The card or virtual device to open.
     pub device: Device,
+    /// The card's MAC address: required for a PCI card, `None` (`null`) for a vdev.
+    /// Opening a PCI card fails if the card reports a different address.
     pub mac: Option<EthernetAddress>,
+    /// The program's address and subnet.
     pub ipv4: Ipv4Cidr,
+    /// The router for destinations outside the subnet, or `None`. A unicast address inside
+    /// the subnet, other than `ipv4`'s address and the subnet's network and broadcast
+    /// addresses.
     pub gateway: Option<Ipv4Address>,
     /// IPv4 addresses the Stack owns besides `ipv4`: single addresses (/32) and prefixes. Sorted,
     /// none inside another (duplicates and contained entries are dropped on load). Ownership
     /// only: `ipv4` keeps routing, the subnet broadcast and the default source.
     pub owned_ipv4: Vec<Ipv4Cidr>,
+    /// The largest IP packet the card sends, headers included. At least 88.
     pub mtu: u16,
+    /// Per-destination path MTUs; see [`Config::path_mtu`].
     pub paths: Vec<PathRule>,
+    /// Checksum offloads: `"auto"` or explicit.
     pub offloads: Offloads,
+    /// Ask the card to stamp each received packet with its clock. Never set by `"auto"`.
     pub rx_timestamps: bool,
+    /// Slots in each of the card's RX and TX rings, before the driver's adjustment. Positive.
     pub descriptors: u16,
+    /// DPDK start-up settings.
     pub eal: EalConfig,
 }
 
+/// The device to open. In JSON, an object with the [`PciDevice`] keys, or `{"vdev": "..."}`.
+/// A malformed `device` object fails with serde's
+/// `data did not match any variant of untagged enum Device`, which names no key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum Device {
+    /// A PCI card.
     Pci(PciDevice),
+    /// A DPDK virtual device string, such as `net_tap0,iface=cdnic0`. Not empty.
     Vdev { vdev: String },
 }
 
+/// A PCI card.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PciDevice {
+    /// PCI address, `dddd:bb:dd.f` in lowercase hex.
     pub pci: String,
+    /// Vendor and device id, `vvvv:dddd` in lowercase hex.
     pub pci_id: String,
+    /// Driver options, passed to DPDK as `-a <pci>,<devargs>`. Empty for none.
     pub devargs: String,
+    /// The Linux driver the card returns to on `unbind`. Not empty.
     pub kernel_driver: String,
+    /// The card's Linux interface name. Not empty.
     pub kernel_interface: String,
+    /// The card's NUMA node as Linux reports it, `-1` for none.
     pub numa_node: i32,
 }
 
+/// One path MTU rule: destinations in `prefix` get at most `mtu`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PathRule {
+    /// No host bits set; no prefix may appear twice.
     #[serde(
         serialize_with = "serialize_string",
         deserialize_with = "deserialize_prefix"
     )]
     pub prefix: Ipv4Cidr,
+    /// At least 88.
     pub mtu: u16,
+    /// A non-empty label for people. `switch-netconf discover -o` regenerates the rules
+    /// labelled `vpc` and `default`.
     pub why: String,
 }
 
+/// The config's `offloads`: the string `"auto"` or an object with three booleans.
+/// What `Auto` resolves to is described in `switch::nic::offloads`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, try_from = "Value", into = "JsonOffloads")]
 pub enum Offloads {
+    /// Request what the driver advertises, chosen per driver.
     Auto,
+    /// Request exactly these; opening fails if the driver lacks one.
     Explicit {
         rx_checksum: bool,
         tx_tcp_checksum: bool,
@@ -67,13 +107,19 @@ pub enum Offloads {
     },
 }
 
+/// DPDK start-up settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EalConfig {
+    /// DPDK's `--file-prefix`. Not empty.
     pub file_prefix: String,
+    /// Further DPDK arguments, added after the ones `open` passes itself.
     pub extra: Vec<String>,
 }
 
+/// Why a config file was refused. `Display` gives the message, which names the key for
+/// every rule except a malformed `device` object, for example `gateway: gateway must be
+/// inside the IPv4 subnet`. A file that cannot be read gives `<path>: <io error>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigError(pub(crate) String);
 
@@ -402,16 +448,21 @@ fn mac_string(mac: EthernetAddress) -> String {
 }
 
 impl Config {
+    /// Parse and validate a config from JSON text. Owned addresses are sorted and merged.
     pub fn from_json(json: &str) -> Result<Self, ConfigError> {
         serde_json::from_str(json).map_err(|e| ConfigError(e.to_string()))
     }
 
+    /// Read the file at `path`, then [`from_json`](Self::from_json). A read error is
+    /// reported as `<path>: <io error>`.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let json = fs::read_to_string(path)
             .map_err(|e| error(&path.display().to_string(), &e.to_string()))?;
         Self::from_json(&json)
     }
 
+    /// The config as pretty-printed JSON with a trailing newline, `version: 1` included;
+    /// `owned_ipv4` is left out when empty.
     pub fn to_json(&self) -> String {
         format!(
             "{}\n",
@@ -419,8 +470,15 @@ impl Config {
         )
     }
 
-    /// Query before opening the Stack to size a capped socket with `path_mtu - 40`.
-    /// This is the same destination lookup the Stack applies to TCP connects.
+    /// The path MTU toward `addr`: the `mtu` of the longest matching prefix, capped at
+    /// [`mtu`](Self::mtu). When `paths` has rules, the own subnet counts as one more rule at
+    /// `mtu` unless a rule names that prefix; an unmatched destination, or any destination
+    /// with no rules, gets `mtu`. This is the lookup the Stack uses, so `path_mtu(addr) - 40`
+    /// is the largest TCP segment payload toward `addr`, a value for `tcp::Config::mss_cap`.
+    ///
+    /// # Panics
+    ///
+    /// On a hand-built `Config` whose `mtu` or path rules break the file's rules.
     pub fn path_mtu(&self, addr: Ipv4Address) -> u16 {
         let rules: Vec<PathMtu> = self.paths.iter()
             .map(|rule| PathMtu { prefix: rule.prefix, mtu: rule.mtu })

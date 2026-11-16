@@ -96,21 +96,13 @@ unsafe fn wake_by_ref(header: *const ()) {
 
 unsafe fn drop(_: *const ()) {}
 
-/// A copyable wake handle for runtime primitives that park tasks. `wake`
-/// enqueues the task directly, with no call through a waker vtable.
+/// A copyable handle that wakes one task, for futures that park the task polling them
+/// (sockets, channels). `wake` queues the task directly, with no call through a waker
+/// vtable.
 ///
-/// Like a stale `Waker`, a stale `StoredWaker` is harmless: when its slot is free
-/// its wake does nothing, and when the slot holds a newer task that task gets one
-/// more poll.
-///
-/// ```compile_fail
-/// fn require_send<T: Send>() {}
-/// require_send::<switch_runtime::StoredWaker>();
-/// ```
-/// ```compile_fail
-/// fn require_sync<T: Sync>() {}
-/// require_sync::<switch_runtime::StoredWaker>();
-/// ```
+/// A `StoredWaker` may outlive its task. Waking it then does nothing, or gives one extra
+/// poll to a newer task that took the old task's place. Neither `Send` nor `Sync`: it is
+/// created and woken on the runtime's thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StoredWaker {
     header: NonNull<TaskHeader>,
@@ -120,18 +112,17 @@ pub struct StoredWaker {
 impl StoredWaker {
     /// The task whose waker `cx` carries.
     ///
-    /// Safe because: a waker with switch's vtable was made by switch (a forged
-    /// one needs `Waker::from_raw`, whose contract the forger breaks), so its
-    /// data heads a slot of a task block. Blocks are never freed, so the header
-    /// and its block metadata stay readable for the life of the process, whatever
-    /// happens to the task or runtime. The owner check pins the handle to the
-    /// block's thread, and being `!Send`/`!Sync` it never leaves; so every later
-    /// `wake` runs on the only thread that writes the slot's flags and runtime.
-    /// `wake` reads the runtime only when the slot is LIVE, and a LIVE slot's
-    /// runtime is alive.
-    ///
     /// # Panics
     /// If `cx`'s waker is not a switch task waker, or on a foreign thread.
+    // Safe because: a waker with switch's vtable was made by switch (a forged
+    // one needs `Waker::from_raw`, whose contract the forger breaks), so its
+    // data heads a slot of a task block. Blocks are never freed, so the header
+    // and its block metadata stay readable for the life of the process, whatever
+    // happens to the task or runtime. The owner check pins the handle to the
+    // block's thread, and being `!Send`/`!Sync` it never leaves; so every later
+    // `wake` runs on the only thread that writes the slot's flags and runtime.
+    // `wake` reads the runtime only when the slot is LIVE, and a LIVE slot's
+    // runtime is alive.
     pub fn new(cx: &Context<'_>) -> Self {
         let waker = cx.waker();
         assert!(

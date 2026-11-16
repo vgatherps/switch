@@ -1,55 +1,193 @@
-//! Little-endian, framed control messages. Decoders consume one message at a time.
+//! The control protocol between a [`Session`](crate::session::Session) and the daemon.
+//!
+//! [`Session`](crate::session::Session) implements all of it. The types here are its
+//! vocabulary ([`SocketId`], the socket configurations, [`Event`], [`RejectCode`],
+//! [`EndReason`]) and the encoder and decoder of the control socket, for reading a capture of
+//! that socket or writing another client.
+//!
+//! # Channels
+//!
+//! A session uses three channels:
+//!
+//! | Channel | Direction | Carries |
+//! |---|---|---|
+//! | control socket (`control.sock` in the daemon's directory, a Unix stream socket) | both | handshake, socket operations, events, the end-of-session notice |
+//! | send ring (one shared file with one ring per CPU, named in [`Welcome::ingress`]) | client to daemon | send records ([`crate::send`]) and the session's end record |
+//! | receive ring (one per session, named in [`Welcome::rx`]) | daemon to client | received TCP chunks and UDP datagrams |
+//!
+//! The control socket and the two rings are not ordered against each other. A send record
+//! can reach the daemon before an open sent earlier on the control socket, and a socket's
+//! first received packet can reach the client before its [`Event::Connected`].
+//!
+//! # Handshake
+//!
+//! ```text
+//!  client                                         daemon
+//!    | connect(control.sock)                        |
+//!    |--- Hello { version, max_sockets } ---------->|
+//!    |                                              | checks the version, max_sockets and
+//!    |                                              | for a free session; creates the
+//!    |                                              | session's receive ring
+//!    |<-- Welcome { version, status, stream,        |
+//!    |              max_record, frame_capacity,     |
+//!    |              ingress, rx } ------------------|
+//!    | opens the send ring (ingress) and            |
+//!    | the receive ring (rx)                        |
+//!    |--- operations ------------------------------>|
+//!    |<-- events -----------------------------------|
+//! ```
+//!
+//! The client sends [`ClientMessage::Hello`] first; the daemon drops a connection that has
+//! not sent it within 5 seconds. The daemon answers every `Hello` with a [`Welcome`] carrying
+//! its own [`VERSION`], whatever the client sent.
+//!
+//! # Message framing
+//!
+//! Every message is a [`HEADER_LEN`]-byte header followed by a body. Integers are
+//! little-endian; IPv4 addresses are 4 bytes in network order.
+//!
+//! ```text
+//!  offset  size  field
+//!  0       1     kind
+//!  1       1     flags: bit 0 for kinds 6 (Close: unread) and 70 (Closed: reset_by_peer); otherwise 0
+//!  2       2     body length in bytes
+//!  4       4     zero
+//!  8       ...   body
+//! ```
+//!
+//! A socket id in a body is 8 bytes: slot u32, then generation u32. A TCP config is 12 bytes:
+//! `rx_capacity` u32, `tx_capacity` u32, `mss_cap` u16 (0 for none), 2 zero bytes. A local
+//! endpoint is 8 bytes: address (all zero when absent), port u16, has-address u8 (0 or 1),
+//! 1 zero byte.
+//!
+//! Client to daemon ([`ClientMessage`]):
+//!
+//! | Kind | Message | Body length | Body |
+//! |---|---|---|---|
+//! | 1 | [`Hello`](ClientMessage::Hello) | 8 | magic `JNCT`, version u16, max_sockets u16 |
+//! | 2 | [`ConnectTcp`](Op::ConnectTcp) | 36 | id, TCP config, remote address, remote port u16, 2 zero bytes, local endpoint |
+//! | 3 | [`ListenTcp`](Op::ListenTcp) | 28 | id, TCP config, local endpoint |
+//! | 4 | [`BindUdp`](Op::BindUdp) | 24 | id, local endpoint, rx_queue u32, tx_checksum u8, broadcast u8, 2 zero bytes |
+//! | 5 | [`ShutdownTcp`](Op::ShutdownTcp) | 8 | id |
+//! | 6 | [`Close`](Op::Close) | 8 | id; flag bit 0 = unread |
+//! | 7 | [`AbortTcp`](Op::AbortTcp) | 8 | id |
+//!
+//! Daemon to client ([`HostMessage`]):
+//!
+//! | Kind | Message | Body length | Body |
+//! |---|---|---|---|
+//! | 64 | [`Welcome`] | 28 + both path lengths | magic `JNCT`, version u16, status u8, zero u8, stream u64, max_record u32, frame_capacity u32, ingress length u16, ingress path, rx length u16, rx path |
+//! | 65 | [`Connected`](Event::Connected) | 10 | id, mss u16 |
+//! | 66 | [`Bound`](Event::Bound) | 8 | id |
+//! | 67 | [`Rejected`](Event::Rejected) | 9 | id, [`RejectCode`] u8 |
+//! | 68 | [`PeerFin`](Event::PeerFin) | 8 | id |
+//! | 69 | [`Delivered`](Event::Delivered) | 8 | id |
+//! | 70 | [`Closed`](Event::Closed) | 8 | id; flag bit 0 = reset by peer |
+//! | 71 | [`Freed`](Event::Freed) | 8 | id |
+//! | 72 | [`End`](HostMessage::End) | 1 | [`EndReason`] u8 |
+//!
+//! Both decoders reject unknown kinds, wrong body lengths, nonzero padding, unknown flags,
+//! booleans other than 0 or 1, an absent address with nonzero bytes, and socket configs that
+//! fail [`TcpConfig::check`] or [`UdpConfig::check`] ([`DecodeError`]). For example, the end
+//! notice of a finished session is these 9 bytes:
+//!
+//! ```text
+//! 72, 0, 1, 0, 0, 0, 0, 0, 4
+//! ```
+//!
+//! # Rules the daemon enforces
+//!
+//! The daemon ends a session with [`EndReason::ProtocolError`] when the client:
+//!
+//! - sends bytes it cannot decode;
+//! - sends an operation before `Hello`, or a second `Hello`;
+//! - uses a socket slot at or above the `max_sockets` it asked for;
+//! - opens a socket on a slot whose socket still exists in the daemon;
+//! - sends an operation other than an open with a generation that is not the slot's last opened one;
+//! - sends `ShutdownTcp` or `AbortTcp` for a UDP socket;
+//! - commits a send record that is malformed, names a slot at or above `max_sockets`, a slot
+//!   never opened, a later generation than the slot's last open, or a socket of the other kind.
+//!
+//! A send record for an earlier generation of a slot is dropped. An operation or send record
+//! whose socket the daemon already removed (rejected, or freed after a close) is ignored.
 
 use std::fmt;
 use std::io::{self, Write};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::num::NonZeroU16;
 
+/// The 4-byte magic that starts the bodies of `Hello` and `Welcome`: `JNCT` in byte order.
 pub const MAGIC: u32 = u32::from_le_bytes(*b"JNCT");
+/// The protocol version. Client and daemon must use the same one: the daemon answers any
+/// other version with [`WelcomeStatus::BadVersion`].
 pub const VERSION: u16 = 3;
+/// Length of every message header.
 pub const HEADER_LEN: usize = 8;
 
+/// One socket of a session.
+///
+/// A session has a table of `max_sockets` socket slots. `slot` is the index in that table.
+/// `generation` counts the opens of that slot: each open of a free slot gets the previous
+/// generation plus one, so an id from an earlier use of the slot differs from the current one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SocketId {
     pub slot: u32,
     pub generation: u32,
 }
 
+/// Configuration of a TCP socket in the daemon's network stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpConfig {
+    /// Target receive window advertised to the peer, in bytes; at most 1 GiB.
     pub rx_capacity: u32,
+    /// Bytes the daemon's stack queues for sending and keeps until acknowledged; nonzero.
     pub tx_capacity: u32,
+    /// Cap on the advertised MSS and on outgoing segment payloads.
     pub mss_cap: Option<NonZeroU16>,
 }
 
+/// A local IPv4 address and port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListenEndpoint {
+    /// One address the daemon owns, or `None` for the daemon's address: for a listener or
+    /// UDP socket, every address the daemon owns; for a connect, the source address for the remote.
     pub addr: Option<Ipv4Addr>,
     pub port: u16,
 }
 
+/// Configuration of a UDP socket in the daemon's network stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UdpConfig {
+    /// Local address and port; the port is nonzero.
     pub local: ListenEndpoint,
+    /// Received datagrams the daemon's stack holds for this socket before it drops more; nonzero.
     pub rx_queue: u32,
+    /// Compute the UDP checksum of sent datagrams in software, or write 0.
     pub tx_checksum: bool,
+    /// Allow sending to the broadcast address.
     pub broadcast: bool,
 }
 
+/// A message from client to daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientMessage {
+    /// The first message on a connection: the protocol version and the size of the session's
+    /// socket table.
     Hello { version: u16, max_sockets: u16 },
     Op(Op),
 }
 
+/// A socket operation. Opens carry the [`SocketId`] the client chose for a free slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
+    /// Connect to `remote` from `local`. The local port is nonzero.
     ConnectTcp {
         id: SocketId,
         config: TcpConfig,
         remote: SocketAddrV4,
         local: ListenEndpoint,
     },
+    /// Wait for one connection on `local`. The socket itself becomes that connection.
     ListenTcp {
         id: SocketId,
         config: TcpConfig,
@@ -59,19 +197,24 @@ pub enum Op {
         id: SocketId,
         config: UdpConfig,
     },
+    /// Send a FIN after the data already sent.
     ShutdownTcp {
         id: SocketId,
     },
+    /// Remove the socket. `unread` says the client dropped received data without reading it;
+    /// a TCP connection is then reset.
     Close {
         id: SocketId,
         unread: bool,
     },
+    /// Reset the connection and remove the socket.
     AbortTcp {
         id: SocketId,
     },
 }
 
 impl Op {
+    /// The socket this operation names.
     pub fn id(&self) -> SocketId {
         match *self {
             Self::ConnectTcp { id, .. }
@@ -84,70 +227,121 @@ impl Op {
     }
 }
 
+/// A message from daemon to client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostMessage {
+    /// The answer to `Hello`; exactly one per connection, first.
     Welcome(Welcome),
     Event { id: SocketId, event: Event },
+    /// The daemon ended the session; the last message on the connection.
     End(EndReason),
 }
 
+/// The daemon's answer to `Hello`.
+///
+/// A rejected `Welcome` still carries the daemon's `version`, `max_record`, `frame_capacity`
+/// and `ingress`; its `stream` is 0 and its `rx` is empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Welcome {
+    /// The daemon's protocol version.
     pub version: u16,
     pub status: WelcomeStatus,
+    /// The session's id in the send ring: the daemon's session slot in the high 32 bits, a
+    /// number unique for the daemon's lifetime in the low 32 bits.
     pub stream: u64,
+    /// The largest send record in bytes, send header included: the IP MTU minus 4.
     pub max_record: u32,
-    /// Host TX frame payload capacity (IP MTU minus 28), advertised since protocol v3.
+    /// The largest UDP payload the daemon sends in one frame: the IP MTU minus 28.
     pub frame_capacity: u32,
+    /// Path of the send-ring file (on macOS, a POSIX shared-memory object name).
     pub ingress: String,
+    /// Path of the session's receive-ring file (on macOS, a POSIX shared-memory object name).
     pub rx: String,
 }
 
+/// Whether the daemon accepted a `Hello`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WelcomeStatus {
     Ok = 0,
+    /// The client's version differs from the daemon's.
     BadVersion = 1,
+    /// Every session slot (`--max-sessions`) is taken. A session that has ended keeps its slot
+    /// until the daemon has released its rings.
     SessionsFull = 2,
+    /// `max_sockets` is 0 or larger than the daemon's `--max-sockets`.
     BadMaxSockets = 3,
+    /// The daemon could not create the session's receive ring.
     HostResources = 4,
 }
 
+/// What happened to one socket.
+///
+/// `Connected`, `Bound`, `PeerFin`, `Delivered` and `Closed` leave the socket in place;
+/// `Rejected` and `Freed` mean the daemon no longer has it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
-    /// TCP is synchronized; `mss` is the effective, peer-negotiated segment payload limit.
+    /// A TCP socket is connected: for `ConnectTcp` the handshake finished, for `ListenTcp` a
+    /// peer connected to it. `mss` is the segment payload limit agreed with the peer.
     Connected { mss: u16 },
+    /// A UDP socket is bound.
     Bound,
+    /// The open failed. The socket never existed in the daemon; no close is needed.
     Rejected(RejectCode),
+    /// The peer finished sending, and every byte it sent before its FIN is already in the
+    /// receive ring. The socket can still send.
     PeerFin,
+    /// After `ShutdownTcp`, the peer acknowledged the FIN and all data before it.
     Delivered,
+    /// The connection is fully closed, by FINs in both directions or by a reset, and the
+    /// daemon holds no unread data for it. The socket still exists until it is closed.
     Closed { reset_by_peer: bool },
+    /// The daemon removed the socket after `Close` or `AbortTcp`.
     Freed,
 }
 
+/// Why the daemon refused an open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectCode {
+    /// The daemon's TCP sockets (`--tcp-sockets`, shared by all sessions) are all in use.
     TcpSocketsFull = 1,
+    /// The daemon's stack reported the new socket in a state that cannot connect.
     ConnectInvalidState = 2,
+    /// The remote address is unspecified, the remote or local port is 0, the local address
+    /// is not one the daemon owns, or the daemon has no source address for the remote.
     ConnectUnaddressable = 3,
+    /// A connection with the same local and remote address and port already exists.
     ConnectAddressInUse = 4,
+    /// The daemon's stack reported the new socket in a state that cannot listen.
     ListenInvalidState = 5,
+    /// The port is 0, or the address is not one the daemon owns.
     ListenUnaddressable = 6,
+    /// The daemon's UDP sockets (`--udp-sockets`, shared by all sessions) are all in use.
     UdpSocketsFull = 7,
+    /// A UDP socket of any session is already bound to this address (or to every address) and port.
     UdpPortInUse = 8,
+    /// The address is not a unicast address the daemon owns.
     UdpUnaddressable = 9,
 }
 
+/// Why the daemon ended a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndReason {
+    /// The session's send stream had a gap the daemon could not fill: a record was committed
+    /// with a sequence number ahead of one that never arrived.
     Kicked = 1,
+    /// The client broke a rule of the protocol (see the module documentation).
     ProtocolError = 2,
+    /// The daemon is stopping.
     HostShutdown = 3,
-    /// The host took all committed records and completed graceful retirement.
+    /// The daemon took every record the session committed before its end record and
+    /// completed the session's close.
     Finished = 4,
 }
 
+/// A socket configuration that [`TcpConfig::check`] or [`UdpConfig::check`] rejects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigError {
+    /// `rx_capacity` is above 1 GiB.
     TcpRxCapacityTooLarge,
     TcpTxCapacityZero,
     UdpPortZero,
@@ -155,6 +349,7 @@ pub enum ConfigError {
 }
 
 impl TcpConfig {
+    /// Rejects an `rx_capacity` above 1 GiB and a `tx_capacity` of 0.
     pub fn check(&self) -> Result<(), ConfigError> {
         if self.rx_capacity > 1 << 30 {
             return Err(ConfigError::TcpRxCapacityTooLarge);
@@ -167,6 +362,7 @@ impl TcpConfig {
 }
 
 impl UdpConfig {
+    /// Rejects a local port of 0 and an `rx_queue` of 0.
     pub fn check(&self) -> Result<(), ConfigError> {
         if self.local.port == 0 {
             return Err(ConfigError::UdpPortZero);
@@ -191,19 +387,28 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// A control message that does not follow the protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeError {
+    /// The kind is not one this side receives.
     UnknownKind(u8),
+    /// The body length is not the one the kind requires (`Welcome`: less than 28, or not
+    /// matching its two path lengths).
     WrongLength { kind: u8, len: u16 },
     NonzeroPad,
+    /// A flag other than bit 0 of `Close` or `Closed` is set.
     UnknownFlags { kind: u8, flags: u8 },
     BadMagic(u32),
+    /// A boolean byte other than 0 or 1.
     InvalidBool(u8),
     InvalidWelcomeStatus(u8),
     InvalidRejectCode(u8),
     InvalidEndReason(u8),
+    /// A `Welcome` path is not UTF-8.
     InvalidUtf8(std::str::Utf8Error),
+    /// A local endpoint without an address has nonzero address bytes.
     NonzeroAbsentAddress,
+    /// A socket configuration fails [`TcpConfig::check`] or [`UdpConfig::check`].
     InvalidConfig(ConfigError),
 }
 

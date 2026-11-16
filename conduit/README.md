@@ -1,71 +1,12 @@
-# switch
+# conduit
 
-Start with [How the pieces fit together](../book/src/overview/architecture.md)
-in the switch book. The directory table and contributor reference remain below.
+The part of the switch workspace that owns a network card: the TCP/UDP stack on one DPDK port (`dpdk-smoltcp`), its DPDK bindings and packet buffers, the network config file and its tool, the tools that run on a real card, and the DPDK test fixtures. Applications reach it through the `switch` crate (`switch::net`, `switch::nic`).
 
-switch is a userspace TCP/UDP stack for low-latency market feeds. It runs a modified smoltcp on one
-DPDK port: packets go from the NIC to your process with no kernel in the path, and received data
-stays in DPDK buffers instead of being copied into a socket buffer (a small in-order segment can be
-appended to the buffer before it). Everything runs on one thread, one `Stack` per process on its own
-CPU core. Your program drives the stack in a loop and passes it the current time. IPv4 over
-Ethernet.
-
-## Repository
-
-| directory | package | contents |
-|---|---|---|
-| `crates/dpdk-smoltcp` | `dpdk-smoltcp` | The stack: `Eal`, `Port`, `Stack`, TCP and UDP sockets |
-| `crates/switch-open` | `switch-open` | `open()`: config file to running `Stack` in one call |
-| `crates/switch-netconf` | `switch-netconf` | Config file format, and the `switch-netconf` tool that writes it and binds the NIC |
-| `crates/switch-buffer` | `switch-buffer` | DPDK mbufs and pools with ownership-checked chaining |
-| `crates/switch-dpdk-sys` | `switch-dpdk-sys` | Bindings to DPDK 25.11.3 |
-| `crates/switch-nic` | `switch-nic` | `switch-nic`: runs a Stack on a real NIC (link info, sockperf server, feed client) |
-| `crates/switch-tap-echo` | `switch-tap-echo` | TCP echo server over a tap device, the target for packetdrill and the fuzzers |
-| `crates/switch-binance-feed` | `switch-binance-feed` | Binance bookTicker client: switch-ws's wss client (TLS 1.3 through switch-tls) on switch-net |
-| `crates/switch-memif-bench` | `switch-memif-bench` | Benchmarks over DPDK memif |
-| `crates/switch-sockperf-wire` | `switch-sockperf-wire` | sockperf's message format, used by `switch-nic` |
-| `vendor/smoltcp` | `smoltcp` | smoltcp 0.14.0, cut down to IPv4 TCP and UDP over Ethernet, with mbuf-native receive |
-| `switch-test-support` | `switch-test-support`, `switch-test-kit`, `switch-test-support-macros` | Test helpers |
-
-`fuzz/` has the packetdrill scripts and the Scapy fuzzers, `autobahn/` the WebSocket conformance
-setup, `docker/` the test image.
-
-## Tests
-
-Docker Desktop with at least 8 CPUs for its VM. No NIC or hugepages needed.
+The crates are listed in [docs/contributing/crates.md](../docs/contributing/crates.md), running a card in [docs/operations/](../docs/operations/README.md), and the tests in [docs/contributing/testing.md](../docs/contributing/testing.md). The API reference is the `switch` crate's rustdoc (`make docs` at the repository root).
 
 ```sh
-make docker-image    # Ubuntu 24.04, Rust 1.93.0, DPDK 25.11.3 built from source
-make docker-build    # whole workspace, all targets except the `e2e` ones (make test builds those)
-make docker-test     # every test suite, then the Autobahn WebSocket suite
-make docker-fuzz     # Scapy TCP fuzzer
-```
-
-`make docker-test` passes when make exits 0 and its last line is
-
-```text
-docker-test: PASS: make test exit 0, docker-autobahn exit 0
-```
-
-`make help` lists the per-suite targets (`test-stack`, `test-buffer`, `test-netconf`, ...), which
-run natively on Linux or inside the image. [docker/README.md](docker/README.md) covers each suite,
-the CPU layout, benchmarks and native Linux setup.
-
-## Running on a NIC
-
-[crates/switch-nic/README.md](crates/switch-nic/README.md): supported drivers, writing the config
-with `switch-netconf discover`, hugepages, binding the NIC to vfio-pci, and `switch-nic`.
-
-## Writing a program
-
-Applications run on switch-net (async sockets for `switch` tasks), with switch-ws (WebSocket) and
-switch-tls (TLS 1.3) on top. Start with [your first network program](../book/src/getting-started/first-connection.md)
-or [the Stack guide](../book/src/stack/index.md) for synchronous setup, sizing, TCP, UDP and shutdown.
-[crates/switch-open/examples/tcp_client.rs](crates/switch-open/examples/tcp_client.rs)
-loads a config, opens the stack, connects to a TCP server, prints what it sends and closes the port.
-
-```sh
-cargo build -p switch-open --example tcp_client
+make docker-image    # Ubuntu 24.04, Rust, DPDK 25.11.3 built from source
+make help            # the per-suite test targets, which run natively on Linux or in the image
 ```
 
 ## License

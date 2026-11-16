@@ -1,46 +1,8 @@
-//! One call from a network config file to a running Stack on a NIC the process owns. Programs that drive a card themselves (directly or through `switch_net::Net::new`) and the junction daemon open it with [`open`].
+//! Opens a NIC from a network config file and returns a running Stack, in one call.
 //!
-//! [`open`] takes the loaded [`switch_netconf::Config`], a [`Sizing`] (socket slots and packet-buffer shares), optional helper CPUs for DPDK's own threads, and the clock the caller will drive the Stack with. In order it checks that the calling thread may run on exactly one CPU, starts DPDK's EAL with that CPU for its main thread, finds the device, checks a PCI card's MAC against the config, chooses offloads (module [`offloads`]), opens the NIC port with its pools, waits up to ten seconds for link, builds the Stack, and, if the config has a gateway, resolves it by ARP for up to three seconds. It returns [`Opened`]: the `stack`, the `eal` handle (keep it until the port is closed) and an [`OpenReport`] whose `Display` prints one `key: value` line per fact. [`OpenError`] names the failing step; errors after the port exists carry the port or the Stack so the caller can close it with `try_close`.
-//!
-//! `open` is `unsafe` because DPDK and the card write to memory the compiler cannot see. In practice the contract is: call it once per process, from the thread that will drive the Stack, for a device that EAL creates or finds from the config and nothing else has configured; keep every Stack, socket and packet buffer on that thread; keep `eal` alive until the port is closed. The `# Safety` section of [`open`] states the full contract.
-//!
-//! ```rust,no_run
-//! use std::path::Path;
-//!
-//! use dpdk_smoltcp::DEFAULT_NEIGHBOR_CAPACITY;
-//! use dpdk_smoltcp::smoltcp::socket::tcp;
-//! use dpdk_smoltcp::smoltcp::time::Instant;
-//! use dpdk_smoltcp::smoltcp::wire::Ipv4Address;
-//!
-//! fn setup() -> Result<(), Box<dyn std::error::Error>> {
-//!     let config = switch_netconf::Config::load(Path::new("dut.json"))?;
-//!     let server = Ipv4Address::new(192, 0, 2, 1);
-//!     let tcp_config = tcp::Config {
-//!         rx_capacity: 65536,
-//!         tx_capacity: 65536,
-//!         mss_cap: Some(config.path_mtu(server) - 40),
-//!     };
-//!     let sizing = switch_open::Sizing {
-//!         frame_share: tcp::tx_mbuf_budget(&tcp_config, usize::from(config.mtu)),
-//!         max_sockets: 1,
-//!         max_udp_sockets: 0,
-//!         rx_staging: 32,
-//!         tx_pending: 32,
-//!         neighbor_capacity: DEFAULT_NEIGHBOR_CAPACITY,
-//!     };
-//!     let start = std::time::Instant::now();
-//!     let mut clock = || Instant::from_micros(i64::try_from(start.elapsed().as_micros()).unwrap());
-//!     let opened = unsafe { switch_open::open(&config, &sizing, None, &mut clock) }?;
-//!     println!("{}", opened.report);
-//!     let (mut stack, _eal) = (opened.stack, opened.eal);
-//!     let handle = stack.add_tcp(tcp_config)?;
-//!     stack.connect(&handle, (server, 7000), 40000)?;
-//!     // then the drive loop; keep `_eal` alive until the Port is closed
-//!     Ok(())
-//! }
-//! ```
-//!
-//! See the switch book, chapter "Opening the NIC from code".
+//! Applications reach this crate as `switch::nic` ([`open`], [`Sizing`], [`Opened`],
+//! [`OpenError`], [`OpenReport`], [`Link`] and [`offloads`]). `switch-nic`, `switch-bench` and
+//! the junction daemon use it the same way.
 
 use std::thread;
 use std::time::{Duration, Instant};
@@ -62,35 +24,79 @@ const CACHE: u32 = 8;
 const RX_BURST: u16 = 128;
 /// RX pool mbufs: 2^15 - 1 as DPDK prefers. Below the pool's low mark the stack frees
 /// frames TCP sockets hold past a gap (out-of-order data); this many mbufs keeps the pool
-/// above that mark in practice. 82 MiB of 2 MiB hugepages at MTU 1500, 306 MiB at MTU 9001.
+/// above that mark in practice.
 const RX_POOL: u32 = 32767;
 
-/// What the application needs from the Port and Stack.
+/// How many sockets the Stack has room for and how the packet-buffer pools are sized.
 ///
-/// Every field is required. The RX pool holds `RX_POOL` (32767) mbufs, which all sockets
-/// share; `Stack::new` refuses it if it is below `rx_reserve` over the adjusted RX
-/// descriptors, the RX burst and `rx_staging`. The frame pool holds `frame_reserve` over
-/// the adjusted TX descriptors and `tx_pending` plus `frame_share`. Every socket draws on
-/// the shares; none is reserved per socket.
+/// [`open`] builds three pools from the config file and this value. A pool is a fixed set
+/// of packet buffers made once when the port opens; nothing is allocated per packet later.
+/// Each pool is a reserve, which the Stack and the NIC driver need whatever the sockets do,
+/// plus a share, which every socket and the application draw on together. Nothing is
+/// reserved per socket, so [`add_tcp`](dpdk_smoltcp::Stack::add_tcp) never fails because a
+/// pool is small; a small pool shows up later as backpressure (table below).
+///
+/// | Pool | Holds | Size with `open` |
+/// |---|---|---|
+/// | RX | received packets, until the application drops the frame or datagram that owns each one | 32767 buffers, always |
+/// | TX | packets the Stack builds itself (ACKs, ARP, resets) and TCP segments sent by copy | [`tx_reserve`]`(TX descriptors, tx_pending)` |
+/// | frame | data the application sends, held until the peer acknowledges it (TCP) or the NIC has sent it (UDP) | [`frame_reserve`]`(TX descriptors, tx_pending) + frame_share` |
+///
+/// The descriptor counts are the config's `descriptors` after the driver's adjustment,
+/// shown on the report's `descriptors` line. Each RX buffer has a data room of DPDK's
+/// headroom (128 bytes) plus `(mtu + 26)` rounded up to a multiple of 1024; TX and frame
+/// buffers hold headroom plus `mtu + 14`. The RX burst is 128 packets, the TX burst 32 and
+/// every pool cache 8.
+///
+/// Every field is required. [`max_sockets`](Self::max_sockets), [`rx_staging`](Self::rx_staging),
+/// [`tx_pending`](Self::tx_pending) and [`neighbor_capacity`](Self::neighbor_capacity) must
+/// be positive; a zero fails `open` with [`OpenError::Stack`] carrying
+/// [`StackError::InvalidConfig`](dpdk_smoltcp::StackError::InvalidConfig). The fixed RX pool
+/// must cover [`rx_reserve`](dpdk_smoltcp::rx_reserve), which is
+/// `2 × max(rx descriptors, 32) + 128 + rx_staging + 12`; beyond that (about 16 000
+/// descriptors) `open` fails with `RxPoolTooSmall`.
+///
+/// # When a pool runs dry
+///
+/// Nothing fails; each pool produces its own backpressure.
+///
+/// | Pool | What happens | What frees it |
+/// |---|---|---|
+/// | RX | The driver has no buffer for arrivals and drops them. TCP peers retransmit; UDP senders are not told. | Reading queued data and dropping received frames the application holds. |
+/// | TX | Sockets that want to send wait for a later send step; replies built while receiving are dropped. | The driver finishing earlier sends. |
+/// | frame | `send_slice` queues what fits, possibly `Ok(0)`; [`Stack::tx_frame`](dpdk_smoltcp::Stack::tx_frame) returns `None`; [`Stack::udp_send`](dpdk_smoltcp::Stack::udp_send) returns `WouldBlock`. | Peers acknowledging TCP data, the application dropping frames, the driver finishing UDP sends. |
+///
+/// Nothing signals when frames return: retry on a later pass of the loop.
+/// [`Stack::free_frames`](dpdk_smoltcp::Stack::free_frames) says how many are free now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sizing {
-    /// Frames all TCP send queues and the application (`Stack::tx_frame`) may hold
-    /// at once. `tcp::tx_mbuf_budget(&config, mtu)` estimates a socket's needs for
-    /// full-sized segments; smaller writes can use more frames. When the pool runs
-    /// out, sends queue nothing until frames return.
+    /// Frames all TCP send queues and the application may hold at once, on top of the frame
+    /// pool's reserve.
+    ///
+    /// A TCP socket holds up to its `tx_capacity` bytes in frames: queued data plus data sent
+    /// and not yet acknowledged. [`tcp::tx_mbuf_budget`](dpdk_smoltcp::smoltcp::socket::tcp::tx_mbuf_budget)`(&config, mtu)`
+    /// gives that count when every frame is a full segment. Sum it over the sockets that
+    /// may be sending at the same time and add the frames the application holds itself
+    /// (from [`Stack::tx_frame`](dpdk_smoltcp::Stack::tx_frame)). Small writes use more
+    /// frames for the same bytes. A one-socket client uses one socket's budget.
     pub frame_share: usize,
-    /// `StackConfig::max_sockets`: TCP socket slots. Must be positive.
+    /// TCP socket slots. Must be positive. A socket whose handle was dropped keeps its slot
+    /// until its connection has closed.
     pub max_sockets: usize,
-    /// `StackConfig::max_udp_sockets`: UDP socket slots. Zero disables UDP.
+    /// UDP socket slots. Zero disables UDP.
     pub max_udp_sockets: usize,
-    /// `StackConfig::rx_staging`: received packets held before processing.
-    /// Also counted in `rx_reserve`.
+    /// Received packets the Stack may hold between taking them from the NIC and processing
+    /// them. Must be positive. Each receive step processes at most its `ingress_budget`
+    /// packets; the rest wait here. Counts towards the RX reserve. 32 suits one or a few
+    /// sockets; the benchmark server and the junction daemon use 128.
     pub rx_staging: usize,
-    /// `StackConfig::tx_pending`: frames built but not yet accepted by the
-    /// PMD. Also counted in the TX pool and the frame pool.
+    /// Packets built but not yet accepted by the NIC driver. Must be positive. While it is
+    /// full, a send step can only flush and UDP sends return `WouldBlock`. Counts towards
+    /// the TX and frame reserves. The examples use 32; the benchmark server and the daemon 64.
     pub tx_pending: usize,
-    /// `StackConfig::neighbor_capacity`: ARP cache entries.
-    /// `dpdk_smoltcp::DEFAULT_NEIGHBOR_CAPACITY` is 256.
+    /// ARP cache entries: how many on-link neighbors, the gateway included, the Stack
+    /// remembers. Must be positive. When full, a new neighbor evicts the one that expires
+    /// first. [`DEFAULT_NEIGHBOR_CAPACITY`](dpdk_smoltcp::DEFAULT_NEIGHBOR_CAPACITY) is 256.
     pub neighbor_capacity: usize,
 }
 
@@ -151,11 +157,16 @@ fn port_config(
     })
 }
 
-/// The current physical link state reported by DPDK.
+/// The port's link state as the NIC driver reported it when [`open`] stopped waiting.
+/// Shown on the report's `link_speed_mbps`, `link_duplex` and `link_status` lines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Link {
+    /// Link speed in Mbit/s, as the driver reports it.
     pub speed_mbps: u32,
+    /// Full duplex (`true`) or half duplex.
     pub full_duplex: bool,
+    /// Whether the link is up. Always `true` in a returned [`OpenReport`]; a link still down
+    /// after ten seconds fails `open` with [`OpenError::LinkDown`].
     pub up: bool,
 }
 

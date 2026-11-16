@@ -126,14 +126,17 @@ impl Mailbox {
     }
 }
 
-/// A wake handle that may be used from any thread.
+/// A handle that wakes one task from any thread. `Copy`, `Send` and `Sync`.
 ///
-/// On the task's own thread `wake` is the normal wake; on any other thread it
-/// queues the task in its runtime's mailbox, and the runtime wakes it at the
-/// start of its next [`crate::Runtime::poll`]. Like a stale `Waker`, a stale
-/// `RemoteWaker` is harmless: when its slot is free its wake does nothing, when
-/// the slot holds a newer task that task gets one more poll, and after its runtime
-/// shut down the wake is dropped.
+/// On the task's own thread `wake` is an ordinary wake. On any other thread it queues the
+/// task in its runtime's mailbox, and the runtime makes it ready at the start of its next
+/// [`Runtime::poll`](crate::Runtime::poll); the waking thread runs nothing. A task's
+/// standard `Waker` behaves the same way when cloned, dropped or woken on another thread,
+/// so code that hands its waker to a background thread works unchanged.
+///
+/// A `RemoteWaker` may outlive its task. Waking it then does nothing, or gives one extra
+/// poll to a newer task that took the old task's place. After the runtime shut down, the
+/// wake is dropped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RemoteWaker {
     header: NonNull<TaskHeader>,

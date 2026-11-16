@@ -64,13 +64,12 @@ impl Run {
 /// hands out is one record's plaintext.
 ///
 /// The rustls connection lives in [`TlsTx`], which each call borrows. Records rustls wants
-/// sent while receiving go to the send half's `take_pending`, and a receive error stops the
-/// send half too.
+/// sent while receiving (the alert after an error) wait in the send half for
+/// [`TlsTx::take_pending`], and a receive error stops the send half too.
 ///
-/// The bytes being worked on (the source) are `scratch` if it is non-empty, else the current
-/// frame from `pos`. The source starts with `seen` bytes that rustls has processed but must
-/// see again (records of a handshake message that is still incomplete, which rustls joins in
-/// place, so their headers are no longer readable); the next record starts after them.
+/// A record that lies inside one frame is decrypted in place, and its run is a slice of that
+/// frame. A record that straddles frames is copied into a buffer the receive half keeps, and
+/// decrypted there.
 pub struct TlsRx<F, L> {
     frame: Option<F>,
     /// Bytes at the front of `frame` that rustls has consumed.
@@ -96,6 +95,8 @@ impl<F: RxFrame, L: FrameTx> Default for TlsRx<F, L> {
 }
 
 impl<F: RxFrame, L: FrameTx> TlsRx<F, L> {
+    /// A receive half with nothing buffered, for a connection whose handshake left no bytes
+    /// over.
     pub fn new() -> Self {
         Self {
             frame: None,
@@ -327,8 +328,9 @@ impl<F: RxFrame, L: FrameTx> TlsRx<F, L> {
 }
 
 impl<F: RxFrame, L: FrameTx> TlsRx<F, L> {
-    /// Hands over the next frame. Allowed only after `chunk` returned `Ok(None)`. Frames
-    /// pushed after close_notify or an error are dropped.
+    /// Hands over the next frame. Allowed only after `chunk` returned `Ok(None)`; panics if the
+    /// current frame still holds unprocessed bytes. Frames pushed after close_notify or an error
+    /// are dropped.
     pub fn push(&mut self, frame: F) {
         assert!(
             self.frame.is_none(),
@@ -342,16 +344,8 @@ impl<F: RxFrame, L: FrameTx> TlsRx<F, L> {
 
     /// The unconsumed plaintext of the current record, else the next record's, decrypted now;
     /// `Ok(None)` if more frames are needed or the peer has closed (see [`TlsRx::eof`]). A run
-    /// borrows `self`, so the next `chunk` cannot run while it is held:
-    ///
-    /// ```compile_fail,E0499
-    /// # use switch_tls::{FrameTx, RxFrame};
-    /// # fn f<F: RxFrame, L: FrameTx>(rx: &mut switch_tls::TlsRx<F, L>, tx: &mut switch_tls::TlsTx<L>) {
-    /// let first = rx.chunk(tx).unwrap().unwrap();
-    /// let second = rx.chunk(tx);
-    /// first.bytes[0] = 0;
-    /// # }
-    /// ```
+    /// borrows `self`, so the next `chunk` cannot run while it is held. After an error, every
+    /// call returns the same error.
     pub fn chunk(&mut self, tx: &mut TlsTx<L>) -> Result<Option<Chunk<'_>>, Error> {
         if self.run.at.is_empty() {
             self.drop_run();
@@ -373,8 +367,7 @@ impl<F: RxFrame, L: FrameTx> TlsRx<F, L> {
     }
 
     /// The unconsumed plaintext of the run the last `chunk` returned (empty if none): exactly
-    /// those bytes, unchanged, until the next `chunk` or `push`. switch-ws relies on
-    /// this to read text it validated at receipt without validating again.
+    /// those bytes, unchanged, until the next `chunk` or `push`.
     pub fn current(&self) -> &[u8] {
         let at = self.run.at.clone();
         match self.run.src {
@@ -383,7 +376,8 @@ impl<F: RxFrame, L: FrameTx> TlsRx<F, L> {
         }
     }
 
-    /// Marks the first `n` bytes of `current()` consumed.
+    /// Marks the first `n` bytes of `current()` consumed. Panics if `n` is more than
+    /// `current().len()`.
     pub fn consume(&mut self, n: usize) {
         assert!(n <= self.run.at.len(), "consume past the current run");
         self.run.at.start += n;

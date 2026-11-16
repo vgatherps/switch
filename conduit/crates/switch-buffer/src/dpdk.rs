@@ -852,22 +852,32 @@ mod test_pool {
     }
 }
 
-/// Explicit production pool settings. Data room includes DPDK headroom.
+/// One packet-buffer pool, as a `PortConfig` field.
 #[derive(Debug, Clone, Copy)]
 pub struct PoolConfig<'a> {
+    /// Pool name, unique in the process.
     pub name: &'a CStr,
+    /// Number of buffers.
     pub count: u32,
+    /// Per-CPU cache size. Must be nonzero.
     pub cache_size: u32,
+    /// Bytes per buffer, DPDK's headroom (`RTE_PKTMBUF_HEADROOM`) included.
     pub data_room_size: u16,
     /// NUMA socket, or -1 for DPDK's SOCKET_ID_ANY.
     pub socket_id: i32,
 }
 
+/// Why a pool could not be created.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoolCreateError {
+    /// `cache_size` is 0.
     CacheDisabled,
+    /// `data_room_size` is smaller than DPDK's headroom.
     DataRoomTooSmall { provided: u16, minimum: u16 },
+    /// DPDK could not create the pool, for example a name already used in this process or
+    /// not enough memory.
     Dpdk { errno: i32 },
+    /// The pool has no cache for the EAL thread.
     OwnerCacheUnavailable { lcore_id: u32 },
 }
 

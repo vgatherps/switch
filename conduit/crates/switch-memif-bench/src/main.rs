@@ -1,4 +1,20 @@
-//! The `switch-memif-bench` command; see the [library documentation](switch_memif_bench).
+//! The `switch-memif-bench` command: two Stacks in two processes joined by a memif link. `peer`
+//! is the memif server, which echoes or discards; `client` sends and measures; `run` launches
+//! both and orders their shutdown; `matrix` runs the fixed configurations several times and
+//! prints min, median and max per configuration.
+//!
+//! ```text
+//! switch-memif-bench peer --mode echo|sink|udp-sink --conns K --cpu C --socket NAME [--run-timeout-s S]
+//! switch-memif-bench client SHAPE --cpu C --socket NAME [--run-timeout-s S]
+//! switch-memif-bench run SHAPE --peer-cpu P --client-cpu C --control-cpu X [--socket NAME] [--run-timeout-s S]
+//! switch-memif-bench matrix [--reps R] [--dry-run] --peer-cpu P --client-cpu C --control-cpu X [--run-timeout-s S]
+//! SHAPE: --shape pingpong --conns K --message M --rounds N --warmup W
+//!      | --shape bulk --bytes B --warmup W
+//!      | --shape udp --size N --count N --warmup N
+//! ```
+//!
+//! Run it with bad arguments for the full usage. `run` and `matrix` exit 0 only if every run was
+//! valid and every child exited 0. See `docs/benchmarks/memif.md`.
 
 // Protocol on stdout/stdin: the peer prints `ready` once its memif server
 // listens; each side prints `report <json>` once done and polls no more;

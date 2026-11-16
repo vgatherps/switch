@@ -4,9 +4,7 @@
 //!
 //! `driver.rs` is also the repository's worked example of opening a NIC port without `switch_open::open`: EAL arguments, pools, `Port::open`, `Stack::new` and teardown.
 //!
-//! The binary is `switch-tap-echo [--listeners N] [--buffer BYTES] [--close-after BYTES] -- <tester> [args...]`. It serves echo on port 8080 until the tester exits, and exits 0 when the tester succeeded, 1 when it failed, 2 when packet buffers were still held at port close, 3 on an argument, setup, serve or teardown error, and 101 on a panic. It needs DPDK, `CAP_NET_ADMIN` and `/dev/net/tun`.
-//!
-//! See the switch book, chapter "Starting DPDK and opening a NIC port by hand".
+//! The `switch-tap-echo` binary runs [`EchoServer`] through [`driver::run`]. How the test suites use it is in `docs/contributing/testing.md`.
 
 pub mod driver;
 

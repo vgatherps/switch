@@ -1,4 +1,10 @@
-//! Unix control thread. The network thread owns sockets in the Stack, never these descriptors.
+//! The daemon's side of the control socket. [`HostControl`] accepts sessions, answers
+//! `Hello`, creates each session's receive ring and passes socket operations to the daemon's
+//! network thread. Applications do not use this module.
+//!
+//! # For implementers
+//!
+//! The control thread owns these descriptors; the network thread owns sockets in the Stack.
 //!
 //! Poll passes read one chunk per connection. Terminal handling snapshots and drains only
 //! already-readable control bytes, including after write failures. FIFO completion survives

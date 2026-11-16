@@ -1,9 +1,8 @@
 //! A single-threaded channel for one value, received by a switch task.
 //!
-//! [`channel`] makes one allocation: whether one side left, the value and the
-//! waiting task. Neither side is `Send` or `Sync`, so both stay on the
-//! thread that made them. The [`Receiver`] must be polled by a switch task,
-//! whose [`StoredWaker`] it keeps.
+//! [`channel`] costs one heap allocation. Neither half is `Send` or `Sync`: the channel
+//! connects code on one thread, such as two tasks, or the program's loop and a task. The
+//! [`Receiver`] must be awaited by a switch task, which it parks while it waits.
 
 use std::cell::Cell;
 use std::fmt;

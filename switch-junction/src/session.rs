@@ -1,13 +1,4 @@
-//! Client-side control socket and socket-slot ownership for one producer thread.
-//!
-//! `Session::finish` first flushes queued control operations, then commits the
-//! cephalopod end record. Retry backpressure errors while polling events.
-//! Only the host's `EndReason::Finished` acknowledgement makes `Session::closed`
-//! true; a disconnect without that acknowledgement is session loss.
-//! After a successful `finish`, opening sockets, sending and shutting down TCP panic.
-//! `close` and `abort` become no-ops so Drop cleanup remains safe, even while
-//! unwinding. Repeated `finish` calls and polling for the host acknowledgement
-//! remain valid.
+//! [`Session`], one application's connection to the daemon, and its errors.
 
 use std::cell::Cell;
 use std::fmt;
@@ -32,26 +23,39 @@ use crate::control::{
 };
 use crate::send::{self, TCP_SEND_HEADER, UDP_SEND_HEADER};
 
+/// Why [`Session::connect`] failed.
 #[derive(Debug)]
 pub enum ConnectError {
+    /// Connecting to the control socket, the handshake I/O, opening either ring or starting
+    /// the reader thread failed. The daemon closing the connection before its `Welcome` is
+    /// `UnexpectedEof`; a first message other than `Welcome` is `InvalidData`. On Linux,
+    /// attaching to the send ring fails with `Unsupported` when glibc registered no
+    /// restartable sequences for the process.
     Io(io::Error),
+    /// The daemon refused the session.
     Rejected(WelcomeStatus),
+    /// The daemon speaks protocol version `host`, not [`VERSION`].
     Version { host: u16 },
+    /// The daemon sent bytes that are not a valid control message.
     Protocol(DecodeError),
 }
 
+/// Why opening a socket failed. Nothing was sent to the daemon and no slot was taken.
 #[derive(Debug)]
 pub enum OpenError {
+    /// Every socket slot is open or closing.
     NoFreeSlot,
+    /// The configuration fails its `check`.
     Config(ConfigError),
 }
 
-/// Backpressure preventing the session's end record from being committed.
+/// Why [`Session::finish`] could not commit the end record. Nothing was committed; poll and
+/// call `finish` again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinishError {
-    /// Control operations still await writing to the host. Poll events and retry.
+    /// Control messages are still waiting to be written to the daemon.
     ControlPending,
-    /// The cephalopod ingress has no room for the end record. Retry later.
+    /// The send ring of the current CPU has no room for the end record.
     StreamFull,
 }
 
@@ -66,11 +70,18 @@ impl fmt::Display for FinishError {
 
 impl std::error::Error for FinishError {}
 
-/// A send record could not be committed to the session stream.
+/// Why a send was not committed. Nothing was committed and no sequence number was used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendError {
+    /// The send ring of the CPU the thread is running on has no room. Every session sending
+    /// from that CPU writes into the same ring, so another application can fill it. Space
+    /// returns as the daemon takes records; poll and retry.
     Full,
+    /// Send header plus payload exceed [`Session::max_record`]: a TCP payload is at most
+    /// `max_record() - 16` bytes, a UDP payload `max_record() - 24`.
     TooLarge,
+    /// The socket is closing, its open was rejected, it was freed, or it is a TCP socket after
+    /// [`Session::shutdown`].
     NotOpen,
 }
 
@@ -86,11 +97,29 @@ impl fmt::Display for SendError {
 
 impl std::error::Error for SendError {}
 
+/// How a session was lost: the error of [`Session::poll`] and [`Session::poll_events`].
+///
+/// | How the session ended | What a poll returns | What the daemon does with open TCP connections |
+/// |---|---|---|
+/// | the daemon is stopped (SIGINT or SIGTERM) | `Ended(HostShutdown)`, or `Disconnected` | closes the network card without closing them; peers see no FIN or reset |
+/// | the daemon is killed or crashes | `Disconnected` | nothing |
+/// | the daemon kicked the session | `Ended(Kicked)` | resets them |
+/// | the session broke the protocol, such as a send before `Connected` | `Ended(ProtocolError)` | resets them |
+/// | writing to the control socket failed | `Io(..)` or `Disconnected` | resets them, as for a dropped session |
+/// | the daemon sent bytes the session cannot decode | `Protocol(..)` | nothing until the session is dropped; then resets them |
+///
+/// The first `Err` carries the reason; later polls may return `Ok` or a different `Lost`.
+/// A lost session cannot be resumed: connect a new one and open new sockets.
 #[derive(Debug)]
 pub enum Lost {
+    /// The daemon ended the session.
     Ended(EndReason),
+    /// The control connection closed without the daemon's [`EndReason::Finished`].
     Disconnected,
+    /// Reading or writing the control socket failed, or the daemon sent a message that is not
+    /// valid at this point (kind `InvalidData`).
     Io(io::Error),
+    /// The daemon sent bytes that are not a valid control message.
     Protocol(DecodeError),
 }
 
@@ -168,6 +197,122 @@ struct Slot {
     shut: bool,
 }
 
+/// One application's connection to the junction daemon: TCP and UDP sockets on the network
+/// card the daemon owns, with packet data passed through shared memory.
+///
+/// Most programs do not use a `Session` directly: they connect one and hand it to
+/// `Net::remote` in `switch::net`, and their tasks then run against the daemon. A program
+/// with its own loop and no async runtime uses the methods here.
+///
+/// Only [`connect`](Self::connect) waits. Opening, sending and polling return at once, and
+/// the program calls them in its own loop: open sockets, poll for events and packets, send.
+/// One background thread, `junction-ctl`, reads the control socket. A `Session` is neither
+/// `Send` nor `Sync`; it stays on the thread that connected it.
+///
+/// # Socket ids and slots
+///
+/// A session has a table of [`max_sockets`](Self::max_sockets) socket slots. Opening a socket
+/// takes a free slot and returns its [`SocketId`]. A slot moves through these states:
+///
+/// ```text
+///             connect_tcp / listen_tcp / bind_udp
+///    free -----------------------------------------> open
+///     ^  ^                                            |  |
+///     |  |              Rejected(code)                |  |
+///     |  +--------------------------------------------+  |
+///     |                                                  | close / abort
+///     |                 Freed or Rejected(code)          v
+///     +--------------------------------------------- closing
+///
+///    (the next open of a freed slot gets generation + 1)
+/// ```
+///
+/// Other events leave the slot's state alone. A closing socket still occupies its slot, so
+/// [`OpenError::NoFreeSlot`] means every slot is open or closing. An id is stale when its slot
+/// has been opened again since; methods panic on a stale id, and packets for one are dropped.
+///
+/// # Opening sockets
+///
+/// [`connect_tcp`](Self::connect_tcp), [`listen_tcp`](Self::listen_tcp) and
+/// [`bind_udp`](Self::bind_udp) check the configuration, take a slot and return the id at
+/// once; the daemon answers later with [`Event::Connected`], [`Event::Bound`] or
+/// [`Event::Rejected`]. Wait for `Connected` or `Bound` before sending on the socket: opens
+/// travel over the control socket and sends through the send ring, which are not ordered, and
+/// a send that reaches the daemon before its open ends the session with
+/// [`EndReason::ProtocolError`]. The session does not check this. Addresses are IPv4 only.
+///
+/// A TCP listener is one connection, not an accept queue: when a peer connects, the
+/// listening socket becomes that connection and gets `Connected`. To serve several
+/// connections, keep several listeners open on the same port and open a new one when one is
+/// taken. Listeners of different sessions on the same port all wait for connections on it.
+///
+/// # Closing sockets
+///
+/// | Call | What the daemon does | Then |
+/// |---|---|---|
+/// | [`shutdown(id)`](Self::shutdown) | TCP only. Sends a FIN after the data already sent; the socket can still receive. | [`Event::Delivered`] once the peer acknowledges |
+/// | [`close(id, false)`](Self::close) | Waits until every send ring is empty and the socket's queued bytes are written, then closes the connection with a FIN and removes the socket. Resets instead if it holds received bytes the program never read. For UDP, waits the same way, then unbinds. | [`Event::Freed`] |
+/// | [`close(id, true)`](Self::close) | Resets the connection at once and discards queued bytes; unbinds a UDP socket at once. | [`Event::Freed`] |
+/// | [`abort(id)`](Self::abort) | TCP only. Resets the connection at once and discards queued bytes. | [`Event::Freed`] |
+///
+/// A graceful close waits for the send rings of all sessions, so it can wait while another
+/// application keeps sending. Until `Freed`, the socket still exists in the daemon, and opening
+/// another socket on its port can be refused. Pass `unread = true` when the program dropped
+/// received data without reading it.
+///
+/// # Polling
+///
+/// [`poll_events`](Self::poll_events) writes control messages still waiting to be sent and
+/// calls back once per event that has arrived. [`poll_packets`](Self::poll_packets) calls back
+/// once per received packet, then reclaims receive-ring space. [`poll`](Self::poll) does both,
+/// events first. Polling is the only way to learn that the session is lost ([`Lost`]); the
+/// send methods do not look, so a program that only sends must still poll.
+///
+/// Events and packets travel on different channels. Within one `poll`, every event callback
+/// runs before any packet callback. A socket's first packet can arrive before its
+/// `Connected`; a program that needs the event first holds such packets per socket until it
+/// arrives. By the time the program handles [`Event::PeerFin`], every byte the peer sent
+/// before its FIN is in the ring, and the same `poll`, or an earlier one, delivers it. Packets
+/// for freed sockets or earlier generations of a slot are dropped.
+///
+/// # Received packets and ring space
+///
+/// Each packet comes as a [`PacketMeta`] and an [`OwnedFrame`] that points into the session's
+/// receive ring, which is `--rx-size` bytes for all of the session's sockets. A TCP chunk
+/// larger than the ring can hold arrives in several frames; a UDP datagram larger than
+/// `--rx-size` minus 40 bytes is dropped by the daemon. A frame's space returns to the daemon
+/// only after it is dropped and a later poll reclaims it, and reclaiming stops at the oldest
+/// frame still held: one long-held frame blocks the reuse of everything received after it, on
+/// every socket. While the ring is full the daemon keeps the next pending data for each socket
+/// and retries; TCP flow control slows the peer.
+///
+/// # Ending a session
+///
+/// [`finish`](Self::finish) asks the daemon to end the session after everything already
+/// sent; keep polling until [`closed`](Self::closed) is true. The daemon then applies every
+/// close and shutdown already sent and closes the remaining TCP connections with a FIN. A
+/// connection that still has bytes queued closes after they are sent; if the peer stops
+/// acknowledging, the daemon gives up after 8 retransmission back-offs and resets it. A
+/// connection with received data the program never read is reset.
+///
+/// Dropping a `Session` without a successful `finish` is treated as a crash: the daemon resets
+/// every socket the session still had. Dropping it after a successful `finish` but before
+/// `closed()` still ends it gracefully. `Drop` closes the control socket and joins the reader
+/// thread.
+///
+/// # Panics
+///
+/// | Method | Panics when |
+/// |---|---|
+/// | `connect_tcp`, `listen_tcp`, `bind_udp` | `finish` has succeeded |
+/// | `send_tcp`, `send_udp` | `finish` has succeeded; the id's slot is out of range or the id is stale; the socket is of the other kind |
+/// | `shutdown` | `finish` has succeeded; out-of-range or stale id; a UDP socket; the socket is not open |
+/// | `close` | before a successful `finish`: out-of-range or stale id; the socket is already closing |
+/// | `abort` | before a successful `finish`: out-of-range or stale id; a UDP socket; the socket is already closing |
+///
+/// After a successful `finish`, `close` and `abort` do nothing, so cleanup in destructors
+/// stays safe. On an id whose socket was rejected or freed and whose slot has not been opened
+/// again, sends return [`SendError::NotOpen`] and `close` and `abort` do nothing.
 pub struct Session {
     socket: UnixStream,
     writer: Writer,
@@ -189,8 +334,12 @@ pub struct Session {
 }
 
 impl Session {
-    /// Performs the Hello/Welcome handshake on the caller's thread, then starts
-    /// one `junction-ctl` reader thread with the caller's inherited CPU affinity.
+    /// Connects to the daemon's control socket at `path` (`control.sock` in its directory),
+    /// asking for `max_sockets` socket slots.
+    ///
+    /// Blocks, with no timeout, until the daemon answers. A daemon that is still opening its
+    /// network card answers once it has finished. Then starts the `junction-ctl` reader thread,
+    /// which inherits the calling thread's CPU affinity.
     pub fn connect(path: &Path, max_sockets: u16) -> Result<Self, ConnectError> {
         let mut socket = UnixStream::connect(path).map_err(ConnectError::Io)?;
         let mut bytes = Vec::new();
@@ -279,15 +428,17 @@ impl Session {
         })
     }
 
-    /// Host TX frame payload capacity advertised in Welcome.
+    /// The daemon's IP MTU minus 28: the largest UDP payload that fits one frame.
     pub fn frame_capacity(&self) -> u32 {
         self.frame_capacity
     }
 
+    /// The largest send record in bytes, send header included. See [`SendError::TooLarge`].
     pub fn max_record(&self) -> usize {
         self.max_record as usize
     }
 
+    /// The number of socket slots, as passed to [`connect`](Self::connect).
     pub fn max_sockets(&self) -> usize {
         self.slots.len()
     }
@@ -315,8 +466,12 @@ impl Session {
         })
     }
 
+    /// Opens a TCP connection to `remote` from `local`. The answer is [`Event::Connected`],
+    /// [`Event::Rejected`], or, when the peer refuses, [`Event::Closed`] without `Connected`.
+    /// The local port must be nonzero.
+    ///
     /// # Panics
-    /// Panics if `finish()` has succeeded, before validating the configuration.
+    /// Panics if [`finish`](Self::finish) has succeeded.
     pub fn connect_tcp(
         &mut self,
         config: TcpConfig,
@@ -335,8 +490,11 @@ impl Session {
         Ok(id)
     }
 
+    /// Opens a TCP socket that waits for one connection on `local`. The answer is
+    /// [`Event::Rejected`], or [`Event::Connected`] when a peer connects.
+    ///
     /// # Panics
-    /// Panics if `finish()` has succeeded, before validating the configuration.
+    /// Panics if [`finish`](Self::finish) has succeeded.
     pub fn listen_tcp(
         &mut self,
         config: TcpConfig,
@@ -349,8 +507,10 @@ impl Session {
         Ok(id)
     }
 
+    /// Binds a UDP socket. The answer is [`Event::Bound`] or [`Event::Rejected`].
+    ///
     /// # Panics
-    /// Panics if `finish()` has succeeded, before validating the configuration.
+    /// Panics if [`finish`](Self::finish) has succeeded.
     pub fn bind_udp(&mut self, config: UdpConfig) -> Result<SocketId, OpenError> {
         self.assert_unfinished();
         config.check().map_err(OpenError::Config)?;
@@ -359,15 +519,17 @@ impl Session {
         Ok(id)
     }
 
-    /// Commits the payload with a TCP send header as one record; no headroom is needed.
-    /// `Full` consumes no sequence number; retry after space becomes available.
+    /// Commits `payload` to the send ring as one record for the TCP socket `id`.
     ///
-    /// Valid only after this socket's `Connected` event. An earlier send can reach
-    /// the host before the open because the stream and control socket are unordered,
-    /// ending the session as a protocol error. Session does not enforce this ordering.
+    /// `Ok` means the record is in the send ring, nothing more: the daemon has not taken it and
+    /// the peer has not received it. The daemon passes the bytes to its network stack as fast as
+    /// the stack accepts them and queues the rest without limit, so a peer that does not read
+    /// never makes this return `Full`. Received data chunks need not match these records. Send
+    /// only after the socket's [`Event::Connected`].
     ///
     /// # Panics
-    /// Panics after successful `finish()`, for an invalid or stale socket ID, or a UDP socket.
+    /// Panics if [`finish`](Self::finish) has succeeded, for an out-of-range or stale id, or
+    /// for a UDP socket.
     pub fn send_tcp(&mut self, id: SocketId, payload: &[u8]) -> Result<(), SendError> {
         self.assert_unfinished();
         let slot = self.slot_for(id);
@@ -380,15 +542,15 @@ impl Session {
         self.push(&header, payload)
     }
 
-    /// Commits the payload with a UDP send header as one record; no headroom is needed.
-    /// `Full` consumes no sequence number; retry after space becomes available.
+    /// Commits `payload` to the send ring as one datagram for the UDP socket `id`, to `to`.
     ///
-    /// Valid only after this socket's `Bound` event. An earlier send can reach
-    /// the host before the open because the stream and control socket are unordered,
-    /// ending the session as a protocol error. Session does not enforce this ordering.
+    /// `Ok` means the record is in the send ring. A datagram the daemon's network stack cannot
+    /// send, for example because the destination's hardware address is not resolved yet, is
+    /// dropped after `Ok`. Send only after the socket's [`Event::Bound`].
     ///
     /// # Panics
-    /// Panics after successful `finish()`, for an invalid or stale socket ID, or a TCP socket.
+    /// Panics if [`finish`](Self::finish) has succeeded, for an out-of-range or stale id, or
+    /// for a TCP socket.
     pub fn send_udp(
         &mut self,
         id: SocketId,
@@ -420,8 +582,13 @@ impl Session {
         }
     }
 
+    /// Half-closes the TCP socket `id`: the daemon sends a FIN after the data already sent.
+    /// [`Event::Delivered`] follows once the peer acknowledges it. Later sends return
+    /// [`SendError::NotOpen`].
+    ///
     /// # Panics
-    /// Panics if `finish()` has succeeded, or the socket is not open or not TCP.
+    /// Panics if [`finish`](Self::finish) has succeeded, for an out-of-range or stale id, for
+    /// a UDP socket, or if the socket is not open.
     pub fn shutdown(&mut self, id: SocketId) {
         self.assert_unfinished();
         let slot = self.slot_for(id);
@@ -434,11 +601,15 @@ impl Session {
         self.queue(Op::ShutdownTcp { id });
     }
 
-    /// After successful `finish()`, does nothing, without validating the ID.
-    /// This permits socket cleanup from Drop, including during unwinding.
+    /// Closes the socket `id`; [`Event::Freed`] follows. `unread` says the program dropped
+    /// received data without reading it. See [Closing sockets](Self#closing-sockets).
+    /// Does nothing if the socket's open was rejected or it was already freed.
+    ///
+    /// After a successful [`finish`](Self::finish), does nothing, without checking `id`.
     ///
     /// # Panics
-    /// Before successful `finish()`, panics if the socket ID is invalid or closing.
+    /// Before a successful `finish`, panics for an out-of-range or stale id, or if the socket
+    /// is already closing.
     pub fn close(&mut self, id: SocketId, unread: bool) {
         if self.finished {
             return;
@@ -448,12 +619,14 @@ impl Session {
         }
     }
 
-    /// After successful `finish()`, does nothing, without validating the ID.
-    /// This permits socket cleanup from Drop, including during unwinding.
+    /// Resets the TCP connection `id` and removes the socket; [`Event::Freed`] follows. Does
+    /// nothing if the socket's open was rejected or it was already freed.
+    ///
+    /// After a successful [`finish`](Self::finish), does nothing, without checking `id`.
     ///
     /// # Panics
-    /// Before successful `finish()`, panics if the socket ID is invalid, closing,
-    /// or not TCP.
+    /// Before a successful `finish`, panics for an out-of-range or stale id, for a UDP socket,
+    /// or if the socket is already closing.
     pub fn abort(&mut self, id: SocketId) {
         if self.finished {
             return;
@@ -505,13 +678,13 @@ impl Session {
         }
     }
 
-    /// Flushes pending control output and handles queued host events without blocking.
-    /// The reader thread owns socket reads and decoding; this method never reads
-    /// the control socket.
+    /// Writes control messages still waiting to be sent, then calls `on_event` for each event
+    /// that has arrived. Never waits.
     ///
-    /// A successful finish acknowledgement sets `closed()` and returns `Ok(())`.
-    /// EOF without that acknowledgement returns `Lost::Disconnected`, even after
-    /// `finish()` succeeded. An unsolicited finish acknowledgement is invalid data.
+    /// Returns `Ok` and sets [`closed`](Self::closed) when the daemon confirms the end of a
+    /// finished session. A control connection that closes without that confirmation is
+    /// [`Lost::Disconnected`], even after `finish` succeeded. After `closed()`, returns `Ok`
+    /// and does nothing.
     pub fn poll_events(&mut self, mut on_event: impl FnMut(SocketId, Event)) -> Result<(), Lost> {
         if self.closed {
             return Ok(());
@@ -552,20 +725,11 @@ impl Session {
         }
     }
 
-    /// Dispatches available control events before draining received packets.
+    /// [`poll_events`](Self::poll_events), then [`poll_packets`](Self::poll_packets). Never
+    /// waits.
     ///
-    /// All event callbacks in this poll happen before its packet callbacks.
-    /// The ring and control socket are unordered: a socket's packets may arrive
-    /// before its `Connected` event. Callers needing that event first must queue
-    /// packets per socket until it arrives.
-    /// The host publishes received bytes to the ring before sending `PeerFin`.
-    /// The reader's channel handoff preserves happens-before, so the subsequent
-    /// ring drain sees every byte preceding a `PeerFin` handled in this poll.
-    /// Packets for freed sockets or earlier socket generations are discarded.
-    /// A callback may retain its owned frame; that storage becomes reusable only
-    /// after the frame is dropped and a poll reclaims it.
-    /// Even when control polling reports session loss, all available packets are
-    /// drained and reclaimed before that error is returned.
+    /// When `poll_events` reports loss, the packets already in the ring are still delivered
+    /// before the error is returned. See [Polling](Self#polling) for ordering.
     pub fn poll(
         &mut self,
         on_event: impl FnMut(SocketId, Event),
@@ -576,11 +740,10 @@ impl Session {
         result
     }
 
-    /// Drains available received packets without polling control events or
-    /// flushing pending control output, including after session loss.
+    /// Calls `on_packet` for each packet in the receive ring, then reclaims ring space.
+    /// Never waits, and keeps working after the session is lost.
     ///
-    /// Packets for freed sockets or earlier generations are discarded. Retained
-    /// frames become reusable after they are dropped and a later drain reclaims them.
+    /// Packets for freed sockets or earlier generations of a slot are dropped.
     pub fn poll_packets(&mut self, mut on_packet: impl FnMut(SocketId, PacketMeta, OwnedFrame)) {
         while let Some((meta, frame)) = self.rx.next() {
             let id = SocketId {
@@ -622,17 +785,12 @@ impl Session {
         Ok(())
     }
 
-    /// Commits the session's end record after all queued control operations are written.
+    /// Ends the session once the daemon has taken everything already sent: commits the end
+    /// record to the send ring after every control message is written.
     ///
-    /// `ControlPending` means control output is still unsent; no end record was
-    /// committed. `StreamFull` means ingress has no room for the end record.
-    /// Poll events and retry either error. A successful call is idempotent, but
-    /// does not mean retirement is complete: keep polling until `closed()` is true.
-    /// Control I/O failures are reported by `poll_events`.
-    /// After success, `connect_tcp`, `listen_tcp`, `bind_udp`, `send_tcp`,
-    /// `send_udp`, and `shutdown` panic before validating arguments or changing state.
-    /// `close` and `abort` instead do nothing, even for invalid IDs, so Drop
-    /// cleanup remains safe during unwinding and sends no further operations.
+    /// A successful call does not mean the session is over: keep polling until
+    /// [`closed`](Self::closed) is true. Further calls return `Ok` and do nothing. After
+    /// success, opening, sending and `shutdown` panic; `close` and `abort` do nothing.
     pub fn finish(&mut self) -> Result<(), FinishError> {
         if self.finished {
             return Ok(());
@@ -651,7 +809,7 @@ impl Session {
         Ok(())
     }
 
-    /// Whether the host acknowledged successful retirement with `EndReason::Finished`.
+    /// Whether the daemon confirmed the end of the session after [`finish`](Self::finish).
     pub fn closed(&self) -> bool {
         self.closed
     }

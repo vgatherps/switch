@@ -99,14 +99,17 @@ impl<Fut: Future> Drop for Joinable<Fut> {
     }
 }
 
-/// The result of a task spawned with [`crate::Spawner::spawn_join`].
+/// The result of a task spawned with [`Spawner::spawn_join`](crate::Spawner::spawn_join).
 ///
-/// Resolves to the task's return value, at once if the task already finished,
-/// or to `Err(Canceled)` if the task ends without a value: its runtime shut
-/// down or was dropped first, or its poll panicked. Dropping the handle
-/// detaches the task: its value is dropped when it completes, or now if it
-/// already did. Must be awaited by a switch task (it keeps a `StoredWaker`).
-/// Not `Send` or `Sync`.
+/// Resolves to `Ok` with the task's return value, at once if the task already finished.
+/// Resolves to `Err(Canceled)` if the task ends without a value: its runtime was shut down
+/// or dropped first, or its poll panicked (then at once). Dropping the handle detaches the
+/// task without stopping it: its value is dropped when it completes, or now if it already
+/// did. Neither `Send` nor `Sync`.
+///
+/// # Panics
+///
+/// When polled by anything other than a switch task while the task is still running.
 #[must_use = "dropping a JoinHandle detaches its task"]
 pub struct JoinHandle<T>(Receiver<T>);
 

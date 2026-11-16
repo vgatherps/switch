@@ -1,60 +1,10 @@
-//! TLS 1.3 client over TCP frames, on rustls's unbuffered client. Use it for a TLS connection
-//! over a switch-net TCP stream with your own protocol on top; for `wss://`, use switch-ws,
-//! which runs this crate underneath.
+//! TLS 1.3 client over TCP, on rustls's unbuffered client. Applications reach it as
+//! `switch::tls` (feature `tls`): [`net::tls_connect`] runs the handshake on a connected TCP
+//! stream and returns a [`net::Tls`] that reads and writes plaintext.
 //!
-//! Feature `switch-net`: module `net`, TLS over switch-net TCP.
-//! `net::tls_connect` runs the handshake on a connected `TcpStream` and returns a `Tls`
-//! holding the two halves and the TCP receive half; `Tls::ready` waits for plaintext,
-//! `net::send_bytes` sends, `Tls::close` sends close_notify and FIN and waits for their
-//! delivery. The `rustls::ClientConfig` must allow TLS 1.3 only. Every wait that depends on the
-//! server can last as long as the server stays silent, so bound the exchange with
-//! `switch_net::within`. Without the feature only the TLS layer over the frame traits builds; it
-//! needs no DPDK.
-//!
-//! ```rust,no_run
-//! # #[cfg(feature = "switch-net")]
-//! # mod example {
-//! use std::sync::Arc;
-//! use std::time::Duration;
-//! use rustls::ClientConfig;
-//! use switch_runtime::Spawner;
-//! use switch_net::{IpEndpoint, IpListenEndpoint, NetHandle, tcp, within};
-//! use switch_tls::net::{send_bytes, tls_connect};
-//!
-//! async fn get(
-//!     handle: &NetHandle,
-//!     spawner: &Spawner,
-//!     config: Arc<ClientConfig>,
-//!     server: IpEndpoint,
-//!     socket: tcp::Config,
-//! ) -> Result<(), String> {
-//!     let exchange = async {
-//!         let local = IpListenEndpoint { addr: None, port: 49152 };
-//!         let stream = handle.tcp_connect(socket, server, local).await.map_err(|e| format!("{e:?}"))?;
-//!         // min_plain: smallest plaintext room wanted; send_bytes splits larger data
-//!         let mut tls = tls_connect(handle, stream, config, "example.com", 1).await.map_err(|e| e.to_string())?;
-//!         let request = b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
-//!         send_bytes(&mut tls.tx, request).await.map_err(|e| e.to_string())?;
-//!         // `ready` is Ok(false) once the server sent close_notify
-//!         while tls.ready().await.map_err(|e| e.to_string())? {
-//!             let n = tls.rx.current().len();
-//!             tls.rx.consume(n);
-//!         }
-//!         tls.close().await.map_err(|e| e.to_string())
-//!     };
-//!     within(spawner, Duration::from_secs(10), exchange).await.unwrap_or(Err("timed out".to_owned()))
-//! }
-//! # }
-//! ```
-//!
-//! For embedding on another frame source: [`TlsRx`] hands each received frame's bytes to rustls,
-//! which decrypts records in place: a record lying wholly inside one frame is returned as a slice
-//! of that frame. Only a record straddling frames is copied, into one reusable scratch buffer, and
-//! decrypted there. Decryption is lazy: one record per run. [`TlsTx`] owns the rustls connection
-//! and seals each frame's plaintext into one record in that frame, on top of a lower [`FrameTx`]
-//! that sends frames as they are; it is a [`FrameTx`] itself.
-//!
-//! Book: See the switch book, chapter "TLS without WebSocket".
+//! The items at the root are the TLS layer itself, over any frame source that implements
+//! [`RxFrame`], [`TxFrame`] and [`FrameTx`]. `switch::ws` runs its `wss://` connections on them.
+//! They build without DPDK.
 
 use std::fmt;
 
@@ -68,6 +18,31 @@ pub mod net;
 
 pub use rx::TlsRx;
 pub use tx::{CLOSE_NOTIFY_LEN, Sealed, TlsTx};
+
+#[cfg(doctest)]
+mod api_guards {
+    //! A run borrows the receive half, so the next `chunk` cannot run while it is held:
+    //!
+    //! ```compile_fail,E0499
+    //! # use switch_tls::{FrameTx, RxFrame};
+    //! # fn f<F: RxFrame, L: FrameTx>(rx: &mut switch_tls::TlsRx<F, L>, tx: &mut switch_tls::TlsTx<L>) {
+    //! let first = rx.chunk(tx).unwrap().unwrap();
+    //! let second = rx.chunk(tx);
+    //! first.bytes[0] = 0;
+    //! # }
+    //! ```
+    //!
+    //! Only `TlsTx::try_send` takes a `Sealed` frame, so a frame that was not sealed cannot be
+    //! sent in place of a sealed one:
+    //!
+    //! ```compile_fail,E0308
+    //! # use switch_tls::FrameTx;
+    //! async fn send_unsealed<L: FrameTx>(tx: &mut switch_tls::TlsTx<L>) {
+    //!     let f = tx.alloc().await.ok().unwrap();
+    //!     let _ = tx.try_send(f);
+    //! }
+    //! ```
+}
 
 /// A received TCP segment's payload with its hardware RX timestamp.
 pub trait RxFrame {
@@ -121,9 +96,12 @@ pub trait FrameTx {
     fn delivered(&mut self) -> impl Future<Output = ()>;
 }
 
-/// A receive error.
+/// Why receiving failed. Receiving and sending are both over: later receives return the same
+/// error, and sends fail with [`TxError::Received`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum Error {
+    /// rustls rejected the server's handshake, a received record, or (from
+    /// [`net::tls_connect`]) the config.
     Tls(rustls::Error),
     /// The transport ended without the peer's close_notify.
     Truncated,
@@ -145,14 +123,17 @@ impl std::error::Error for Error {}
 /// A send error.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TxError<E> {
-    /// Receiving failed (a TLS error or truncation), which ends the connection.
+    /// Receiving failed earlier with this error, which ends the connection.
     Received(Error),
-    /// We sent close_notify.
+    /// close_notify was already sent ([`TlsTx::close_notify`], [`TlsTx::send_close_notify`] or
+    /// [`net::Tls::close`]).
     Closed,
-    /// The frame sender below failed.
+    /// The frame sender below failed with this error.
     Lower(E),
-    /// A record was encrypted but the frame sender below failed to take it: its sequence
-    /// number is gone, so the peer cannot decrypt any later record.
+    /// An encrypted record never reached the frame sender: a [`Sealed`] frame was dropped
+    /// before `try_send` took it, or an earlier seal failed below (reported then as `Lower`).
+    /// Its sequence number is gone, so the peer cannot decrypt any later record; every later
+    /// send fails with `Broken`.
     Broken,
 }
 

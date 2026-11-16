@@ -13,19 +13,22 @@ pub enum Role {
     Server,
 }
 
-/// A connection's size limits. A received message over its limit fails the connection
-/// (`MessageTooBig`, at the header of the frame that passes it); a send over `max_send` is
-/// refused. The receive buffer grows only with bytes received, up to `max_message`.
+/// A connection's message size limits, given to `connect`, `connect_ws` or `accept_ws`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
-    /// Largest message accepted.
+    /// Largest received message, counting the data of all its frames; control frames are not
+    /// counted (they have their own 125 B limit). A frame header announcing a length that takes
+    /// the message past it fails the connection with [`ProtocolError::MessageTooBig`], before
+    /// any of that frame's data is read. The buffer for a message that spans frames grows only
+    /// as its bytes arrive.
     pub max_message: usize,
-    /// Largest message sent.
+    /// Largest message `send` accepts; a larger one is refused with `TooBig` and nothing is
+    /// sent.
     pub max_send: usize,
 }
 
 impl Default for Limits {
-    /// tungstenite's message limit, 64 MiB (either way).
+    /// 64 MiB each way, tungstenite's message limit.
     fn default() -> Limits {
         Limits { max_message: 64 << 20, max_send: 64 << 20 }
     }
@@ -43,19 +46,26 @@ impl Config {
     }
 }
 
+/// A data message's type. Text must be UTF-8: received text is checked as it arrives, and
+/// `send` refuses text that is not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Text,
     Binary,
 }
 
-/// Why the connection failed. No close frame is sent for it: the connection ends with FIN
-/// (after close_notify on TLS).
+/// How the peer broke the WebSocket protocol, inside `Failure::Protocol`. No close frame is
+/// sent for it: the connection sends close_notify (over TLS) and FIN, then reports the failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProtocolError {
+    /// A frame with a reserved bit (RSV1 to RSV3) set; no extension is negotiated that would
+    /// define one.
     ReservedBits,
+    /// A frame with an opcode RFC 6455 does not define; the opcode.
     UnknownOpcode(u8),
+    /// A ping, pong or close frame without FIN.
     FragmentedControl,
+    /// A ping, pong or close frame with more than 125 B of payload.
     ControlTooBig,
     /// A continuation frame with no message in progress.
     UnexpectedContinuation,
@@ -71,7 +81,9 @@ pub enum ProtocolError {
     NonMinimalLength,
     /// A close payload of 1 byte.
     InvalidCloseLength,
+    /// A Text message, or a close frame's reason, that is not UTF-8.
     InvalidUtf8,
+    /// A data frame that takes its message past [`Limits::max_message`].
     MessageTooBig,
 }
 
@@ -609,8 +621,13 @@ impl<R: PlainRx> WsRx<R> {
     }
 }
 
-/// A received message, borrowing either the lower layer's run (direct) or the receive scratch.
-/// It borrows the receive half, so no further `recv` runs while it is held.
+/// A received Text or Binary message. Ping, pong and close frames are handled inside `recv` and
+/// never returned.
+///
+/// It borrows the connection, so the next `recv` cannot run while it is held: copy what must
+/// outlive it. A message that arrived inside one frame (over TLS, one record) is that frame's
+/// own bytes; one that spans frames, records or WebSocket fragments is a copy in a buffer the
+/// connection keeps.
 pub struct Message<'r> {
     kind: Kind,
     bytes: &'r [u8],
@@ -622,11 +639,13 @@ impl Message<'_> {
         self.kind
     }
 
+    /// The payload.
     pub fn bytes(&self) -> &[u8] {
         self.bytes
     }
 
-    /// `Some` iff text; no second pass over the bytes.
+    /// The payload as text for a Text message, `None` for Binary. The UTF-8 was checked on
+    /// receipt, so this does not check it again.
     pub fn text(&self) -> Option<&str> {
         match self.kind {
             Kind::Text => {
@@ -644,7 +663,8 @@ impl Message<'_> {
         }
     }
 
-    /// Stamp of the frame holding the message's first byte.
+    /// The NIC receive stamp of the frame where the message began (over TLS, where the record
+    /// holding its first byte began); 0 if the NIC gave none.
     pub fn rx_timestamp(&self) -> u64 {
         self.rx_timestamp
     }
@@ -679,8 +699,8 @@ mod tests {
 
     /// `text()` gives back the validated payload without checking it again: a direct message
     /// (read through the lower layer) and one assembled in scratch, both with multibyte text.
-    /// The check is `text()`'s debug_assert, which re-validates in every test build. switch-ws is
-    /// not in `make miri`; by hand, `cargo +nightly miri test -p switch-ws --lib` runs this too.
+    /// The check is `text()`'s debug_assert, which re-validates in every test build. `make miri`
+    /// runs this under Miri too (`cargo +nightly miri test -p switch-ws --lib`).
     #[test]
     fn text_is_the_payload_validated_on_receipt() {
         let t = "a€𝄞b";

@@ -1,37 +1,6 @@
-//! Ordered per-stream delivery over `ceph-ring`.
-//!
-//! [`Fifo`] is the consumer side of cephalopod. It sweeps every per-CPU ring of a `ceph_ring::Reader` and delivers each stream's messages in sequence-number order, starting at 0, whichever rings they landed in. The junction daemon runs one `Fifo` for the send rings of all sessions.
-//!
-//! [`Fifo::next_message`] returns the next deliverable [`Message`], or `None` if nothing is ready now. Dropping the message consumes its record; the ring space returns to writers at the start of the next sweep. For each ring's oldest record: the expected sequence number is delivered; a lower one, or a record of an unknown or closed stream, is discarded; a higher one stalls that ring until the missing record turns up elsewhere. When a sweep makes no progress while rings are stalled, the `Fifo` kicks a stream whose expected record is in none of them and sends `Retire::Kicked`; if every expected record is present, the first stalled stream is kicked. A delivered end record ([`Message::end`], empty payload) sends `Retire::Finished` when dropped. At most 64 messages in a row come from one ring.
-//!
-//! This restores a stream's order across CPU rings after its producer migrates; it does not reorder records a producer committed out of order within one ring. Producers therefore follow three rules: each pushing thread uses its own stream, or taking a sequence number and committing it are serialized for a shared stream; the sequence number advances only after a successful push (retry `Full` with the same number); sequence numbers stay below 2^63, because the top bit marks the end record.
-//!
-//! Streams open and close through `ceph_proto::Control` messages, normally from `ceph_control::Listener`. `max_streams` in [`Fifo::new`] must equal the value passed to `Listener::bind`.
-//!
-//! ```no_run
-//! use std::path::Path;
-//! use std::sync::mpsc;
-//!
-//! use ceph_control::Listener;
-//! use ceph_fifo::Fifo;
-//! use ceph_ring::{Config, Reader};
-//!
-//! # fn main() -> std::io::Result<()> {
-//! let reader = Reader::create(Config { ring_size: 2 << 20, max_record: 4096, dir: "/dev/shm".into() })?;
-//! let (control_tx, control_rx) = mpsc::channel();
-//! let (retire_tx, retire_rx) = mpsc::channel();
-//! let listener = Listener::bind(Path::new("/tmp/ceph.sock"), reader.name(), 1024, control_tx, retire_rx)?;
-//! std::thread::spawn(move || listener.run());
-//! let mut fifo = Fifo::new(reader, 1024, control_rx, retire_tx);
-//! loop {
-//!     if let Some(message) = fifo.next_message() {
-//!         println!("stream={} seq={} end={}", message.stream(), message.seq(), message.end());
-//!     }
-//! }
-//! # }
-//! ```
-//!
-//! See the switch book, chapter "cephalopod: many writers, one reader".
+//! The consumer side of cephalopod: [`Fifo`] sweeps every per-CPU ring of a
+//! `ceph_ring::Reader` and delivers each stream's records in sequence order, whichever rings
+//! they landed in. The junction daemon runs one `Fifo` for the send rings of all sessions.
 
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -40,6 +9,9 @@ use ceph_ring::{END_OF_STREAM, Reader};
 
 const BATCH: usize = 64;
 
+/// A delivered record. It borrows the [`Fifo`]; dropping it consumes the record, and dropping
+/// an end record sends `Retire::Finished`. The record's ring space returns to writers at the
+/// start of the next sweep, so a held `Message` keeps it.
 pub struct Message<'a> {
     stream: u64,
     seq: u64,
@@ -51,10 +23,12 @@ pub struct Message<'a> {
 }
 
 impl Message<'_> {
+    /// The stream id: the slot in the high 32 bits, the unique id in the low 32 bits.
     pub fn stream(&self) -> u64 {
         self.stream
     }
 
+    /// The sequence number, without the end bit.
     pub fn seq(&self) -> u64 {
         self.seq
     }
@@ -64,6 +38,7 @@ impl Message<'_> {
         self.finish.is_some()
     }
 
+    /// The record's payload; empty for an end record.
     pub fn payload(&self) -> &[u8] {
         // SAFETY: the slice points into the ring mapping, which stays valid while this message
         // holds the mutable reader borrow and prevents publishing its tail.
@@ -115,8 +90,51 @@ enum Front {
     Deliver { end: bool },
 }
 
-/// At kick time, every ring with committed data is stalled. The victim is a front stream whose
-/// expected record is absent from every stalled ring's committed backlog.
+/// Delivers each stream's records in sequence order across all rings of a `ceph_ring::Reader`.
+///
+/// Streams open and close through `ceph_proto::Control` messages, normally from
+/// `ceph_control::Listener`. A stream's records are delivered from sequence number 0, each
+/// number once. For the oldest record of each ring:
+///
+/// | The record | What happens |
+/// |---|---|
+/// | the next number its stream expects | delivered |
+/// | a lower number, or a stream that is unknown or closed | discarded |
+/// | a higher number | the ring stalls, with every record behind it, until the missing record turns up in another ring |
+///
+/// Streams are delivered in the order the sweep comes across them; at most 64 records in a row
+/// are delivered from one ring before the sweep moves to the next.
+///
+/// A gap that is never filled would stall rings forever. When a whole sweep delivers nothing,
+/// discards nothing and stalls no new ring while some rings are stalled, the `Fifo` kicks a
+/// stream whose expected record is in none of the stalled rings: it closes the stream and sends
+/// `Retire::Kicked`. If every expected record is present somewhere, a producer committed its
+/// own records out of order within one ring, and the first stalled stream is kicked. This
+/// restores a stream's order across rings after its producer moves between CPUs; it does not
+/// reorder records committed out of order within one ring.
+///
+/// ```no_run
+/// use std::path::Path;
+/// use std::sync::mpsc;
+///
+/// use ceph_control::Listener;
+/// use ceph_fifo::Fifo;
+/// use ceph_ring::{Config, Reader};
+///
+/// # fn main() -> std::io::Result<()> {
+/// let reader = Reader::create(Config { ring_size: 2 << 20, max_record: 4096, dir: "/dev/shm".into() })?;
+/// let (control_tx, control_rx) = mpsc::channel();
+/// let (retire_tx, retire_rx) = mpsc::channel();
+/// let listener = Listener::bind(Path::new("/tmp/ceph.sock"), reader.name(), 1024, control_tx, retire_rx)?;
+/// std::thread::spawn(move || listener.run());
+/// let mut fifo = Fifo::new(reader, 1024, control_rx, retire_tx);
+/// loop {
+///     if let Some(message) = fifo.next_message() {
+///         println!("stream={} seq={} end={}", message.stream(), message.seq(), message.end());
+///     }
+/// }
+/// # }
+/// ```
 pub struct Fifo {
     reader: Reader,
     slots: Vec<Slot>,
@@ -128,7 +146,11 @@ pub struct Fifo {
 }
 
 impl Fifo {
-    /// `max_streams` must equal the value passed to `Listener::bind`.
+    /// A `Fifo` over `reader` for up to `max_streams` streams, opened and closed by `control`;
+    /// it reports finished and kicked streams on `retire`.
+    ///
+    /// `max_streams` must equal the value passed to `Listener::bind`: a `Control::Open` for a
+    /// slot at or beyond it panics.
     pub fn new(
         reader: Reader,
         max_streams: u32,
@@ -152,10 +174,7 @@ impl Fifo {
         &self.reader
     }
 
-    /// Returns the next deliverable message, or `None` if none is available now. The message
-    /// borrows the `Fifo`; dropping it consumes the record, and `publish` happens at the next
-    /// sweep boundary. Up to 64 consecutive deliveries from one ring are returned before
-    /// advancing to the next ring; discarded records do not count.
+    /// The next deliverable record, or `None` if nothing is ready now. Never waits.
     pub fn next_message(&mut self) -> Option<Message<'_>> {
         loop {
             match self.phase {

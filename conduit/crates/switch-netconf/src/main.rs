@@ -1,4 +1,17 @@
-//! The `switch-netconf` command; usage is in the library crate documentation.
+//! The `switch-netconf` command: checks a network config file, writes one from a Linux
+//! interface, and moves a PCI card between its kernel driver and `vfio-pci` so a DPDK program can
+//! open it. It needs no DPDK; `bind` and `unbind` need root.
+//!
+//! ```text
+//! switch-netconf check FILE
+//! switch-netconf discover --interface IF [--ipv4 ADDR] [--aws] [-o FILE]
+//! switch-netconf bind FILE [--noiommu] [--dry-run]
+//! switch-netconf unbind FILE
+//! ```
+//!
+//! Exit status: 0 success, 1 failure (one `switch-netconf:` line on stderr), 2 usage error. Each
+//! subcommand, its checks and its output are described in `docs/operations/switch-netconf.md`.
+
 use switch_netconf::{
     devbind,
     discover::{discover, discover_aws, ipv4_addresses, Roots},

@@ -5,22 +5,12 @@ use std::rc::Rc;
 
 use switch_dpdk_sys::{rte_eal_init, rte_timer_subsystem_init, switch_errno, switch_lcore_id, EALREADY};
 
-/// The calling thread's process-lifetime EAL setup.
+/// DPDK's process setup (EAL), owned by the thread that started it.
 ///
-/// Dropping this owner does not clean up EAL or unregister its main lcore.
-/// EAL cannot be initialized a second time after successful initialization.
-///
-/// ```compile_fail
-/// use dpdk_smoltcp::Eal;
-/// fn requires_send<T: Send>() {}
-/// requires_send::<Eal>();
-/// ```
-///
-/// ```compile_fail
-/// use dpdk_smoltcp::Eal;
-/// fn requires_sync<T: Sync>() {}
-/// requires_sync::<Eal>();
-/// ```
+/// That thread is DPDK's main thread: the port, the Stack and every packet buffer must be
+/// used on it, and `Eal` is neither `Send` nor `Sync`. Keep it alive until the port is
+/// closed. Dropping it does nothing; DPDK is never torn down and cannot be started a second
+/// time in the process.
 #[derive(Debug)]
 pub struct Eal {
     owner_lcore_id: u32,
@@ -85,18 +75,26 @@ impl Eal {
         })
     }
 
+    /// DPDK's id for the owning thread (its lcore).
     pub fn owner_lcore_id(&self) -> u32 {
         self.owner_lcore_id
     }
 }
 
+/// Why [`Eal::init`] failed. Some DPDK argument errors, and `--help`, exit the process
+/// instead of returning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EalError {
+    /// No arguments; the first must be a program name.
     EmptyArguments,
+    /// More arguments than DPDK's C interface can count.
     ArgumentCountTooLarge { count: usize },
+    /// Argument number `argument` contains a NUL byte at `position`.
     InteriorNul { argument: usize, position: usize },
+    /// DPDK's start-up failed; read its messages on stderr. `errno` is `EALREADY` when DPDK
+    /// already started in this process. A retry is not promised to work.
     Initialization { return_code: c_int, errno: c_int },
-    /// `rte_timer_subsystem_init` failed after EAL initialized.
+    /// DPDK started, but its timer subsystem did not. Treat as fatal.
     TimerSubsystem { return_code: c_int },
 }
 

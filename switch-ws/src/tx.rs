@@ -35,14 +35,26 @@ const CLOSE: u8 = 8;
 const PONG: u8 = 10;
 const FIN: u8 = 0x80;
 
-/// Why a connection failed. The first failure is kept and reported by every later call.
+/// Why a connection failed, inside `Error::Failed`. The first failure is kept: every later
+/// `send`, `close` and `recv` reports it. Before `recv` returns it, the connection delivers
+/// what it still owes the peer, so the connection may be dropped then; if the peer may still be
+/// sending, call `linger` first so that the drop sends no reset.
+///
+/// | Failure | Cause | Sent before it is reported |
+/// |---|---|---|
+/// | `Protocol(e)` | The peer broke the WebSocket protocol. | close_notify (over TLS) and FIN; no close frame. |
+/// | `PeerEof` | The peer's FIN, or its close_notify, came before its close frame. | close_notify (over TLS) and FIN. |
+/// | `Tls(Truncated)` | Over TLS: TCP ended without close_notify. | FIN. |
+/// | `Tls(Tls(e))` | Over TLS: a record from the peer failed. | The TLS alert and FIN. |
+/// | `Dead` | The socket closed or reset before the peer's close frame, or was dead at setup. A reset after the peer's close frame is a clean end. | Nothing. |
 #[derive(Clone, Debug, PartialEq)]
 pub enum Failure {
     /// The peer broke the WebSocket protocol; no close frame is sent.
     Protocol(ProtocolError),
-    /// The peer ended the stream before its WebSocket close.
+    /// The peer ended its stream before its WebSocket close.
     PeerEof,
-    /// A TLS record from the peer failed; its alert is sent, no close_notify.
+    /// Over TLS: a record from the peer failed (its alert is sent, no close_notify), or TCP
+    /// ended without close_notify.
     Tls(switch_tls::Error),
     /// The socket closed or reset: nothing more is sent.
     Dead,

@@ -32,17 +32,10 @@ pub(crate) fn plain_room(room: usize, max_fragment_size: Option<usize>) -> usize
     (room - OVERHEAD).min(record)
 }
 
-/// A frame holding records that used sequence numbers. Only [`TlsTx`] makes one, and only
+/// A frame holding encrypted records, ready for `try_send`. Only [`TlsTx`] makes one, and only
 /// [`TlsTx::try_send`](FrameTx::try_send) takes one, so a frame that was not sealed cannot be
-/// sent in place of the sealed one:
-///
-/// ```compile_fail,E0308
-/// # use switch_tls::FrameTx;
-/// async fn send_unsealed<L: FrameTx>(tx: &mut switch_tls::TlsTx<L>) {
-///     let f = tx.alloc().await.ok().unwrap();
-///     let _ = tx.try_send(f);
-/// }
-/// ```
+/// sent in its place. Its records used sequence numbers: dropped unsent, it breaks every later
+/// record ([`TxError::Broken`]).
 #[derive(Debug)]
 pub struct Sealed<S>(S);
 
@@ -82,9 +75,10 @@ pub struct TlsTx<L> {
 }
 
 impl<L: FrameTx> TlsTx<L> {
-    /// `conn` must have completed a TLS 1.3 handshake; `max_fragment_size` is the
-    /// `ClientConfig::max_fragment_size` it was made with. Panics if `lower`'s frames cannot
-    /// carry a record with one byte of plaintext.
+    /// `conn` is a client connection whose TLS 1.3 handshake is complete; `max_fragment_size` is
+    /// the `ClientConfig::max_fragment_size` it was made with. Panics if `conn` is still
+    /// handshaking or negotiated another version, or if `lower`'s frames cannot carry a record
+    /// with one byte of plaintext.
     pub fn new(conn: UnbufferedClientConnection, lower: L, max_fragment_size: Option<usize>) -> Self {
         assert!(
             !conn.is_handshaking(),

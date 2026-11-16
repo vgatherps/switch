@@ -1,29 +1,13 @@
 # switch-tap-echo
 
-TCP echo server on a `Stack` over a net_tap netdev, plus the driver that switch-ws's `switch-ws-autobahn` and `switch-binance-feed` reuse. It is the switch target for the packetdrill scripts and the Scapy fuzzer.
+A TCP echo server on a tap device, the target of the packetdrill scripts and the Scapy TCP fuzzer, and the tap driver that `switch-ws-autobahn` and `switch-binance-feed` share. It is test infrastructure; applications do not use it.
 
-Depends on [`dpdk-smoltcp`](../dpdk-smoltcp/README.md), `switch-buffer` and `switch-dpdk-sys`. switch-ws (feature `e2e`) and `switch-binance-feed` depend on it for `driver`.
-
-## Contents
-
-- Binary `switch-tap-echo`: `switch-tap-echo [--listeners N] [--buffer BYTES] [--close-after BYTES] -- <tester> [args...]`. It spawns the tester before DPDK starts, serves echo on port 8080 until the tester exits, and returns an exit status (0 tester exited 0, 1 tester failed, 2 packet buffers still in use at port close, 3 bad arguments or a setup, serve or teardown error). `switch-tap-echo` with no valid arguments prints the full usage, including the fixed addressing: switch 192.0.2.2/24, tester 192.0.2.1, netdev `cdtap_echo`.
-- `EchoServer`, `EchoError`, `serve(stack, echo, start, stop)` in `lib.rs`: the echo application and its drive loop. `with_close_after` makes it close after echoing a set number of bytes.
-- `driver` module: `run(...)` (spawn tester, build the Port and Stack on the tap vdev, run an app until the tester exits, tear down, compose the exit status; the app takes the Stack by value and hands it back with its result, so it can own it in a switch-net `Net`), `tester_env()`, `report()`, and the constants for addresses, pool sizes and exit codes.
-- `driver::run_tester(...)`: the same tester environment, stop callback and exit-status composition without EAL, a tap device or a Stack. `switch-ws-autobahn --backend junction --junction-socket PATH` uses this while a separate `switch-junctiond` owns the network; the app retires its session before returning.
-
-## Build and test
-
-Needs DPDK 25.11.3, `CAP_NET_ADMIN` and `/dev/net/tun`; use the Docker image on macOS.
+Its API reference is the crate's rustdoc (`make docs` at the repository root); the suites that use it are in [docs/contributing/testing.md](../../../docs/contributing/testing.md).
 
 ```sh
-make test-echo         # cargo test -p switch-tap-echo -- --test-threads=1 --show-output
-make test-packetdrill  # packetdrill scripts against switch-tap-echo
-make fuzz              # Scapy TCP fuzzer against switch-tap-echo
+make -C conduit test-echo         # needs DPDK, CAP_NET_ADMIN and /dev/net/tun
+make -C conduit test-packetdrill  # see docs/contributing/testing.md for its CPUs
+make -C conduit docker-fuzz       # the Scapy fuzzer
 ```
 
-Tests are `tests/echo.rs`, `driver.rs`, `serve.rs` and `kernel_interop.rs`.
-
-## Constraints
-
-- The process must be restricted to one CPU: EAL's main lcore is pinned to it. packetdrill runs put switch-tap-echo and packetdrill on separate CPUs (see [fuzz/packetdrill/README.md](../../fuzz/packetdrill/README.md)).
-- The tester must exit on SIGTERM and be run directly or via `exec`, since only the tester process is killed.
+The tester must exit on SIGTERM and be run directly or through `exec`: only the tester process itself is killed.

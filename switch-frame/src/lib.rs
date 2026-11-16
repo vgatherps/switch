@@ -1,14 +1,7 @@
-//! Single-threaded packet frames with producer-owned storage.
-//!
-//! A frame is a handle to a run of packet bytes that some producer owns: a DPDK packet buffer, a record in a shared-memory ring, a buffer in a pool. Every layer of switch hands received data and send buffers to application code as frames. Frames let each layer pass packet bytes on without copying them; a transport may still copy once when it sends or receives. Application code uses the two frame types; only libraries that manage packet memory create frames.
-//!
-//! [`OwnedFrame`] is the only handle to its bytes and dereferences to `&mut [u8]`. [`OwnedFrame::freeze`] turns it into an [`ImmutableFrame`], a shared, read-only handle whose `clone` copies no bytes. [`ImmutableFrame::try_own`] turns a shared frame back into an `OwnedFrame` when it is the last handle. `slice` (on both types) and [`OwnedFrame::truncate`] narrow a frame without copying. When the last handle is dropped, the producer's [`Release`] function runs on the dropping thread and the memory goes back to the producer.
-//!
-//! Each frame is 32 bytes, aligned to eight bytes: a data pointer, a u32 length, a u32 offset back to its u16 reference count, a release function, and context. The count must precede the data in the same allocation; slicing advances the data pointer and the offset together. The count is plain, not atomic: frames and their storage management stay on one thread. Neither frame type is `Send` or `Sync`. Cloning a frame that already has 65,535 live handles panics. Out-of-range `slice` and `truncate` panic; a frame consumed by a failed `slice` is still released.
-//!
-//! Producers create the first handle with the unsafe [`OwnedFrame::from_raw_parts`] and can take a reference back without releasing it through `into_raw_parts`. Several producers exist (the Stack, switch-net's junction-backend send pool, junction's receive ring), so this crate names none of them and leaves storage release to the producer's function.
-//!
-//! See the switch book, chapter "switch-frame: packet-buffer handles".
+//! The two handles to packet bytes, [`OwnedFrame`] and [`ImmutableFrame`]. Every layer of
+//! switch hands received data and send buffers to applications as frames, which reach them as
+//! `switch::net::OwnedFrame` and `switch::net::ImmutableFrame`. Libraries that manage packet
+//! memory create frames over it with [`OwnedFrame::from_raw_parts`].
 
 #![no_std]
 
@@ -17,10 +10,16 @@ use core::mem::{ManuallyDrop, align_of, size_of};
 use core::ops::{Deref, DerefMut, Range};
 use core::ptr::NonNull;
 
-/// Called once, on the last release. `rc` points at the frame's refcount (still 1).
+/// A producer's function that takes frame storage back.
+///
+/// Called exactly once, on the thread that drops the last handle, inside that `drop`. `rc`
+/// points at the frame's count, still 1; `ctx` is the value given to
+/// [`OwnedFrame::from_raw_parts`].
 pub type Release = unsafe extern "C" fn(rc: NonNull<u16>, ctx: *mut ());
 
-/// One transferred reference to producer-owned frame storage.
+/// One reference to frame storage, taken out of a frame by `into_raw_parts` without changing
+/// the count. Whoever holds the `RawParts` that carries the last reference finishes it by
+/// calling `release(rc, ctx)`.
 pub struct RawParts {
     pub data: NonNull<u8>,
     pub len: u32,
@@ -84,12 +83,37 @@ impl Drop for RawFrame {
     }
 }
 
-/// An exclusively owned, mutable packet frame.
+/// The only handle to a run of packet bytes; dereferences to `&[u8]` and `&mut [u8]`.
+///
+/// A frame is a handle to bytes that a producer owns: a network card's packet buffer, a
+/// record in a shared-memory ring, a buffer in a pool. Holding any handle to the bytes keeps
+/// them in use. When the last handle is dropped, the producer's [`Release`] function runs on
+/// the dropping thread and the bytes go back to the producer. A frame stays valid after the
+/// socket, network or session it came from is gone.
+///
+/// ```text
+///                    freeze()
+///    OwnedFrame  ----------------->  ImmutableFrame  --clone()-->  ImmutableFrame
+///    (sole handle,                   (shared, read-only)            (same bytes)
+///     writable)   <-----------------
+///                    try_own()
+///                    Ok only when this is the last handle
+/// ```
+///
+/// Frames are single-threaded: neither frame type is `Send` or `Sync`, and the count of
+/// handles is a plain integer, not an atomic. To pass packet data to another thread, copy the
+/// bytes out.
 #[repr(transparent)]
 pub struct OwnedFrame(RawFrame);
 
 impl OwnedFrame {
-    /// Takes ownership of a producer's packet storage.
+    /// Creates the first handle to a producer's packet storage. For libraries that manage
+    /// packet memory.
+    ///
+    /// The count is a `u16` in the same allocation as the data, before it. Frames outlive the
+    /// objects that handed them out, so the producer keeps everything `release` uses alive
+    /// until the last handle is dropped; the usual way is to pass a counted reference
+    /// (`Rc::into_raw`) as `ctx` and take it back in `release`.
     ///
     /// # Safety
     /// `*rc == 1` and the count is owned by this frame. `rc` must be aligned for
@@ -117,18 +141,23 @@ impl OwnedFrame {
         })
     }
 
-    /// Shares this frame without changing its reference count.
+    /// Turns this into a shared, read-only handle, without copying or changing the count.
     pub fn freeze(self) -> ImmutableFrame {
         ImmutableFrame(self.0)
     }
 
-    /// Narrows the payload, panicking if the range is out of bounds.
+    /// Narrows the frame to `range` of its bytes, without copying.
+    ///
+    /// # Panics
+    /// Panics if `range.start > range.end` or `range.end` is past the end. The consumed frame
+    /// is still released.
     pub fn slice(mut self, range: Range<usize>) -> Self {
         self.0.slice(range);
         self
     }
 
-    /// Sets the length of producer-owned storage.
+    /// Sets the length of producer-owned storage, for example to append after the current end.
+    /// For libraries that manage packet memory.
     ///
     /// # Safety
     /// `data..data+len` is storage this frame owns; the producer knows its room.
@@ -138,23 +167,26 @@ impl OwnedFrame {
         self.0.len = len;
     }
 
-    /// Narrows the payload in place, keeping its start. Panics past the current length.
+    /// Shortens the frame to `len` bytes, keeping its start.
+    ///
+    /// # Panics
+    /// Panics if `len` is longer than the frame.
     pub fn truncate(&mut self, len: usize) {
         assert!(len <= self.0.len as usize);
         self.0.len = len as u32;
     }
 
-    /// The stored data pointer, retaining its allocation provenance.
+    /// The data pointer, with its original provenance. For producers.
     pub fn data_ptr(&self) -> NonNull<u8> {
         self.0.data
     }
 
-    /// The producer's context.
+    /// The `ctx` given to [`from_raw_parts`](Self::from_raw_parts). For producers.
     pub fn ctx(&self) -> *mut () {
         self.0.ctx
     }
 
-    /// Transfers this reference without changing the count.
+    /// Turns this handle into a [`RawParts`] without changing the count. For producers.
     pub fn into_raw_parts(self) -> RawParts {
         self.0.into_raw_parts()
     }
@@ -182,27 +214,32 @@ impl fmt::Debug for OwnedFrame {
     }
 }
 
-/// A possibly shared, immutable packet frame.
+/// A shared, read-only handle to packet bytes; dereferences to `&[u8]`. See [`OwnedFrame`].
+///
+/// `clone` copies no bytes: it adds one to the count kept beside the data. The bytes can have
+/// at most 65,535 live handles; the clone that would make one more panics and acquires
+/// nothing. A slice of a shared frame still counts as a handle to the original bytes.
 #[repr(transparent)]
 pub struct ImmutableFrame(RawFrame);
 
 impl ImmutableFrame {
-    /// The stored data pointer, retaining its allocation provenance.
+    /// The data pointer, with its original provenance. For producers.
     pub fn data_ptr(&self) -> NonNull<u8> {
         self.0.data
     }
 
-    /// The producer's context.
+    /// The `ctx` given to [`OwnedFrame::from_raw_parts`]. For producers.
     pub fn ctx(&self) -> *mut () {
         self.0.ctx
     }
 
-    /// Transfers this reference without changing the count.
+    /// Turns this handle into a [`RawParts`] without changing the count. For producers.
     pub fn into_raw_parts(self) -> RawParts {
         self.0.into_raw_parts()
     }
 
-    /// Recovers exclusive ownership only if this is the sole reference.
+    /// Returns the frame as an [`OwnedFrame`] when no other handle to its bytes is alive, a
+    /// clone or a slice anywhere included; gives it back as `Err` otherwise.
     pub fn try_own(self) -> Result<OwnedFrame, Self> {
         // SAFETY: the frame keeps the count alive and only this thread accesses it.
         if unsafe { self.0.rc().as_ptr().read() } == 1 {
@@ -212,7 +249,11 @@ impl ImmutableFrame {
         }
     }
 
-    /// Narrows the payload, panicking if the range is out of bounds.
+    /// Narrows the frame to `range` of its bytes, without copying.
+    ///
+    /// # Panics
+    /// Panics if `range.start > range.end` or `range.end` is past the end. The consumed frame
+    /// is still released.
     pub fn slice(mut self, range: Range<usize>) -> Self {
         self.0.slice(range);
         self

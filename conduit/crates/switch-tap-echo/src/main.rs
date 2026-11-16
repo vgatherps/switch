@@ -1,4 +1,15 @@
-//! The `switch-tap-echo` command; usage is in the library crate documentation.
+//! The `switch-tap-echo` command: a TCP echo server on port 8080 of the tap device `cdtap_echo`
+//! (switch at 192.0.2.2/24, kernel side 192.0.2.1), serving until a tester process exits. It is
+//! the target of the packetdrill scripts and the Scapy TCP fuzzer.
+//!
+//! ```text
+//! switch-tap-echo [--listeners N] [--buffer BYTES] [--close-after BYTES] -- <tester> [args...]
+//! ```
+//!
+//! Exit status: 0 the tester succeeded, 1 it failed, 2 packet buffers still held at port close,
+//! 3 an argument, setup, serve or teardown error, 101 a panic. It needs DPDK, `CAP_NET_ADMIN` and
+//! `/dev/net/tun`, and a process allowed on one CPU. Run it with no arguments for the full usage,
+//! the tester's environment variables included. See `docs/contributing/testing.md`.
 
 use std::ffi::OsString;
 use std::process;

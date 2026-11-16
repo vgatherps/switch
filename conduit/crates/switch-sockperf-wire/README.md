@@ -1,20 +1,9 @@
 # switch-sockperf-wire
 
-Message framing for the sockperf 3.10 wire format, with no dependencies and no DPDK. `switch-nic`'s `sockperf-server` mode uses it to answer kernel `sockperf` clients.
+The message format of sockperf 3.10, which `switch-nic sockperf-server` uses to answer kernel `sockperf` clients. It has no dependencies and does not use DPDK.
 
-Used by `switch-nic` only.
-
-## API (`sockperf` module)
-
-- `HEADER` (14 bytes) and `MAX_MESSAGE` (65507, the largest UDP payload).
-- `validate_udp(message)`: checks that a datagram is a whole message, i.e. at least a header and a length field (bytes 10..14, big endian) equal to the datagram length.
-- `reply(message)`: for a validated message, clears the reply-request bit and returns true when the flags ask for a reply (`flags & 7 == 3`); otherwise it changes nothing and returns false.
-- `Framer::new(max)`, `push(bytes, complete)`, `reset()`: splits a TCP byte stream into messages. `push` calls `complete` for each whole message in order and keeps only the trailing partial one. A length below `HEADER` or above `max` returns `Malformed`.
-
-## Test
+Its API reference is the crate's rustdoc (`make docs` at the repository root); the server is described in [docs/operations/switch-nic.md](../../../docs/operations/switch-nic.md#sockperf-server).
 
 ```sh
-cargo test -p switch-sockperf-wire
+cargo test --locked -p switch-sockperf-wire   # no DPDK; also run by make -C conduit test-switch-nic
 ```
-
-Plain cargo, no DPDK. `make test-switch-nic` also runs these tests.

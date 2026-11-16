@@ -4,7 +4,10 @@ use std::ptr;
 
 use crate::system;
 
-/// A shared mapping with a requested usable length and page-rounded ownership.
+/// Part of a [`Backing`](crate::Backing) mapped into this process. Unmapped on drop.
+///
+/// The crate does not synchronize, initialize or interpret the bytes: the caller owns that,
+/// and the lifetime of anything derived from [`as_ptr`](Self::as_ptr).
 pub struct Mapping {
     ptr: *mut u8,
     len: usize,
@@ -12,10 +15,17 @@ pub struct Mapping {
 }
 
 impl Mapping {
+    /// Maps `len` bytes of the backing at `offset`, readable and writable.
+    ///
+    /// Fails with `InvalidInput` when `len` is 0, `offset` is not a multiple of the backing's
+    /// [page size](crate::Backing::page_size), or the range runs past the end of the backing.
+    /// `len` need not be a page multiple; the mapping covers whole pages.
     pub fn new(fd: BorrowedFd<'_>, offset: usize, len: usize) -> io::Result<Self> {
         Self::map(fd, offset, len, libc::PROT_READ | libc::PROT_WRITE)
     }
 
+    /// Maps `len` bytes of the backing at `offset`, read-only, with the same rules as
+    /// [`new`](Self::new).
     pub fn read_only(fd: BorrowedFd<'_>, offset: usize, len: usize) -> io::Result<Self> {
         Self::map(fd, offset, len, libc::PROT_READ)
     }
@@ -45,17 +55,20 @@ impl Mapping {
         })
     }
 
+    /// The first mapped byte.
     #[inline]
     pub fn as_ptr(&self) -> *mut u8 {
         self.ptr
     }
 
+    /// The `len` the mapping was made with.
     #[inline]
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.len
     }
 
+    /// Asks the kernel to keep the mapped pages in memory (`mlock`).
     pub fn lock(&self) -> io::Result<()> {
         lock(self.ptr, self.mapped_len)
     }
@@ -68,13 +81,29 @@ impl Drop for Mapping {
     }
 }
 
-/// Two adjacent aliases of the same file extent.
+/// The same part of a backing mapped twice, back to back, so a record that starts near the
+/// end of the first view continues into the second as one contiguous slice. Unmapped on drop.
+///
+/// ```text
+///  backing:                 [ A A A A B B B B ]        len bytes
+///
+///  address space:  as_ptr()            as_ptr()+len          as_ptr()+2*len
+///                   | first view        | second view (same bytes)
+///                   [ A A A A B B B B ][ A A A A B B B B ]
+/// ```
+///
+/// A write through either view is visible through the other.
 pub struct DoubleMapping {
     region: Region,
     len: usize,
 }
 
 impl DoubleMapping {
+    /// Maps `len` bytes of the backing at `offset` twice, back to back, readable and writable.
+    ///
+    /// `len` must be a multiple of the backing's [page size](crate::Backing::page_size), and the
+    /// rules of [`Mapping::new`] apply; violations fail with `InvalidInput`. On Linux,
+    /// `populate` faults every page in while mapping; elsewhere it has no effect.
     pub fn new(fd: BorrowedFd<'_>, offset: usize, len: usize, populate: bool) -> io::Result<Self> {
         let page = system::page_size(fd)?;
         let offset = checked_extent(fd, offset, len, page)?;
@@ -144,11 +173,13 @@ impl DoubleMapping {
         })
     }
 
+    /// The start of the first view.
     #[inline]
     pub fn as_ptr(&self) -> *mut u8 {
         self.region.ptr
     }
 
+    /// The length of one view.
     #[inline]
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {

@@ -1,12 +1,40 @@
-//! Packet-send records carried by a session's cephalopod stream.
+//! The send records a session commits to the send ring.
+//!
+//! Each send is one record in the send ring. A send-ring record has a 32-byte header that
+//! carries, at offsets 0, 8, 16 and 24, the commit tag, the length of the rest of the record, the session's
+//! stream id ([`Welcome::stream`](crate::control::Welcome::stream)) and a sequence number
+//! that counts from 0 for each session. The record's payload starts with a send header,
+//! followed directly by the data:
+//!
+//! ```text
+//!  TCP send, 16-byte header          UDP send, 24-byte header
+//!  offset size field                 offset size field
+//!  0      1    kind = 16             0      1    kind = 17
+//!  1      3    zero                  1      3    zero
+//!  4      4    slot (u32)            4      4    slot (u32)
+//!  8      4    generation (u32)      8      4    generation (u32)
+//!  12     4    zero                  12     4    zero
+//!  16     ...  payload               16     4    destination address
+//!                                    20     2    destination port (u16)
+//!                                    22     2    zero
+//!                                    24     ...  payload
+//! ```
+//!
+//! Integers are little-endian; the address is in network order. Header and data together are
+//! at most [`Welcome::max_record`](crate::control::Welcome::max_record) bytes, so a TCP
+//! payload is at most `max_record - 16` bytes and a UDP payload `max_record - 24`. The session
+//! ends its stream with an empty record whose sequence number has bit 63 set.
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use crate::control::SocketId;
 
+/// Length of the TCP send header.
 pub const TCP_SEND_HEADER: usize = 16;
+/// Length of the UDP send header.
 pub const UDP_SEND_HEADER: usize = 24;
 
+/// A decoded send record, borrowing its payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendRecord<'a> {
     Tcp {
@@ -20,7 +48,8 @@ pub enum SendRecord<'a> {
     },
 }
 
-/// Decodes a little-endian send record, rejecting unknown kinds and reserved bits.
+/// Decodes one send record. Returns `None` for an unknown kind, a record shorter than its
+/// header, or nonzero reserved bytes.
 pub fn decode(record: &[u8]) -> Option<SendRecord<'_>> {
     if record.len() < TCP_SEND_HEADER || record[1..4] != [0; 3] || record[12..16] != [0; 4] {
         return None;

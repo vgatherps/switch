@@ -13,55 +13,121 @@ use switch_dpdk_sys::{only_allowed_cpu, AffinityError};
 use crate::offloads::{self, OffloadPlan};
 use crate::{adjusted_descriptors, port_config, wait_link, Link, Sizing};
 
+/// What a successful [`open`] returns.
 pub struct Opened {
+    /// The running Stack, ready for sockets. Its start time is the first value `open` read
+    /// from the clock; every later drive call must take its time from the same clock.
     pub stack: Stack,
+    /// DPDK's process setup. Keep it alive until the port is closed: the port and every
+    /// packet buffer depend on it. Dropping it does nothing, and DPDK is never torn down.
     pub eal: Eal,
+    /// What was opened, for printing.
     pub report: OpenReport,
 }
 
+/// Why [`open`] failed: one variant per step, in the order the steps run.
+///
+/// `Display` prints a short phrase naming the step, then the cause.
+///
+/// | Variant | Step | `Display` starts with | Carries |
+/// |---|---|---|---|
+/// | [`NotPinned`](Self::NotPinned) | check the thread may run on exactly one CPU | `CPU affinity:` | nothing |
+/// | [`HelperAffinity`](Self::HelperAffinity) | place DPDK's helper threads | `EAL helper CPU affinity:` | nothing |
+/// | [`Eal`](Self::Eal) | start DPDK | `EAL initialization:` | nothing |
+/// | [`EalAffinityRestore`](Self::EalAffinityRestore) | start DPDK, then restore affinity | `EAL initialization:` | nothing |
+/// | [`DeviceNotFound`](Self::DeviceNotFound) | find the device | `device lookup:` | nothing |
+/// | [`DeviceInfo`](Self::DeviceInfo) | read the device's capabilities | `device information:` | nothing |
+/// | [`MacMismatch`](Self::MacMismatch) | compare a PCI card's MAC with the config | `device MAC:` | nothing |
+/// | [`Descriptors`](Self::Descriptors) | let the driver adjust the ring sizes | `descriptor adjustment:` | nothing |
+/// | [`PortConfig`](Self::PortConfig) | size the pools | `port configuration:` | nothing |
+/// | [`PortOpen`](Self::PortOpen) | open the NIC port | `port open:` | a retained `Port`, if any |
+/// | [`Link`](Self::Link) | read the link state | `link query:` | the `Port` |
+/// | [`LinkDown`](Self::LinkDown) | wait up to 10 s for the link | `link wait:` | the `Port` |
+/// | [`Seed`](Self::Seed) | read a random seed | `stack random seed:` | the `Port` |
+/// | [`Stack`](Self::Stack) | build the Stack | `Stack::new:` | the `Port` |
+/// | [`GatewayUnresolved`](Self::GatewayUnresolved) | resolve the gateway by ARP, up to 3 s | `gateway` | the `Stack` |
+/// | [`Receive`](Self::Receive) | resolve the gateway by ARP | `gateway receive:` | the `Stack` |
+///
+/// From `PortOpen` on, the port exists. Dropping the carried `Port` or `Stack` stops and
+/// closes the device, reporting a failure only on stderr. To see the result, close it with
+/// [`Port::try_close`](dpdk_smoltcp::Port::try_close) (for a `Stack`, after
+/// [`Stack::into_port`](dpdk_smoltcp::Stack::into_port)); it reports buffers still held
+/// as [`PortError::OutstandingBuffers`](dpdk_smoltcp::PortError::OutstandingBuffers).
 pub enum OpenError {
+    /// The calling thread may run on more or fewer than one CPU. Start the process with
+    /// `taskset -c N`, or a container with `--cpuset-cpus=N`.
     NotPinned(AffinityError),
+    /// DPDK's start-up failed. DPDK starts once per process: a second `open` in the same
+    /// process fails here with `errno` `EALREADY`.
     Eal(EalError),
+    /// Placing DPDK's helper threads failed: `helper_cpus` is empty or names a CPU at or
+    /// above `CPU_SETSIZE`; a named CPU is outside the process's cpuset
+    /// (`EAL helper CPUs are outside the effective cpuset`); `helper_cpus` is `Some` on a
+    /// system other than Linux; `/sys/devices/system/cpu/isolated` or `online` could not be
+    /// read or parsed; or setting the thread's affinity failed.
     HelperAffinity(std::io::Error),
+    /// DPDK's start-up failed (`error`) and restoring the thread to its one CPU failed too
+    /// (`restore`).
     EalAffinityRestore {
         error: EalError,
         restore: std::io::Error,
     },
+    /// No DPDK port has the config's PCI address or vdev name.
     DeviceNotFound {
+        /// The PCI address, or the vdev name (the vdev string before its first comma).
         name: String,
     },
+    /// The driver did not report the device's capabilities or MAC address.
     DeviceInfo(PortError),
+    /// The PCI card's MAC differs from the config's `mac`: the file was written for another
+    /// card. Not checked for a vdev.
     MacMismatch {
         config: EthernetAddress,
         device: EthernetAddress,
     },
+    /// The driver refused to adjust the descriptor counts (`rte_eth_dev_adjust_nb_rx_tx_desc`
+    /// and its return code).
     Descriptors(String),
+    /// A pool size does not fit DPDK's types: a pool count above `u32`, or an MTU so large
+    /// that a buffer's data room exceeds `u16` (`pool data room exceeds u16`).
     PortConfig(String),
+    /// Opening the NIC port failed. An offload the driver lacks fails here, naming it, for
+    /// example `InvalidSettings("PMD lacks the requested TX TCP checksum offload")`.
     // The Port, Stack and failed-open payloads are boxed: an error does not carry them inline.
     PortOpen(Box<PortOpenError>),
+    /// Reading the link state failed.
     Link {
         port_id: u16,
         port: Box<Port>,
+        /// The DPDK call and its return code.
         error: String,
     },
+    /// The link was still down after ten seconds.
     LinkDown {
         port_id: u16,
         port: Box<Port>,
+        /// The last link state the driver reported.
         link: Link,
     },
+    /// Reading the Stack's random seed from `/dev/urandom` failed.
     Seed {
         port: Box<Port>,
         error: std::io::Error,
     },
+    /// [`Stack::new`](dpdk_smoltcp::Stack::new) refused: a zero [`Sizing`] field, a clock
+    /// that returned a time before zero, an MTU below 88, or a pool below its reserve.
     Stack {
         port: Box<Port>,
         error: StackError,
     },
+    /// The gateway did not answer ARP within three seconds, measured by the caller's clock.
+    /// `Display`: `gateway <ip> unresolved after <waited>`.
     GatewayUnresolved {
         stack: Box<Stack>,
         gateway: Ipv4Address,
         waited: Duration,
     },
+    /// A receive step failed while waiting for the gateway's ARP reply.
     Receive {
         stack: Box<Stack>,
         error: StackError,
@@ -171,16 +237,34 @@ impl fmt::Display for OpenError {
 
 impl std::error::Error for OpenError {}
 
+/// What [`open`] found and chose.
+///
+/// `Display` prints one `key: value` line per fact, in this order: `driver`, `mac`, `cpu`,
+/// `port_id`, `rx_offload_capa`, `tx_offload_capa`, `max_rx_pktlen`, `min_mtu`, `max_mtu`,
+/// `descriptors: rx=N tx=N`, `rx_pool_count`, `tx_pool_count`, the offload lines of
+/// [`OffloadPlan`]'s `Display`, `link_speed_mbps`, `link_duplex` (`full` or `half`),
+/// `link_status` (`up`), and `gateway: <ip> at <mac> after <n> ms` or `gateway: none`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenReport {
+    /// The one CPU the calling thread may run on; DPDK's main thread runs there.
     pub cpu: usize,
+    /// DPDK's port id for the device, as [`read_clock`](dpdk_smoltcp::read_clock) takes it.
     pub port_id: u16,
+    /// What the driver reported: its name, offload capability bits, MTU range and MAC.
     pub device: DeviceInfo,
+    /// The offloads requested and why.
     pub offloads: OffloadPlan,
+    /// RX and TX descriptor counts after the driver's adjustment of the config's
+    /// `descriptors`.
     pub descriptors: (u16, u16),
+    /// Buffers in the RX pool (32767).
     pub rx_pool_count: u32,
+    /// Buffers in the TX pool. The frame pool's size is not reported.
     pub tx_pool_count: u32,
+    /// The link state when the wait ended.
     pub link: Link,
+    /// With a configured gateway: its address, its MAC, and how long ARP took on the
+    /// caller's clock. `None` without a gateway.
     pub gateway: Option<(Ipv4Address, EthernetAddress, Duration)>,
 }
 
@@ -232,12 +316,48 @@ impl fmt::Display for OpenReport {
     }
 }
 
-/// Initialize EAL and open the configured device as a running Stack.
+/// Start DPDK, open the device the config names, and return a running Stack on it.
 ///
-/// `helper_cpus` optionally supplies Linux EAL helper CPUs. The opener remains
-/// pinned to its original single CPU after initialization (also on EAL failure).
-/// `None` keeps the existing isolated-CPU housekeeping selection. An explicit
-/// set is unsupported on other platforms.
+/// Call it once per process, from the thread that will drive the Stack, with that thread
+/// already restricted to one CPU (`taskset -c N`, or `--cpuset-cpus=N` for a container).
+/// Resolve host names before calling it: name lookup goes through the kernel, which loses
+/// the interface of a real card once DPDK takes it.
+///
+/// `config` is the loaded network config file; `sizing` sizes the socket slots and pools
+/// (see [`Sizing`]).
+///
+/// `helper_cpus` says where DPDK's helper threads (interrupt and control work) may run.
+/// DPDK places them on the CPUs the starting thread may use, so `open` widens the thread's
+/// affinity while DPDK starts and restores the single CPU afterwards, also when DPDK fails:
+///
+/// - `None`: if the pinned CPU is listed in `/sys/devices/system/cpu/isolated`, the
+///   helpers may use every online CPU that is not isolated (Linux trims that to the
+///   container's cpuset). Otherwise, or with no such CPU available, they share the pinned
+///   CPU. Right for most programs.
+/// - `Some(cpus)`, Linux only: the helpers may use `cpus`. For a pinned CPU that is not
+///   isolated at boot, such as in a container given several CPUs. The list must be
+///   non-empty, every CPU below `CPU_SETSIZE` and inside the process's cpuset. A list
+///   holding only the pinned CPU behaves like `None`.
+///
+/// `clock` returns the Stack's time. `open` calls it for the Stack's start time and while
+/// it waits for the gateway; every later drive call must use the same clock, because the
+/// Stack refuses a time earlier than one it has seen.
+///
+/// The steps, each failing with its [`OpenError`] variant:
+///
+/// 1. Check the thread may run on exactly one CPU, the pinned CPU.
+/// 2. Start DPDK with `--lcores=0@<cpu> --file-prefix <eal.file_prefix> --no-telemetry`,
+///    then `-a <pci>[,<devargs>]` for a PCI card or `--no-pci --vdev <spec>` for a vdev,
+///    then `eal.extra`.
+/// 3. Find the device; for a PCI card, compare its MAC with `mac`. The Stack always uses
+///    the device's MAC.
+/// 4. Choose offloads (see [`offloads`](crate::offloads)), let the driver adjust the
+///    descriptor counts, size the pools and open the port.
+/// 5. Wait up to ten seconds of wall-clock time for the link, polling every 100 ms.
+/// 6. Build the Stack.
+/// 7. With a gateway in the config, send ARP for it and run receive steps until it
+///    answers or the clock shows three seconds since the start time. This loop spins, and
+///    it ends only when the clock advances: a clock that never moves never times out.
 ///
 /// # Safety
 /// The ethdev must be newly created, never configured or started, and under

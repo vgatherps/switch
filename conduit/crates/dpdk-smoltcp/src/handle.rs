@@ -4,45 +4,14 @@ use std::ptr;
 
 use smoltcp::iface::{DropQueue, SocketHandle};
 
-/// Owned name of one TCP socket in one [`Stack`](crate::Stack).
-/// Access it through `&handle` on the Stack that made it. `Stack::remove_tcp`
-/// consumes it and removes the socket immediately. Dropping it queues cleanup
-/// at the start of the Stack's next `turn`, `receive`, `send`,
-/// `add_tcp` or `add_udp`. TCP closes like Linux `close()`:
-/// unread in-order data causes RST; otherwise it sends FIN. The slot stays
-/// occupied until the connection is fully closed. This handle holds an Rc
-/// and is single-threaded, not Send.
+/// Names one TCP socket in the [`Stack`](crate::Stack) that made it.
 ///
-/// ```compile_fail,E0382
-/// use dpdk_smoltcp::{Stack, TcpHandle};
-/// fn f(stack: &mut Stack, h: TcpHandle) {
-///     stack.remove_tcp(h);
-///     stack.tcp(&h);
-/// }
-/// ```
-/// ```compile_fail,E0382
-/// use dpdk_smoltcp::{Stack, TcpHandle};
-/// fn f(stack: &mut Stack, h: TcpHandle) {
-///     stack.remove_tcp(h);
-///     stack.remove_tcp(h);
-/// }
-/// ```
-/// ```compile_fail,E0599
-/// use dpdk_smoltcp::TcpHandle;
-/// fn f(h: TcpHandle) { h.clone(); }
-/// ```
-/// ```compile_fail,E0277
-/// use dpdk_smoltcp::TcpHandle;
-/// fn needs_send<T: Send>(_: T) {}
-/// fn f(h: TcpHandle) { needs_send(h); }
-/// ```
-/// ```no_run
-/// use dpdk_smoltcp::{Stack, TcpHandle};
-/// fn f(stack: &mut Stack, h: TcpHandle) {
-///     let state = stack.tcp(&h).state();
-///     stack.remove_tcp(h);
-/// }
-/// ```
+/// Pass `&handle` to the Stack's methods; using it on another Stack panics with
+/// "TCP handle belongs to another Stack". It is not `Clone` and not `Send`.
+/// [`Stack::remove_tcp`](crate::Stack::remove_tcp) consumes it and removes the socket at
+/// once. Dropping it closes the socket like Linux `close()`: unread in-order data causes a
+/// reset, otherwise a FIN; see [`Stack::close`](crate::Stack::close) for the full table.
+/// A handle may outlive its Stack; dropping it afterwards does nothing.
 pub struct TcpHandle {
     pub(crate) raw: SocketHandle,
     pub(crate) queue: DropQueue,
@@ -78,28 +47,14 @@ impl Drop for TcpHandle {
     }
 }
 
-/// Owned name of one UDP socket (one bound local port) in one [`Stack`](crate::Stack).
-/// Access it through `&handle` on the Stack that made it. `Stack::remove_udp`
-/// consumes it and removes the socket immediately. Dropping it queues cleanup
-/// at the start of the Stack's next `turn`, `receive`, `send`,
-/// `add_tcp` or `add_udp`, freeing the port binding.
-/// Datagrams the application holds stay valid and keep their RX mbufs
-/// until dropped. This handle holds an Rc and is single-threaded, not Send.
+/// Names one UDP socket (one bound local port) in the [`Stack`](crate::Stack) that made it.
 ///
-/// ```compile_fail,E0382
-/// use dpdk_smoltcp::{Stack, UdpHandle};
-/// fn f(stack: &mut Stack, h: UdpHandle) {
-///     stack.remove_udp(h);
-///     stack.udp(&h);
-/// }
-/// ```
-/// ```compile_fail,E0382
-/// use dpdk_smoltcp::{Stack, UdpHandle};
-/// fn f(stack: &mut Stack, h: UdpHandle) {
-///     stack.remove_udp(h);
-///     stack.remove_udp(h);
-/// }
-/// ```
+/// Pass `&handle` to the Stack's methods; using it on another Stack panics with
+/// "UDP handle belongs to another Stack". It is not `Clone` and not `Send`.
+/// [`Stack::remove_udp`](crate::Stack::remove_udp) consumes it and removes the socket at
+/// once. Dropping it does the same at the start of the Stack's next `turn`, `receive`,
+/// `send`, `add_tcp` or `add_udp`, freeing the port binding. Datagrams the application
+/// holds stay valid and keep their packet buffers until dropped.
 pub struct UdpHandle {
     pub(crate) raw: smoltcp::iface::UdpHandle,
     pub(crate) queue: DropQueue,

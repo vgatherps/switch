@@ -18,9 +18,13 @@ use std::marker::PhantomData;
 
 pub(crate) use header::TaskHeader;
 
-/// A task function's packaged call, ready for [`crate::Spawner::spawn`].
+/// One call of a [`#[task]`](../switch/attr.task.html) function: its arguments, packaged for
+/// [`Spawner::spawn`](crate::Spawner::spawn) or
+/// [`Spawner::spawn_join`](crate::Spawner::spawn_join). Calling the function runs none of
+/// its code.
 ///
-/// Dropping an unspawned token drops only the arguments. Not `Send`, `Sync` or `Clone`.
+/// Dropping an unspawned token drops its arguments and nothing else. Not `Send`, `Sync` or
+/// `Clone`: it is spawned once, on the thread that made it.
 #[must_use = "a task does nothing until spawned"]
 pub struct SpawnToken<T> {
     payload: T,

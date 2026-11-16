@@ -14,15 +14,22 @@ use switch_dpdk_sys::*;
 use crate::eal::Eal;
 use crate::rx_pool::rx_low_mark;
 
-/// Static properties and MAC address reported by a DPDK ethdev.
+/// What a NIC driver reports about its device.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
+    /// DPDK's driver name, such as `net_ena` or `net_tap`.
     pub driver_name: String,
+    /// DPDK's `RTE_ETH_RX_OFFLOAD_*` capability bits.
     pub rx_capa: u64,
+    /// DPDK's `RTE_ETH_TX_OFFLOAD_*` capability bits.
     pub tx_capa: u64,
+    /// The smallest MTU the device accepts.
     pub min_mtu: u16,
+    /// The largest MTU the device accepts.
     pub max_mtu: u16,
+    /// The longest frame the device receives, in bytes.
     pub max_rx_pktlen: u32,
+    /// The device's MAC address.
     pub mac: [u8; 6],
 }
 
@@ -87,18 +94,31 @@ pub fn port_by_name(_eal: &Eal, name: &str) -> Option<u16> {
     (unsafe { rte_eth_dev_get_port_by_name(name.as_ptr(), &mut port_id) } == 0).then_some(port_id)
 }
 
+/// One NIC port's configuration for [`Port::open`]: one RX queue, one TX queue and three
+/// pools. Every buffer holds a whole packet; buffers are never chained.
 #[derive(Debug, Clone, Copy)]
 pub struct PortConfig<'a> {
+    /// DPDK's port id, from [`port_by_name`].
     pub port_id: u16,
+    /// The IP MTU. Inside the device's MTU range; [`Stack::new`](crate::Stack::new) needs
+    /// at least 88.
     pub mtu: u16,
+    /// Slots in the RX ring. Positive.
     pub rx_descriptors: u16,
+    /// Slots in the TX ring. Positive.
     pub tx_descriptors: u16,
-    /// Maximum packets requested from the PMD per `rx_burst` call.
+    /// Maximum packets requested from the PMD per `rx_burst` call. Positive.
     pub rx_burst: u16,
-    /// Maximum packets offered to the PMD per `tx_burst` call.
+    /// Maximum packets offered to the PMD per `tx_burst` call. Positive.
     pub tx_burst: u16,
+    /// NUMA node for the queues; -1 for any.
     pub queue_socket: i32,
+    /// Received packets. Data room at least headroom + `(mtu + 26)` rounded up to a
+    /// multiple of 1024. [`Stack::new`](crate::Stack::new) refuses fewer than
+    /// [`rx_reserve`](crate::rx_reserve) mbufs.
     pub rx_pool: PoolConfig<'a>,
+    /// Packets the Stack builds. Data room at least headroom + `mtu + 14`.
+    /// `Stack::new` refuses fewer than [`tx_reserve`](crate::tx_reserve) mbufs.
     pub tx_pool: PoolConfig<'a>,
     /// The Stack's TX frame pool (`Stack::tx_frame`). Its data room must hold
     /// the frame like `tx_pool`'s; a frame's payload starts 42 bytes after the
@@ -200,27 +220,40 @@ impl Offloads {
     }
 }
 
+/// Why a port operation failed: the cause in [`PortOpenError`], the error from
+/// [`Port::try_close`], and the content of `StackError::Port`. `Display` prints the `Debug`
+/// form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortError {
+    /// Called on a thread other than the one that started EAL.
     OwnerMismatch {
         expected: u32,
         actual: u32,
     },
+    /// A setting the device or the rules refuse; the text says which: zero descriptors or
+    /// burst, an MTU outside the device's range, an offload the driver lacks (for example
+    /// `PMD lacks the requested RX timestamp offload`) or did not apply, a pool data room too
+    /// small for one packet.
     InvalidSettings(&'static str),
+    /// Creating the `"RX"`, `"TX"` or `"frame"` pool failed.
     Pool {
         direction: &'static str,
         error: PoolCreateError,
     },
+    /// The DPDK call `operation` returned `code`.
     Dpdk {
         operation: &'static str,
         code: i32,
     },
+    /// From `try_close`: the device is closed, but this many buffers from each pool are
+    /// still held. Drop them and call `try_close` again on the returned `Port`.
     OutstandingBuffers {
         rx: u32,
         tx: u32,
         frame: u32,
     },
-    /// Setup did not complete or cleanup has begun; no packet transfers.
+    /// Setup did not complete, cleanup has begun, or a reset recovery failed; no packet
+    /// transfers. Close the port.
     NotReady,
 }
 
@@ -232,10 +265,17 @@ impl fmt::Display for PortError {
 
 impl std::error::Error for PortError {}
 
+/// Why [`Port::open`] failed. `Display`: `port setup failed: <cause>`, then
+/// `; rollback failed: <error>` when there is one.
 #[derive(Debug)]
 pub struct PortOpenError {
+    /// What stopped the open. Errors found before the pools exist leave the device as it
+    /// was; after that, `open` undoes its setup.
     pub cause: PortError,
+    /// Set when undoing the setup failed too.
     pub rollback_error: Option<PortError>,
+    /// The half-open port when undoing failed. It still owns packet buffers: keep the
+    /// `Eal` alive and close it with [`Port::try_close`].
     pub retained: Option<Port>,
 }
 
@@ -892,8 +932,14 @@ impl Port {
         Ok(())
     }
 
-    /// Stop/close and release backing, or return the same owner for cleanup.
-    /// A released-ID close failure permanently retains backing resources.
+    /// Stop and close the device, then free its pools once every buffer is back.
+    ///
+    /// `Ok(())` when all of that is done; only then remove a test device you created. On
+    /// failure the `Port` comes back with the error, usually
+    /// [`PortError::OutstandingBuffers`]: drop the frames still held and call again. The
+    /// port does no more network work either way. A `Port` dropped with buffers still out
+    /// keeps its pool memory for the rest of the process and prints one line to stderr.
+    /// A failed close of the device itself retains the pool memory permanently.
     // Teardown path; the error size does not matter.
     #[allow(clippy::result_large_err)]
     pub fn try_close(mut self) -> Result<(), (Self, PortError)> {

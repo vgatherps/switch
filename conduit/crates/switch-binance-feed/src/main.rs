@@ -1,4 +1,17 @@
-//! The `switch-binance-feed` binary; usage and exit statuses are in the library's crate docs.
+//! The `switch-binance-feed` command: runs [`switch_binance_feed::feed`] on the tap device
+//! `cdtap_echo` (switch at 192.0.2.2/24) behind a helper process, the tester, which gives the
+//! tap's kernel side 192.0.2.1 and NATs the feed's traffic out. It reads until the tester exits.
+//!
+//! ```text
+//! switch-binance-feed [--host HOST] [--port PORT] [--path PATH] [--print N] -- <tester> [args...]
+//! ```
+//!
+//! Defaults: host `stream.binance.com`, port 9443, path `/ws/btcusdt@bookTicker`, 10 updates
+//! printed; each option at most once. Exit status: 0 the tester exited 0; 1 the tester failed;
+//! 2 packet buffers still in use at port close; 3 bad arguments, setup, feed or teardown error;
+//! 101 panic. Statuses 2 and 3 take precedence over the tester's. Run it with no arguments for
+//! the full usage and the tester's contract. `make -C conduit docker-binance BINANCE_SECONDS=30`
+//! runs it live; the output lines are in `docs/operations/switch-nic.md` (section `feed`).
 
 use std::ffi::OsString;
 use std::fs;
