@@ -1,22 +1,24 @@
 //! switch-net against a raw network stack peer on `net_ring`; every future runs
 //! as a switch task.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::future::pending;
 use std::rc::Rc;
 
 use dpdk_smoltcp::TcpHandle;
 use dpdk_smoltcp::smoltcp::time::Duration;
+use dpdk_smoltcp::smoltcp::wire::{EthernetFrame, EthernetProtocol, Ipv4Packet, TcpPacket};
 use switch_net::tcp::State;
 use switch_net::{Error, IpEndpoint, StackError, TcpStream, TurnError};
 use switch_test_kit::pair::{BUDGET, pattern};
+use switch_test_kit::wire::Verdict;
 use switch_test_kit::with_eal;
 
 mod support;
 use support::{
     bind,
     cancel_after_one_poll, connect, counted, local, net_ip, peer_endpoint, peer_listen, peer_send, peer_udp_send,
-    tcp_config, udp_config, Mixed, LOCAL_PORT, PEER_PORT,
+    silent_syn, tcp_config, udp_config, Mixed, LOCAL_PORT, PEER_PORT, SILENT_MAC,
 };
 
 /// The peer's queued segments all acknowledged, then a reset from the peer
@@ -371,6 +373,47 @@ support::both_backends!(accept_survives_rst_in_syn_received_conduit, accept_surv
         let stream = mixed.wait(&slot).unwrap();
         mixed.until(|m| m.peer.tcp(&peer).state() == State::Established);
         assert_eq!(polls.get(), 2);
+        drop((stream, peer));
+        mixed.close();
+    })
+});
+
+// A peer sends a SYN and never answers the SYN-ACK. The Net retransmits it five times, then
+// the listener gives the handshake up and listens again: the accept keeps waiting and
+// resolves on the next connection.
+support::both_backends!(accept_survives_unanswered_syn_ack_conduit, accept_survives_unanswered_syn_ack_junction, |backend| {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["asua", "asub"], backend);
+        let synacks = Rc::new(Cell::new(0));
+        let counted_synacks = synacks.clone();
+        mixed.to_peer.impair(move |bytes| {
+            let eth = EthernetFrame::new_checked(bytes).unwrap();
+            if eth.dst_addr() == SILENT_MAC && eth.ethertype() == EthernetProtocol::Ipv4 {
+                let ip = Ipv4Packet::new_checked(eth.payload()).unwrap();
+                let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+                assert!(tcp.syn() && tcp.ack() && !tcp.rst(), "unexpected segment to the silent peer");
+                counted_synacks.set(counted_synacks.get() + 1);
+            }
+            Verdict::Deliver
+        });
+        let accepting = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
+        let slot = mixed.spawn(accepting);
+        mixed.turn();
+        silent_syn(&mut mixed, PEER_PORT);
+        mixed.turn();
+        mixed.to_peer.forward();
+        assert_eq!(synacks.get(), 1, "SYN-ACK");
+        let give_up = mixed.now + Duration::from_millis(18_900);
+        mixed.until(|m| m.now >= give_up);
+        mixed.rounds(5);
+        assert!(!slot.is_full(), "accept resolved on an unanswered handshake");
+        assert_eq!(synacks.get(), 6, "one SYN-ACK and five retransmissions");
+        let peer = mixed.peer.add_tcp(tcp_config()).unwrap();
+        mixed.peer.connect(&peer, IpEndpoint::new(net_ip().into(), LOCAL_PORT), PEER_PORT + 2).unwrap();
+        mixed.until(|m| matches!(m.peer.tcp(&peer).state(), State::Established | State::Closed));
+        assert_eq!(mixed.peer.tcp(&peer).state(), State::Established, "the listener refused the next SYN");
+        let stream = mixed.wait(&slot).unwrap();
+        assert_eq!(synacks.get(), 6);
         drop((stream, peer));
         mixed.close();
     })

@@ -935,6 +935,72 @@ fn index_follows_socket_lifecycle() {
     }
 }
 
+/// A passive open whose peer never answers the SYN-ACK is given up from the retransmit timer
+/// during egress: the old tuple leaves the flow index, the socket rejoins its listener chain
+/// ahead of the higher slot, the first peer's late ACK is answered with RST, and another
+/// peer's SYN reaches it.
+#[test]
+fn synack_give_up_rekeys_to_listener_chain() {
+    let (mut iface, mut sockets, mut device) = setup_eth();
+    let handles: Vec<_> = (0..2).map(|_| sockets.add(socket())).collect();
+    for &handle in &handles {
+        sockets.listen(handle, LOCAL_PORT).unwrap();
+    }
+    let local = IpEndpoint::new(LOCAL_ADDR.into(), LOCAL_PORT);
+    let remote = IpEndpoint::new(REMOTE_ADDR.into(), REMOTE_PORT);
+    receive(&mut iface, &mut sockets, &mut device, Instant::ZERO, segment(TcpControl::Syn, REMOTE_SEQ, None));
+    assert_eq!(sockets.get(handles[0]).state(), tcp::State::SynReceived);
+    let bytes = take_reply(&mut device);
+    let synack = reply(&bytes);
+    assert_control(&synack, LOCAL_PORT, TcpControl::Syn, Some(REMOTE_SEQ + 1));
+    let local_seq = synack.seq_number + 1;
+    assert_eq!((sockets.handle_at(0), sockets.handle_at(1)), (handles[0], handles[1]));
+    assert_eq!(sockets.tcp_exact_lookup(local, remote, true), Some(0));
+    assert_eq!(sockets.tcp_listener_lookup(local), Some(1));
+
+    for at in [300, 900, 2100, 4500, 9300] {
+        iface.poll(Instant::from_millis(at - 1), &mut device, &mut sockets);
+        assert!(device.tx_queue.is_empty());
+        iface.poll(Instant::from_millis(at), &mut device, &mut sockets);
+        let bytes = take_reply(&mut device);
+        let synack = reply(&bytes);
+        assert_control(&synack, LOCAL_PORT, TcpControl::Syn, Some(REMOTE_SEQ + 1));
+        assert_eq!(synack.seq_number + 1, local_seq);
+    }
+    let give_up = Instant::from_millis(18_900);
+    iface.poll(give_up - Duration::from_millis(1), &mut device, &mut sockets);
+    assert_eq!(sockets.get(handles[0]).state(), tcp::State::SynReceived);
+    iface.poll(give_up, &mut device, &mut sockets);
+    assert!(device.tx_queue.is_empty());
+    assert_eq!(sockets.get(handles[0]).state(), tcp::State::Listen);
+    assert_eq!(sockets.get(handles[0]).remote_endpoint(), None);
+    sockets.check_flow_index();
+    assert_eq!(sockets.tcp_exact_lookup(local, remote, true), None);
+    assert_eq!(sockets.tcp_listener_lookup(local), Some(0));
+    assert_eq!(iface.poll_at(give_up, &mut sockets), None);
+
+    assert_old_tuple_rst(&mut iface, &mut sockets, &mut device, give_up, REMOTE_SEQ + 1, local_seq);
+    assert_eq!(sockets.get(handles[0]).state(), tcp::State::Listen);
+    receive(
+        &mut iface,
+        &mut sockets,
+        &mut device,
+        give_up,
+        TcpRepr {
+            src_port: REMOTE_PORT + 1,
+            ..segment(TcpControl::Syn, REMOTE_SEQ, None)
+        },
+    );
+    assert_eq!(sockets.get(handles[0]).state(), tcp::State::SynReceived);
+    assert_eq!(sockets.get(handles[0]).remote_endpoint().unwrap().port, REMOTE_PORT + 1);
+    assert_eq!(sockets.get(handles[1]).state(), tcp::State::Listen);
+    let bytes = take_reply(&mut device);
+    let synack = reply(&bytes);
+    assert_eq!(synack.dst_port, REMOTE_PORT + 1);
+    assert_eq!(synack.control, TcpControl::Syn);
+    sockets.check_flow_index();
+}
+
 /// A listener bound to the SYN's destination address beats an all-IP listener on the port,
 /// in either slot order; then an exact tuple beats any listener.
 #[test]

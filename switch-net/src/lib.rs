@@ -805,9 +805,10 @@ impl NetHandle {
     /// all-IP listener (`addr: None`) on the port.
     ///
     /// A reset during the handshake returns the socket to listening and the future keeps
-    /// waiting. If the connection already closed when the future completes, it still resolves
-    /// to a stream: data the peer sent is readable, then `recv` reports the end, and
-    /// [`TcpTx::max_segment_payload`] is `None`.
+    /// waiting. A handshake the peer does not complete is given up after five SYN-ACK
+    /// retransmissions, and the socket listens again. If the connection already closed when
+    /// the future completes, it still resolves to a stream: data the peer sent is readable,
+    /// then `recv` reports the end, and [`TcpTx::max_segment_payload`] is `None`.
     ///
     /// Errors: `Unaddressable` for port 0, `SocketsFull`, `InvalidState`, and when sharing
     /// a card `InvalidConfig` and `HostLost`.

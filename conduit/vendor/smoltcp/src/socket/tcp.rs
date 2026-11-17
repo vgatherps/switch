@@ -353,6 +353,9 @@ const ACK_DELAY_DEFAULT: Duration = Duration::from_millis(10);
 const CLOSE_DELAY: Duration = Duration::from_millis(10_000);
 const ORPHAN_FIN_WAIT_2_TIMEOUT: Duration = Duration::from_secs(60);
 const ORPHAN_RETRIES: u32 = 8;
+/// SYN-ACK retransmissions before a passive open is given up and the socket listens again
+/// (Linux `tcp_synack_retries` default).
+const SYNACK_RETRIES: u32 = 5;
 /// Most frames one socket holds past its first gap; an out-of-order segment beyond them is
 /// refused. Each holds one frame of the shared RX pool, so this bounds what one peer pins.
 pub const MAX_OUT_OF_ORDER_VIEWS: usize = 1024;
@@ -1003,6 +1006,14 @@ impl<'a> Socket<'a> {
         } else {
             self.reset_protocol();
         }
+    }
+
+    /// Return a passive-open SYN-RECEIVED socket to LISTEN on its listen endpoint.
+    fn relisten(&mut self) {
+        let listen_endpoint = self.listen_endpoint;
+        self.reset();
+        self.listen_endpoint = listen_endpoint;
+        self.set_state(State::Listen);
     }
 
     fn reset_protocol(&mut self) {
@@ -1990,10 +2001,7 @@ impl<'a> Socket<'a> {
             if segment_start == window_start || at_peer_fin || at_sack_end {
                 tcp_trace!("received RST");
                 if self.state == State::SynReceived && self.listen_endpoint.port != 0 {
-                    let listen_endpoint = self.listen_endpoint;
-                    self.reset();
-                    self.listen_endpoint = listen_endpoint;
-                    self.set_state(State::Listen);
+                    self.relisten();
                 } else {
                     // Linux does not reset a TIME-WAIT connection; our own close came first.
                     self.reset_by_peer = self.state != State::TimeWait;
@@ -2921,6 +2929,14 @@ impl<'a> Socket<'a> {
             if let Timer::Retransmit { .. } = self.timer {
                 if (self.orphaned || self.retry_limited) && self.rto_backoff >= ORPHAN_RETRIES {
                     self.reset();
+                    return Ok(());
+                }
+                if self.state == State::SynReceived
+                    && self.listen_endpoint.port != 0
+                    && self.rto_backoff >= SYNACK_RETRIES
+                {
+                    tcp_trace!("passive open given up after {} SYN-ACK retransmissions", SYNACK_RETRIES);
+                    self.relisten();
                     return Ok(());
                 }
                 // If a retransmit timer expired, we should resend data starting at the last ACK.
@@ -5464,6 +5480,104 @@ mod test {
         let mut s = socket_established();
         s.limit_retries();
         check_failed_emit(s, false, true);
+    }
+
+    /// A listener takes a SYN and the peer never answers: the SYN-ACK goes out once and is
+    /// retransmitted `SYNACK_RETRIES` times at the 300 ms-based backoff deadlines, then the
+    /// socket listens again without sending anything. Returns the time of the give-up.
+    fn syn_received_given_up(s: &mut TestSocket) -> Instant {
+        s.socket.listen(LISTEN_END).unwrap();
+        let syn_ack = RECV_TEMPL.syn().seq(LOCAL_SEQ).ack(REMOTE_SEQ + 1).mss(BASE_MSS);
+        send(s, Instant::ZERO, &SEND_TEMPL.syn().seq(REMOTE_SEQ).no_ack());
+        recv(s, Instant::ZERO, |reply| assert_eq!(reply, Ok(syn_ack)));
+        let deadlines = [300, 900, 2100, 4500, 9300];
+        assert_eq!(deadlines.len() as u32, SYNACK_RETRIES);
+        for (expiry, at) in (1..).zip(deadlines) {
+            recv_nothing(s, Instant::from_millis(at - 1));
+            recv(s, Instant::from_millis(at), |reply| assert_eq!(reply, Ok(syn_ack)));
+            assert_eq!(s.rto_backoff, expiry);
+            assert_eq!(s.state(), State::SynReceived);
+            assert_eq!(s.remote_endpoint(), Some(REMOTE_END));
+        }
+        let give_up = Instant::from_millis(18_900);
+        assert_eq!(s.timer, Timer::Retransmit { expires_at: give_up });
+        recv_nothing(s, give_up - Duration::from_micros(1));
+        assert_eq!(s.state(), State::SynReceived);
+        recv_nothing(s, give_up);
+        assert_eq!(s.state(), State::Listen);
+        assert_eq!(s.listen_endpoint(), LISTEN_END);
+        assert_eq!(s.tuple, None);
+        assert_eq!(s.rto_backoff, 0);
+        assert!(s.timer.is_idle());
+        recv_nothing(s, give_up + Duration::from_secs(60));
+        give_up
+    }
+
+    #[test]
+    fn syn_received_gives_up_after_synack_retries_and_listens() {
+        let mut s = socket();
+        syn_received_given_up(&mut s);
+    }
+
+    #[test]
+    fn syn_received_give_up_then_other_peer_completes_handshake() {
+        let mut s = socket();
+        let t = syn_received_given_up(&mut s).total_millis() + 60_000;
+        let other = IpEndpoint { port: REMOTE_PORT + 1, ..REMOTE_END };
+        let syn = TcpRepr { src_port: other.port, ..SEND_TEMPL.syn().seq(REMOTE_SEQ).no_ack() };
+        send!(s, time t, syn);
+        assert_eq!(s.state(), State::SynReceived);
+        assert_eq!(s.remote_endpoint(), Some(other));
+        let syn_ack = TcpRepr {
+            dst_port: other.port,
+            ..RECV_TEMPL.syn().seq(LOCAL_SEQ).ack(REMOTE_SEQ + 1).mss(BASE_MSS)
+        };
+        recv!(s, time t, [syn_ack]);
+        // The new handshake starts from the initial RTO, not the abandoned one's backoff.
+        recv_nothing!(s, time t + 299);
+        recv!(s, time t + 300, [syn_ack]);
+        send!(s, time t + 310, TcpRepr {
+            src_port: other.port,
+            ..SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1)
+        });
+        assert_eq!(s.state(), State::Established);
+        assert_eq!(s.remote_endpoint(), Some(other));
+    }
+
+    #[test]
+    fn syn_received_give_up_then_late_ack_is_not_accepted() {
+        let mut s = socket();
+        let t = syn_received_given_up(&mut s) + Duration::from_secs(1);
+        s.cx.set_now(t);
+        let ack = SEND_TEMPL.seq(REMOTE_SEQ + 1).ack(LOCAL_SEQ + 1);
+        let ip_repr = IpReprIpvX(IpvXRepr {
+            src_addr: REMOTE_ADDR,
+            dst_addr: LOCAL_ADDR,
+            next_header: IpProtocol::Tcp,
+            payload_len: ack.buffer_len(),
+            hop_limit: 64,
+        });
+        // A listener refuses any segment carrying an ACK; the interface answers it with RST.
+        assert!(!s.socket.accepts(&mut s.cx, &ip_repr, &ack));
+        assert_eq!(s.state(), State::Listen);
+        assert_eq!(s.tuple, None);
+        recv_nothing(&mut s, t);
+    }
+
+    #[test]
+    fn syn_received_without_listen_endpoint_keeps_retransmitting() {
+        let mut s = socket_syn_received();
+        assert_eq!(s.listen_endpoint().port, 0);
+        let syn_ack = RECV_TEMPL.syn().seq(LOCAL_SEQ).ack(REMOTE_SEQ + 1).mss(BASE_MSS);
+        recv(&mut s, Instant::ZERO, |reply| assert_eq!(reply, Ok(syn_ack)));
+        for expiry in 1..=SYNACK_RETRIES + 3 {
+            let Timer::Retransmit { expires_at } = s.timer else { panic!("expected RTO") };
+            recv_nothing(&mut s, expires_at - Duration::from_micros(1));
+            recv(&mut s, expires_at, |reply| assert_eq!(reply, Ok(syn_ack)));
+            assert_eq!(s.rto_backoff, expiry);
+            assert_eq!(s.state(), State::SynReceived);
+            assert_eq!(s.remote_endpoint(), Some(REMOTE_END));
+        }
     }
 
     #[test]

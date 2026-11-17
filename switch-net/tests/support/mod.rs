@@ -10,12 +10,14 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 
-use dpdk_smoltcp::smoltcp::wire::Ipv4Cidr;
+use dpdk_smoltcp::smoltcp::wire::{
+    ArpOperation, EthernetAddress, Ipv4Address, Ipv4Cidr, TcpControl, TcpRepr, TcpSeqNumber,
+};
 use dpdk_smoltcp::{frame_reserve, rx_reserve, Eal, StackConfig};
 use switch_runtime::Runtime;
 use switch_net::{tcp, Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, Stack, TcpStream, UdpConfig};
 use switch_test_kit::pair::{self, assert_lossless, Side, BUDGET, T0};
-use switch_test_kit::ring_port::RingPort;
+use switch_test_kit::ring_port::{arp, RingPort};
 use switch_test_kit::wire::Link;
 
 #[path = "../../src/testkit/host.rs"]
@@ -322,6 +324,34 @@ pub fn connect_with(mixed: &mut Mixed, port: u16, config: tcp::Config) -> (TcpSt
 
 pub fn peer_send(mixed: &mut Mixed, peer: &dpdk_smoltcp::TcpHandle, data: &[u8]) {
     assert_eq!(mixed.peer.tcp_mut(peer).send_slice(data), Ok(data.len()));
+}
+
+/// An address in the Net's subnet with no host behind it.
+pub const SILENT_IP: Ipv4Address = Ipv4Address::new(10, 0, 0, 3);
+/// No Stack owns this MAC: the Net's frames to it reach the peer's port, whose Stack drops them.
+pub const SILENT_MAC: EthernetAddress = EthernetAddress([0x02, 0, 0, 0, 0, 0x0f]);
+
+/// Injects an ARP request that teaches the Net `SILENT_MAC` for `SILENT_IP`, then a SYN from
+/// `SILENT_IP:port` to the Net's `LOCAL_PORT`. Nothing ever answers the Net's replies.
+pub fn silent_syn(mixed: &mut Mixed, port: u16) {
+    let silent = (SILENT_MAC, SILENT_IP);
+    let request = arp(ArpOperation::Request, EthernetAddress::BROADCAST, silent, (EthernetAddress([0; 6]), net_ip()));
+    mixed.to_net.inject(&request);
+    let syn = TcpRepr {
+        src_port: port,
+        dst_port: LOCAL_PORT,
+        control: TcpControl::Syn,
+        seq_number: TcpSeqNumber(1000),
+        ack_number: None,
+        window_len: 64240,
+        window_scale: None,
+        max_seg_size: Some(1460),
+        sack_permitted: false,
+        sack_ranges: [None; 3],
+        timestamp: None,
+        payload: &[],
+    };
+    mixed.to_net.inject(&pair::tcp_frame_between(silent, (Side::A.mac(), net_ip()), &syn));
 }
 
 /// Peer sends `payload` to the Net's `port`, turning until the Net's MAC is resolved.
