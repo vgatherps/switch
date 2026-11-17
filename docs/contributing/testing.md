@@ -27,7 +27,7 @@ cargo test --locked -p switch-sockperf-wire
 cargo test --locked -p switch-test-support -p switch-test-support-macros
 ```
 
-`make miri` runs the runtime's library tests and its `oneshot_join` test under Miri, Rust's checker for undefined behavior, with both of its aliasing models, and the `switch-ws` library tests with the default model. It needs a nightly toolchain with Miri installed:
+`make miri` runs the runtime's library tests and its `oneshot_join` test under Miri with both of its aliasing models, and the `switch-ws` library tests with the default model. It needs a nightly toolchain with Miri installed:
 
 ```sh
 cargo +nightly miri test -p switch-runtime --lib --test oneshot_join
@@ -84,7 +84,7 @@ Inside the container, `make test` from `conduit/Makefile` runs these targets in 
 
 ## One target at a time
 
-A DPDK test process must be allowed on exactly one CPU; otherwise it panics at startup. Start a container on one CPU, here CPU 3, from the repository root:
+A DPDK test process panics at startup unless its CPU affinity mask contains exactly one CPU. Start a container on one CPU, here CPU 3, from the repository root:
 
 ```sh
 docker run --rm -it --init --cpuset-cpus=3 --cap-add NET_ADMIN --device /dev/net/tun \
@@ -133,7 +133,7 @@ cargo test --locked -p switch-junctiond --test process \
     explicit_control_cpu_keeps_every_helper_off_the_network_cpu -- --exact --test-threads=1
 ```
 
-The first starts DPDK in a child process with one CPU treated as isolated and checks that the helper threads stay off it; it needs two allowed CPUs, one of them not isolated by the kernel. The second starts the daemon with `--control-cpus 2` on CPU 0 and checks that its main thread may run only on CPU 0 and every other thread only on CPU 2; it needs CPUs 0 and 2 among the allowed CPUs.
+The first needs two allowed CPUs, one of them not isolated by the kernel. The second needs CPUs 0 and 2 among the allowed CPUs.
 
 ## CPUs, timeouts and parallel runs
 

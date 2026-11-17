@@ -17,7 +17,7 @@ switch-nic --config FILE <MODE> [MODE OPTIONS]
 cargo build --locked --release -p switch-nic
 ```
 
-Like every program that opens a card, it must be allowed on exactly one CPU ([CPUs](cpus.md)). Run it as root for a real card:
+Like every program that opens a card, it needs a CPU affinity mask of exactly one CPU ([CPUs](cpus.md)). Run it as root for a real card:
 
 ```sh
 sudo taskset -c 3 target/release/switch-nic --config /etc/switch/dut.json info 2>&1 | tee info.log

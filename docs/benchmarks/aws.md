@@ -40,7 +40,7 @@ Nothing is built on your machine.
    python3 switch-bench/aws/switch_aws_bench.py run --region eu-west-1
    ```
 
-   The runner logs each stage on a line starting `switch-aws-bench:`. Expect `run <id> start: provisioning hosts`, `hosts up: ...`, and, once every host is prepared and has built `switch-bench`, `code built: ...`. Preparing a host includes a reboot. Then each sweep runs in turn, with the coordinator's progress lines. A sweep whose coordinator exits nonzero, or whose placement check fails, is recorded as failed and the next sweep runs. An error the runner does not handle, such as an SSH command that times out while a sweep starts, ends the matrix there and goes straight to teardown. At the end the runner tears down, writes the report, and logs `run <id>: nothing left` and `run <id> end: success`, or `failed`.
+   The runner logs each stage on a line starting `switch-aws-bench:`. Expect `run <id> start: provisioning hosts`, `hosts up: ...`, and, once every host is prepared and has built `switch-bench`, `code built: ...`. Preparing a host includes a reboot. Then each sweep runs in turn, with the coordinator's progress lines. A sweep whose coordinator exits nonzero, or whose placement check fails, is recorded as failed and the next sweep runs. Any other error ends the run there and goes straight to teardown. At the end the runner tears down, writes the report, and logs `run <id>: nothing left` and `run <id> end: success`, or `failed`.
 
 The command exits 0 only when the report is complete, every fetch succeeded, no sweep failed and teardown verified that nothing is left.
 
@@ -61,11 +61,11 @@ The sweeps are fixed: UDP, TCP with `--budget-us 50` and without, and WebSocket 
 
 When sharing the card, the runner stops each daemon after its sweep and writes its exit status at the end of `<sweep>.<role>.switch-junctiond.log`. A nonzero status is logged but does not fail the sweep, so check those lines.
 
-When a process owns its card, the echo server and the generators also write the card's ENA allowance counters (`pps_allowance_exceeded`, `bw_in_allowance_exceeded`, `bw_out_allowance_exceeded`) and its reset count to their logs, as `ena_xstats` JSON lines at start and at close, with an `invalid` list naming any reset or counter that went backwards. The report does not read these lines, so a rising counter or a reset does not make it incomplete; check the logs before trusting a sweep's numbers.
+When a process owns its card, the echo server and the generators log the card's ENA allowance counters (`pps_allowance_exceeded`, `bw_in_allowance_exceeded`, `bw_out_allowance_exceeded`) and its reset count as `ena_xstats` JSON lines at start and at close, with an `invalid` list naming any reset or counter that went backwards. The report does not read these lines, so check the logs before trusting a sweep's numbers.
 
 ## INVALID sweeps
 
-A latency number from a host where something else ran on the measured CPU is not worth much. At the start of each sweep and near its end, the runner snapshots every userspace thread's allowed CPUs and the CPU it last ran on, and it counts interrupts between the two snapshots. The report marks a sweep INVALID when:
+The runner checks CPU placement at the start of each sweep and near its end, and counts interrupts in between. The report marks a sweep INVALID when:
 
 - the echo server, a generator or the daemon is not pinned to exactly its CPU;
 - any other thread of those processes, or any other process, may run on a CPU the benchmark uses (the application's `junction-ctl` thread may share `APP_CPU`);

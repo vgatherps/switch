@@ -1,12 +1,12 @@
 # Running on EC2
 
-On EC2 the data card is an ENA, Amazon's virtual network card, which DPDK drives with its `net_ena` driver. You can prepare the instance by hand, following [Preparing a Linux machine](host-setup.md) with the changes below, or run `deploy/hft-host.sh`, which does every step on Amazon Linux 2023.
+On EC2 the data card is an ENA, which DPDK drives with its `net_ena` driver. You can prepare the instance by hand, following [Preparing a Linux machine](host-setup.md) with the changes below, or run `deploy/hft-host.sh`, which does every step on Amazon Linux 2023.
 
 ## Before you log in
 
 Do these in the AWS console or CLI.
 
-1. Give the instance two network interfaces (ENIs). The primary one (device number 0) stays with Linux: it carries SSH and the instance metadata service and keeps the default route. The second ENI is for your program.
+1. Give the instance two network interfaces (ENIs). The primary one (device number 0) stays with Linux, carrying SSH and the instance metadata service and keeping the default route. The second ENI is for your program.
 2. AWS does not auto-assign a public IPv4 address when you launch with more than one network interface ([AWS: Manage the IPv4 addresses](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/working-with-ip-addresses.html)), so either attach the second ENI after launch or give the primary one an Elastic IP for SSH. If your program talks to the internet, attach an Elastic IP to the data ENI, or route its subnet through a NAT gateway; `switch-netconf discover --aws` warns when the data ENI has no public address.
 3. Allow your program's ports on the data ENI's security group, for example outbound TCP 9443 for the market-data feed of `switch-nic feed`.
 4. Choose an instance type with at least two physical cores on the data ENI's NUMA node plus one more CPU. The script isolates two cores and needs a CPU left for Linux.

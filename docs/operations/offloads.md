@@ -4,7 +4,7 @@ Both are set in the [network config file](config.md), decided when the card open
 
 ## Checksum offloads
 
-Without offloads, the program computes the checksums of every packet it sends and checks those of every packet it receives, on its own CPU. With them, the card does that work:
+With a checksum offload on, the card does this work instead of the program's CPU:
 
 | Setting | What the card does |
 |---|---|
@@ -24,7 +24,7 @@ or `"auto"`. If the driver does not offer an offload you requested explicitly, o
 port open: port setup failed: InvalidSettings("PMD lacks the requested TX TCP checksum offload")
 ```
 
-Turn that setting off and open again. A refused offload never falls back to the CPU silently.
+Turn that setting off and open again.
 
 ## What auto requests
 
@@ -38,7 +38,7 @@ Turn that setting off and open again. A refused offload never falls back to the 
 | `net_ixgbe` (Intel 82599, X5xx) | nothing | `ixgbe: off until verified on an Intel host`; `ixgbe: vector TX needs zero TX offloads` |
 | any other, including `net_tap` | nothing | `unknown driver <name>: none requested; set offloads explicitly` |
 
-The i40e and ixgbe drivers have a fast send path that works only with no send offloads, which is why `auto` leaves those off. For a driver not in the table, set the offloads explicitly if you want any.
+The i40e and ixgbe drivers' vector TX path works only with no send offloads, which is why `auto` leaves those off. For a driver not in the table, set the offloads explicitly if you want any.
 
 The report prints one line per offload, with the reason; with an explicit object the reason is `explicit`:
 

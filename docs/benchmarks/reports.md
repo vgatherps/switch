@@ -25,19 +25,17 @@ These rows come from the TCP sweep of the [smoke report](smoke-report/smoke-repo
 
 Each row is one step, sorted by offered rate.
 
-Offered pps is the rate the step scheduled, summed over the generators. Each sender's interval is rounded down to whole nanoseconds, so it can be slightly above the rate asked for. Sent pps is the number of messages the generators' network stacks accepted during the measurement window, divided by the window; it counts what the generator handed to its stack, not what left the card. Received pps counts echoes that arrived within the window.
+Offered pps is the rate the step scheduled, summed over the generators. Sent pps counts the messages the generators handed to their network stacks during the measurement window, not what left the card. Received pps counts echoes that arrived within the window.
 
-Not echoed % is the share of measured messages that had not come back when the drain ended. Messages that were due but never sent count as not echoed.
+Not echoed % is the share of measured messages that had not come back when the drain ended, including messages that were due but never sent.
 
-The latency columns (p50, p99, p99.9, max) are receive time minus scheduled send time, over every echoed measured message, from one histogram merged across all generators. A step with no echo at all shows `-` in these columns.
+The latency columns (p50, p99, p99.9, max) are receive time minus scheduled send time, over every echoed measured message of all generators. A step with no echo at all shows `-` in these columns.
 
-Service RTT is the round trip measured from the actual send time instead of the scheduled one, for TCP and WebSocket; UDP shows `-`. It includes every echo a generator received during the step: the warmup's, and, because each connection is kept for the whole sweep, late echoes of messages sent in an earlier step. When it is close to the latency, as in both rows above, messages left on time and the delay was in the network and the server.
+Service RTT is the round trip measured from the actual send time instead of the scheduled one, for TCP and WebSocket; UDP shows `-`. When it is close to the latency, as in both rows above, messages left on time and the delay was in the network and the server.
 
 Send lag is how late messages left compared with their schedule, merged across the generators. The step is sender-late when any one generator's own send lag p99 is above 20 µs, which the merged column can hide.
 
-The two packet columns divide the packets the generators' own ports sent by the messages they sent, and the packets received by the echoes. They count every packet on those ports, ACKs and ARP included, and say nothing about the server's card. In the second row each received packet carried more than one echo, so the ratio fell below 1. Generators that share a card through the daemon have no port of their own, and these columns show `-`.
-
-The second row is budget-bound: some messages waited because their connection already had its budget in flight, so part of that latency is the budget's.
+The two packet columns are the packets the generators' own ports sent per message and received per echo, ACKs and ARP included. A ratio below 1, as in the second row, means a packet carried more than one echo. Generators that share a card through the daemon show `-`.
 
 ## Flags
 
@@ -45,7 +43,7 @@ The second row is budget-bound: some messages waited because their connection al
 |---|---|
 | `-` | Nothing to note |
 | `SENDER-LATE` | A generator was behind schedule: its own send lag p99 was above 20 µs. The generator, not the server, set the limit, and the sweep stopped after this step |
-| `BUDGET-BOUND` | Some measured message waited because its connection already had its budget in flight (`--budget-us`) |
+| `BUDGET-BOUND` | Some measured message waited because its connection already had its budget in flight (`--budget-us`), so part of the latency is the budget's |
 | `NO ECHO` | No measured message came back |
 | `CARRYOVER` | Sweeps through the daemon (files named `junction-...`), TCP or WebSocket without a budget: a step after the first step with loss or the first sender-late step. The daemon may still hold queued work from earlier steps, so the row is not comparable with others |
 
@@ -74,10 +72,10 @@ When the results are incomplete, `report.md` starts with `# INCOMPLETE:` and the
 | `latency_ns` | `p50`, `p99`, `p999` and `max` of receive time minus scheduled send time; `null` when nothing was echoed |
 | `service_rtt_ns` | The same percentiles of echo time minus actual send time |
 | `send_lag_ns` | The same percentiles of actual minus scheduled send time |
-| `sent`, `echoed` | Messages sent over the whole step, warmup and the last batch after the window included, and how many of them were echoed by the end of the drain |
+| `sent`, `echoed` | Messages sent over the whole step, warmup included, and how many of them were echoed by the end of the drain |
 | `gen_tx_packets`, `gen_rx_packets` | Packets the generators' ports sent and received during the step; `null` when a generator shares a card through the daemon |
 | `budget_bound`, `generator_bound` | The `BUDGET-BOUND` and `SENDER-LATE` flags |
 | `baseline_rtt_ns`, `budget_per_connection` | With `--budget-us`: the first step's median service round trip, and each generator's budget per connection |
-| `workers` | Per generator: `behind_schedule`; `backlog_at_end`, messages due at the start of the first send batch to finish at or after the last message's scheduled time that the generator had not reached by that batch's end, not counting those owed by full or budget-bound connections; `stops`, send batches ended by a refusal for every sender; `last_send_ns` and `last_echo_ns`, its last send and last echo after its step start |
+| `workers` | Per generator: `behind_schedule`, and the diagnostic counters `backlog_at_end`, `stops`, `last_send_ns` and `last_echo_ns` |
 
 The last line is the summary: `steps`, `complete`, `generator_bound`, `behind_workers` (the generators behind schedule at the step that stopped the sweep) and `error`.

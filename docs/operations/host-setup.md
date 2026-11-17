@@ -4,7 +4,7 @@ These steps take a Linux machine with a spare network card to the point where a 
 
 The repository builds DPDK with drivers for Intel's E810 (`net_ice`), its 700 series such as the X710 (`net_i40e`), its 82599, X520, X540 and X550 (`net_ixgbe`), and Amazon's ENA (`net_ena`). Other cards need a DPDK built with their driver.
 
-When a program owns a card, Linux no longer sees it: the interface disappears from `ip link`, and SSH, DNS and package updates cannot use it. The machine therefore needs two interfaces. The management interface stays with Linux and keeps the default route. The data interface is the one your program takes.
+A card that a program owns is detached from Linux, so the machine needs two interfaces: a management interface, which stays with Linux and keeps the default route, and a data interface for your program.
 
 ```text
  1. pick the data interface                      once
@@ -26,7 +26,7 @@ To test two ports of one machine against each other, move the peer port into its
 
 ## 2. Reserve hugepages
 
-DPDK takes the packet buffers of a real card from hugepages, which must be reserved before the program starts. Reserve them on the NUMA node the card is attached to; the node number is in `/sys/class/net/<if>/device/numa_node`. For 1 GiB of 2 MiB pages on node `N`:
+Reserve hugepages for DPDK before the program starts, on the NUMA node the card is attached to; the node number is in `/sys/class/net/<if>/device/numa_node`. For 1 GiB of 2 MiB pages on node `N`:
 
 ```sh
 echo 512 | sudo tee /sys/devices/system/node/node<N>/hugepages/hugepages-2048kB/nr_hugepages
@@ -38,7 +38,7 @@ This lasts until the next reboot. To make it permanent, add `hugepagesz=2M hugep
 
 ## 3. Isolate a CPU
 
-The program's loop runs on one CPU at 100%. Pick a CPU on the card's NUMA node other than CPU 0, and keep the kernel's other work off it with these boot options, where `<iso>` is that CPU (and its hyperthread sibling) and `<housekeeping>` is every other CPU:
+The program busy-polls on one CPU. Pick a CPU on the card's NUMA node other than CPU 0 and isolate it with these boot options, where `<iso>` is that CPU (and its hyperthread sibling) and `<housekeeping>` is every other CPU:
 
 ```text
 isolcpus=managed_irq,domain,<iso> nohz_full=<iso> rcu_nocbs=<iso> irqaffinity=<housekeeping>
@@ -61,7 +61,7 @@ sudo systemctl disable --now irqbalance
 
 ## 4. IOMMU
 
-A PCI card is handed to a program through the `vfio-pci` kernel driver. With an IOMMU, the hardware limits which memory the card can reach. Turn it on in the firmware, and on Intel add `intel_iommu=on` to the boot options of step 3. Without one, binding needs `--noiommu` ([switch-netconf](switch-netconf.md#bind)).
+A PCI card is handed to a program through the `vfio-pci` kernel driver. Turn the IOMMU on in the firmware, and on Intel add `intel_iommu=on` to the boot options of step 3. Without an IOMMU, binding needs `--noiommu` ([switch-netconf](switch-netconf.md#bind)).
 
 ## 5. Build the tools
 
@@ -131,7 +131,7 @@ A successful bind ends with lines like:
 node0 hugepages-2048kB HugePages_Free: 512
 ```
 
-The binding does not survive a reboot; bind again after each boot. [switch-netconf](switch-netconf.md) lists every check `bind` makes.
+The binding does not survive a reboot; bind again after each boot. [Troubleshooting](troubleshooting.md#binding) lists what `bind` refuses.
 
 ## 7. Check with switch-nic info
 
@@ -173,4 +173,4 @@ It prints the report from opening the card, then the server's reply `tick`, then
 sudo switch-netconf unbind /etc/switch/dut.json
 ```
 
-This puts the card back on its kernel driver and prints whether the IPv4 address came back on the interface. It does not restore addresses or routes: hand the interface back to your network manager (`sudo nmcli device set ens5f0 managed yes`) for that. Remove the boot options to undo the isolation and the permanent hugepages.
+This puts the card back on its kernel driver and prints whether the IPv4 address came back on the interface. It does not restore addresses or routes, so hand the interface back to your network manager (`sudo nmcli device set ens5f0 managed yes`) for that. Remove the boot options to undo the isolation and the permanent hugepages.

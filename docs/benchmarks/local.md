@@ -22,7 +22,7 @@ The smoke run starts a whole benchmark in one Docker container: a switch echo se
    make -C conduit docker-bench-smoke BENCH_CPUSET=3-6
    ```
 
-   The target refuses to start if a running container shares those CPUs, or runs without a CPU limit, and prints `docker-bench-smoke needs BENCH_CPUSET (3-6) free of other containers.` Timed runs need their CPUs to themselves.
+   The target refuses to start if a running container shares those CPUs, or runs without a CPU limit, and prints `docker-bench-smoke needs BENCH_CPUSET (3-6) free of other containers.`
 
 3. Watch the output. The container builds `switch-bench` in release mode, then sweeps UDP, TCP and WebSocket in turn. After each sweep it prints `smoke:`, the protocol and that sweep's summary line, for example:
 
@@ -105,26 +105,11 @@ taskset -c $((first + 2 + i)) switch-bench gen --config gen$i.json --proto tcp \
     --target 10.10.0.2:7000 --senders 2 --size 64 --local-port 40000
 ```
 
-Each generator runs until the coordinator closes its standard input at the end of the sweep. The coordinator reports its progress on stderr (`processes up`, `processes synced`, `sweep start`, `sweep end`). The echo server runs until it gets SIGINT or SIGTERM.
-
-Each process reads its own [network config file](../operations/config.md). The one the script writes for the echo server is:
-
-```json
-{"version": 1, "device": {"vdev": "net_tap_dut,iface=cddut"}, "mac": null, "ipv4": "10.10.0.2/24",
- "gateway": "10.10.0.1", "mtu": 1500, "paths": [], "offloads": "auto", "rx_timestamps": false,
- "descriptors": 512, "eal": {"file_prefix": "dut", "extra": ["--no-huge", "-m", "512", "--no-shconf"]}}
-```
-
-Once the process has created the tap device, the script gives the kernel side its address:
-
-```sh
-ip address add 10.10.0.1/24 dev cddut
-ip link set cddut up
-```
+The coordinator reports its progress on stderr (`processes up`, `processes synced`, `sweep start`, `sweep end`). Each process reads its own [network config file](../operations/config.md), which the script writes for its tap device.
 
 ## Sharing a card through the daemon
 
-With `--backend junction`, `serve` and `gen` share a card through the daemon instead of owning one: they connect to a running [`switch-junctiond`](../operations/junctiond.md) through its control socket, so they take `--junction-socket` in place of `--config`. Start the daemon with its network thread on one CPU and its control thread elsewhere, then the echo server on a third CPU:
+With `--backend junction`, `serve` and `gen` share a card through a running [`switch-junctiond`](../operations/junctiond.md) and take `--junction-socket` in place of `--config`. Start the daemon with its network thread on one CPU and its control thread elsewhere, then the echo server on a third CPU:
 
 ```sh
 taskset -c 2 switch-junctiond --config jn0.json --dir /run/switch-junctiond --control-cpus 0 &
@@ -143,7 +128,7 @@ docker run --rm --init --cpuset-cpus=0,2 --cap-add NET_ADMIN --device /dev/net/t
     sh -c 'cargo build --locked -p switch-junctiond -p switch-bench --bins && sh switch-bench/local/junction-smoke.sh'
 ```
 
-It starts the daemon on a tap device, echoes UDP and TCP through `serve --backend junction` from kernel clients, and runs a short UDP step with `gen --backend junction`; each of these and the daemon must exit 0. It also starts TCP and WebSocket servers on port 0 and requires them to fail. It prints one line per check, such as `serve --backend junction udp: 16/16 echoes`.
+It starts the daemon on a tap device and checks `serve` and `gen` with `--backend junction`, printing one line per check, such as `serve --backend junction udp: 16/16 echoes`.
 
 ## Command reference
 
@@ -154,14 +139,14 @@ switch-bench serve [--backend conduit --config F | --backend junction --junction
                    --proto udp|tcp|ws --port P
 ```
 
-The echo server. `--backend conduit`, the default, owns the network card named in `--config`; `--backend junction` shares one through the daemon. For TCP and WebSocket it has room for 320 sockets and keeps up to 64 accepts waiting while sockets are free. It runs until SIGINT or SIGTERM.
+The echo server. `--backend conduit`, the default, owns the network card named in `--config`; `--backend junction` shares one through the daemon. For TCP and WebSocket it has room for 320 sockets. It runs until SIGINT or SIGTERM.
 
 ```text
 switch-bench gen [--backend conduit --config F | --backend junction --junction-socket PATH]
                  --proto udp|tcp|ws --target IP:PORT --senders N --size S [--local-port 40000]
 ```
 
-One generator. The coordinator starts it and drives it over its standard input and output; you do not run it by hand. `--target` is an IPv4 address and port. `--size` is the message size in bytes, at least 24; WebSocket messages are at most 1400. A TCP or UDP size larger than one packet buffer is not rejected: the generator panics when it sends. Each sender keeps its socket or connection for the whole sweep. Sender i uses local port `--local-port` + i.
+One generator. The coordinator starts it and drives it over its standard input and output; you do not run it by hand. `--target` is an IPv4 address and port. `--size` is the message size in bytes, at least 24; WebSocket messages are at most 1400. A TCP or UDP size larger than one packet buffer is not rejected, and the generator panics when it sends. Sender i uses local port `--local-port` + i.
 
 ```text
 switch-bench sweep --proto udp|tcp|ws --gens G --gen-cmd CMD --senders N
@@ -183,7 +168,7 @@ The coordinator. It does not open a network card.
 | `--drain-ms` | The time after the window during which echoes still count |
 | `--budget-us W` | TCP and WebSocket only: the [in-flight budget](README.md#the-in-flight-budget) |
 
-It exits 0 only when every step ran and no generator fell behind schedule. The sweep fails when a generator exits, when its clock is more than about 1 ms off the coordinator's, or when it does not reply in time: the coordinator waits for each generator's reply in turn, allowing each the 50 ms lead, warmup, window and drain plus 10 seconds. Then the coordinator kills every generator, and the summary line says `"complete": false` with the error. The steps already printed stay valid.
+It exits 0 only when every step ran and no generator fell behind schedule. The sweep fails when a generator exits, when its clock is more than about 1 ms off the coordinator's, or when it does not reply in time. The summary line then says `"complete": false` with the error, and the steps already printed stay valid.
 
 ```text
 switch-bench kernel-serve --proto udp|tcp|ws --bind IP --port P

@@ -1,6 +1,6 @@
 # switch-netconf
 
-`switch-netconf` writes and checks the [network config file](config.md), and moves a PCI card between its Linux driver and `vfio-pci`, the driver through which a DPDK program owns it.
+`switch-netconf` writes and checks the [network config file](config.md), and moves a PCI card between its Linux driver and `vfio-pci`.
 
 ```text
 switch-netconf check FILE
@@ -47,7 +47,7 @@ $ switch-netconf check /etc/switch/dut.json
 switch-netconf: /etc/switch/dut.json: gateway: gateway must be inside the IPv4 subnet
 ```
 
-[The network config file](config.md#checking-a-file) lists every message.
+[The network config file](config.md#checking-a-file) explains the messages.
 
 ## discover
 
@@ -96,7 +96,7 @@ With `--aws`, `discover` also asks the EC2 instance metadata service at `169.254
 - every path rule not labelled `vpc` or `default`;
 - `owned_ipv4`, except with `--aws`, which replaces it.
 
-For each key that changed it prints `changed: <key>` on stderr, and for `owned_ipv4` also one `owned_ipv4 removed: <cidr>` or `owned_ipv4 added: <cidr>` line per entry. The file is replaced in one step, so an interrupted update leaves either the complete old file or the complete new one. The `changed:` lines are printed after the new file is in place: if printing them fails, `discover` exits 1 with the new file already installed. So you can edit the keys you care about and run `discover -o` again whenever the machine's network changes.
+For each key that changed it prints `changed: <key>` on stderr, and for `owned_ipv4` also one `owned_ipv4 removed: <cidr>` or `owned_ipv4 added: <cidr>` line per entry. The file is replaced atomically. So you can edit the keys you care about and run `discover -o` again whenever the machine's network changes.
 
 ## bind
 
@@ -108,18 +108,7 @@ switch-netconf bind /etc/switch/dut.json              # the card has an IOMMU gr
 switch-netconf bind /etc/switch/dut.json --noiommu    # it has none
 ```
 
-Before it writes anything, `bind` checks that:
-
-1. it runs as root;
-2. the config describes a PCI card;
-3. the card at `pci` exists and has the config's `pci_id`;
-4. if the card is on its Linux driver, its MAC address is the config's `mac`;
-5. the card is on its Linux driver, on `vfio-pci`, or on no driver;
-6. while the card is on its Linux driver, the interface has no route except its own subnet's;
-7. every other device in the card's IOMMU group is on `vfio-pci` or on no driver, since `vfio-pci` takes a whole group;
-8. if the card has no IOMMU group, `--noiommu` was given.
-
-Each refusal is one line on stderr, exit 1, with nothing changed. [Troubleshooting](troubleshooting.md#binding) lists them.
+Before it writes anything, `bind` checks the config against the card, the interface's routes and the card's IOMMU group. Each refusal is one line on stderr, exit 1, with nothing changed. [Troubleshooting](troubleshooting.md#binding) lists them.
 
 `bind` then loads the `vfio-pci` module if needed and moves the card, printing each write as `write '<value>' > <path>`; a dry run prints the same lines prefixed with `dry-run: `. On success it prints the device node and the free hugepages on the card's NUMA node:
 
@@ -130,7 +119,7 @@ node0 hugepages-2048kB HugePages_Free: 512
 
 If a step fails after the card left its Linux driver, `bind` tries to give it back to that driver and reports the driver the card ended on. A card already on `vfio-pci` prints `0000:00:06.0 already bound to vfio-pci (...)` and exits 0, so running `bind` again finishes an interrupted run.
 
-`--noiommu` turns on the kernel's no-IOMMU mode for `vfio-pci`, which `bind` refuses to use without the flag when the card has no IOMMU group. Nothing then stops the card from writing to any memory, and the kernel marks itself tainted. It is the only way to bind a card that has no IOMMU group.
+`--noiommu` turns on the kernel's no-IOMMU mode for `vfio-pci`, which taints the kernel. It is the only way to bind a card that has no IOMMU group.
 
 ## unbind
 
@@ -144,4 +133,4 @@ switch-netconf unbind /etc/switch/dut.json
 0000:00:06.0 on ena; IPv4 10.0.1.23 is back on eth1
 ```
 
-It makes checks 1 to 5 of `bind` first. It does not restore addresses or routes: whatever manages the machine's network does that, or you do. A card already on its Linux driver prints `0000:00:06.0 already on ena` and exits 0.
+It first checks the config against the card, as `bind` does. It does not restore addresses or routes. A card already on its Linux driver prints `0000:00:06.0 already on ena` and exits 0.

@@ -1,12 +1,12 @@
 # The network config file
 
-A program that opens a card, `switch-nic` and `switch-junctiond` all read the same JSON file. It names the device, the IPv4 address the program uses, the gateway, packet sizes, offloads and a few DPDK settings. The file can have any name. For a real card these pages keep it at `/etc/switch/dut.json`, where `deploy/hft-host.sh` also writes it; the tap example is `examples/tap.json`. [switch-netconf](switch-netconf.md) writes it from a Linux interface and checks it. Programs load it with `switch::nic::Config::load`, which applies the same checks.
+A program that opens a card, `switch-nic` and `switch-junctiond` all read the same JSON file. For a real card these pages keep it at `/etc/switch/dut.json`, where `deploy/hft-host.sh` also writes it; the tap example is `examples/tap.json`. [switch-netconf](switch-netconf.md) writes it from a Linux interface and checks it, and programs load it with `switch::nic::Config::load`, which applies the same checks.
 
 Every key is required except `owned_ipv4`, and unknown keys are rejected.
 
 ## Examples
 
-A tap device is a virtual card that DPDK creates and that Linux sees as an ordinary interface, here `cdnic0`, so programs on the Linux side can be the peer. This is `examples/tap.json`:
+A tap device, `cdnic0`, as in `examples/tap.json`:
 
 ```json
 {
@@ -70,7 +70,7 @@ A PCI card is an object with six keys:
 
 Any other DPDK device is an object with one key, `vdev`, holding DPDK's device string. `"net_tap0,iface=cdnic0"` creates a tap device named `net_tap0` that Linux shows as `cdnic0`.
 
-`mac` is the card's Ethernet address, such as `"0a:12:34:56:78:9a"`. A PCI card requires it, and opening fails if the card reports a different address, which catches a file written for another card. A `vdev` requires `null`. The program always uses the address the device reports.
+`mac` is the card's Ethernet address, such as `"0a:12:34:56:78:9a"`. A PCI card requires it, and opening fails if the card reports a different address. A `vdev` requires `null`. The program always uses the address the device reports.
 
 ## Addresses
 
@@ -84,7 +84,7 @@ Any other DPDK device is an object with one key, `vdev`, holding DPDK's device s
 
 `mtu` is the largest IP packet the card sends, headers included, at least 88. It also sizes the packet buffers. 1500 is the usual Ethernet value; EC2 supports 9001 inside a VPC ([AWS: Network MTU for your EC2 instance](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/network_mtu.html)).
 
-The network toward a destination may carry less than the card: an EC2 internet gateway forwards packets of at most 1500 bytes, even when the VPC allows 9001. `paths` sets a limit per destination prefix:
+`paths` sets a path MTU per destination prefix, for a path that carries less than the card. An EC2 internet gateway, for example, forwards packets of at most 1500 bytes even when the VPC allows 9001:
 
 ```json
 "paths": [
@@ -93,7 +93,7 @@ The network toward a destination may carry less than the card: an EC2 internet g
 ]
 ```
 
-The limit toward a destination, its path MTU, is the `mtu` of the longest matching prefix, capped at the card's `mtu`. When `paths` has rules, the program's own subnet counts as one more rule at the card's `mtu`, unless a rule names that prefix. A destination that no rule matches, or any destination when `paths` is empty, gets the card's `mtu`.
+The path MTU toward a destination is the `mtu` of the longest matching prefix, capped at the card's `mtu`. When `paths` has rules, the program's own subnet counts as one more rule at the card's `mtu`, unless a rule names that prefix. A destination that no rule matches, or any destination when `paths` is empty, gets the card's `mtu`.
 
 TCP segments toward a destination carry at most the path MTU minus 40 bytes of data, and UDP datagrams at most the path MTU minus 28. The program does not fragment packets.
 
@@ -105,7 +105,7 @@ Each rule's `mtu` must be at least 88, no prefix may have host bits set or appea
 
 ## descriptors
 
-`descriptors` is the number of slots in each of the card's two rings, one for receiving and one for sending. It must be greater than 0. The driver may round it to a size the card supports; the report from opening the card shows the sizes used, as `descriptors: rx=1024 tx=1024`. `discover` writes 1024.
+`descriptors` is the size of each of the card's RX and TX descriptor rings. It must be greater than 0. The driver may round it to a size the card supports; the report from opening the card shows the sizes used, as `descriptors: rx=1024 tx=1024`. `discover` writes 1024.
 
 ## eal
 
@@ -124,22 +124,4 @@ DPDK's startup arguments. Opening the card starts DPDK with this command line, `
 
 ## Checking a file
 
-`switch-netconf check /etc/switch/dut.json` prints a summary and exits 0, or prints why the file is invalid and exits 1. Most messages name the key:
-
-| Key | Message |
-|---|---|
-| `version` | `version: must be 1` |
-| `device.pci`, `device.pci_id` | `device.pci: invalid PCI BDF`, `device.pci_id: invalid PCI ID` |
-| `device.kernel_driver`, `device.kernel_interface`, `device.vdev` | `<key>: must not be empty` |
-| `device` with a missing, extra or misspelled key | `data did not match any variant of untagged enum Device` |
-| `mac` | `mac: invalid MAC address`, `mac: PCI device requires a MAC address`, `mac: applies to PCI devices; use null for a vdev`, `mac: Ethernet address must be unicast` |
-| `ipv4` | `ipv4: invalid IPv4 CIDR`, `ipv4: IPv4 address must be unicast` |
-| `gateway` | `gateway: invalid IPv4 address`, `gateway: gateway must be unicast`, `gateway: gateway must be inside the IPv4 subnet`, `gateway: gateway must not be our IPv4 address`, `gateway: gateway must not be the subnet's network address`, `gateway: gateway must not be the subnet's broadcast address` |
-| `owned_ipv4[i]` | `owned_ipv4[i]: invalid IPv4 CIDR`, `owned_ipv4[i]: owned IPv4 prefix has host bits set`, `owned_ipv4[i]: owned IPv4 addresses must be unicast`, `owned_ipv4[i]: owned IPv4 addresses must not include the gateway`, `owned_ipv4[i]: owned IPv4 addresses must not include the subnet's broadcast address` |
-| `mtu`, `paths[i].mtu` | `<key>: must be at least 88 (48-byte minimum TCP MSS + 40 bytes of headers)` |
-| `paths[i].prefix` | `prefix: invalid IPv4 CIDR`, `paths[i].prefix: prefix must not have host bits set`, `paths[i].prefix: duplicate of paths[j]` |
-| `paths[i].why` | `paths[i].why: must not be empty` |
-| `offloads` | `offloads: offloads string must be auto` |
-| `descriptors` | `descriptors: must be > 0` |
-| `eal.file_prefix` | `eal.file_prefix: must not be empty` |
-| a missing or unknown key | ``missing field `descriptors` ``, ``unknown field `foo`, expected one of ...`` |
+`switch-netconf check /etc/switch/dut.json` prints a summary and exits 0, or prints why the file is invalid and exits 1. Most messages name the key and the rule it breaks, such as `mtu: must be at least 88 (48-byte minimum TCP MSS + 40 bytes of headers)` or `gateway: gateway must be inside the IPv4 subnet`. A `device` object with a missing, extra or misspelled key gives `data did not match any variant of untagged enum Device`, and a missing or unknown key elsewhere gives ``missing field `descriptors` `` or ``unknown field `foo`, expected one of ...``.

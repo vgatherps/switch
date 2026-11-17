@@ -1,8 +1,8 @@
 # Stack-to-stack throughput
 
-`switch-memif-bench` times the network stack alone. It runs two stacks in two processes and joins them with DPDK's memif device, a virtual network card whose two ends exchange packets through shared memory. There is no physical card and no kernel in the path, so the numbers are the cost of the stack and the loop that drives it, plus memif's copy of every packet into and out of shared memory on both sides.
+`switch-memif-bench` times the network stack alone. It runs two stacks in two processes joined by DPDK's memif device, with no physical card and no kernel in the path, so the numbers are the cost of the stack and the loop that drives it, plus memif's copy of every packet on both sides.
 
-One process is the peer, which echoes or discards what it receives. The other is the client, which sends the traffic and measures it. Each runs on its own CPU, and DPDK's helper threads of both processes share a third.
+The peer echoes or discards what it receives, and the client sends the traffic and measures it. Each runs on its own CPU, and DPDK's helper threads of both processes share a third.
 
 ## Running the matrix
 

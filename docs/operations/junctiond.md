@@ -1,6 +1,6 @@
 # switch-junctiond
 
-A card belongs to one process. `switch-junctiond` is a daemon that owns one card and lets several programs on the same machine use it: each program connects to the daemon through a socket in the daemon's directory instead of opening the card itself. The code a program needs for this is in the guide chapter Sharing a network card in the `switch` crate documentation (`make docs`).
+`switch-junctiond` is a daemon that owns one card and lets several programs on the same machine share it. Each program connects to the daemon through a socket in the daemon's directory instead of opening the card itself. The code a program needs for this is in the guide chapter Sharing a network card in the `switch` crate documentation (`make docs`).
 
 The daemon runs on Linux and needs DPDK. Build it from the repository root:
 
@@ -42,11 +42,11 @@ Every flag takes a value, as `--name value`. An unknown, repeated or valueless f
 | `--udp-sockets N` | `1024` | UDP sockets shared by all applications; 0 allowed. |
 | `--control-cpus LIST` | `0` | CPUs for the daemon's other threads and DPDK's, as a Linux CPU list such as `0,2-3`. |
 
-`--max-sockets` limits each application, `--tcp-sockets` and `--udp-sockets` the whole daemon: an application that asked for 100 sockets can still be refused a TCP socket when others hold all of `--tcp-sockets`.
+`--max-sockets` limits each application, `--tcp-sockets` and `--udp-sockets` the whole daemon, so an application that asked for 100 sockets can still be refused a TCP socket when others hold all of `--tcp-sockets`.
 
 ## CPUs
 
-The daemon's main thread becomes its network thread, which polls the card without pause. It must be allowed on exactly one CPU when the daemon starts, so start it under `taskset -c N`; otherwise it exits before opening anything. The daemon then moves its other threads, and DPDK's, onto `--control-cpus`, so they stay off the network CPU even when no CPU is isolated. Keep the network CPU out of `--control-cpus`; the daemon does not check this.
+The daemon's main thread becomes its network thread, which busy-polls the card. Its CPU affinity mask must contain exactly one CPU when the daemon starts, so start it under `taskset -c N`; otherwise it exits before opening anything. The daemon then moves its other threads, and DPDK's, onto `--control-cpus`, so they stay off the network CPU even when no CPU is isolated. Keep the network CPU out of `--control-cpus`; the daemon does not check this.
 
 Every CPU in `--control-cpus` must be available to the process: in Docker, inside `--cpuset-cpus`. A typical layout on four CPUs, with one application:
 
@@ -64,7 +64,7 @@ Only one daemon can use a directory; a second one exits with `--dir: /run/switch
 
 ## Knowing it is ready
 
-The daemon prints no ready message. It creates `control.sock` before it opens the card. An application that connects at that point waits in `Session::connect` until the daemon has opened the card and serves it, or fails if the daemon exits; connecting has no timeout of its own. So a script that starts applications waits until `control.sock` exists:
+The daemon prints no ready message. It creates `control.sock` before it opens the card, and an application that connects then waits in `Session::connect`, without a timeout, until the daemon serves it or exits. A script that starts applications waits until `control.sock` exists:
 
 ```sh
 until [ -S /run/switch-junctiond/control.sock ]; do sleep 0.1; done
@@ -76,7 +76,7 @@ A tap device's Linux interface appears only while the daemon opens the card, aft
 
 SIGINT or SIGTERM stops the daemon. It tells each connected application that it is shutting down, closes the card, removes `control.sock` and the shared-memory files, and exits with status 0. Connected applications lose their session; the guide chapter Sharing a network card describes what they see.
 
-If the daemon is killed with SIGKILL or crashes, it cannot tell anyone or clean up. Its files stay until the next daemon started on the directory removes them.
+After SIGKILL or a crash, its files stay until the next daemon started on the directory removes them.
 
 ## When it fails
 

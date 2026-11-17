@@ -12,9 +12,7 @@ switch-test-kit.workspace = true       # DPDK fixtures: fake ports, two-stack pa
 
 ## One thread for every DPDK test
 
-DPDK's per-process setup, EAL, starts once per process and belongs to the thread that started it; packet buffers and ports must be used from that thread. The standard test harness runs each test on a new thread, so only the first test could start EAL and the others would run on threads that do not own it.
-
-`#[switch_test_support::pinned_test]` replaces `#[test]` and runs the test body on one long-lived worker thread per test binary. The first body that needs EAL starts it on that thread, and every later body in the binary uses the same one. The harness still reports each test separately, and a panic in a body fails that test with its own message.
+DPDK's EAL starts once per process, and its packet buffers and ports must be used from the thread that started it, but the standard test harness runs each test on a new thread. `#[switch_test_support::pinned_test]` replaces `#[test]` and runs the test body on one long-lived worker thread per test binary, where the first body that needs EAL starts it. The harness still reports each test separately, and a panic in a body fails that test with its own message.
 
 ```rust
 use switch_test_kit::with_eal;
@@ -27,7 +25,7 @@ fn eal_belongs_to_the_test_worker() {
 }
 ```
 
-`with_eal` starts EAL the first time it is called and passes it to the closure. It starts with no PCI devices, no hugepages and 1 GiB of ordinary memory, with its main thread on the one CPU the process may use. That thread gets DPDK's thread number (lcore) 7 (`--lcores=7@<cpu>`), so the assertion above checks that the worker thread is the one that owns EAL. `with_eal` panics if the process may use more than one CPU, so run every DPDK test binary pinned to one CPU and with one test thread:
+`with_eal` starts EAL the first time it is called and passes it to the closure. EAL starts with no PCI devices, no hugepages and 1 GiB of ordinary memory, and its main thread is lcore 7, which the assertion above checks. `with_eal` panics if the process may use more than one CPU, so run every DPDK test binary pinned to one CPU and with one test thread:
 
 ```sh
 taskset -c 3 cargo test --locked -p dpdk-smoltcp -- --test-threads=1
@@ -57,7 +55,7 @@ Declare a fixture before the port it backs, so the port is dropped first, and ca
 
 ## Two stacks on a simulated wire
 
-Most stack tests need two endpoints. `pair::Pair` holds two real stacks, `a` and `b`, each on a `RingPort`, joined by two `wire::Link`s that copy every frame from one side's transmit ring to the other side's receive ring. Both stacks run on a clock the test advances itself, so nothing sleeps and a test runs the same way every time.
+`pair::Pair` holds two real stacks, `a` and `b`, each on a `RingPort`, joined by two `wire::Link`s. Both stacks run on a clock the test advances itself, so nothing sleeps and a test is deterministic.
 
 This test opens a TCP connection from `a` to `b`, sends four bytes, and drives the pair until `b` has them:
 
