@@ -2,8 +2,7 @@
 
 use switch_runtime::{SpawnError, Spawner};
 use switch_net::{
-    Accepting, Error, IpListenEndpoint, NetHandle, TcpStream, UdpConfig, UdpRx,
-    UdpTx, tcp,
+    Error, IpListenEndpoint, NetHandle, TcpListener, TcpStream, UdpConfig, UdpRx, UdpTx, tcp,
 };
 use switch_open::Sizing;
 
@@ -20,9 +19,9 @@ pub struct Args {
 }
 
 const UDP_QUEUE: usize = 4096;
-/// TCP: connections served at once, and accepts kept armed.
+/// TCP: connections served at once, and the listener's backlog.
 const MAX_CONNS: usize = 256;
-const ACCEPTS: usize = 64;
+const BACKLOG: usize = 64;
 
 pub fn run(args: &Args) -> Result<(), String> {
     let tcp_config = tcp::Config {
@@ -52,9 +51,9 @@ pub fn run(args: &Args) -> Result<(), String> {
         }
         Proto::Tcp | Proto::Ws => {
             let startup_error = std::rc::Rc::new(std::cell::RefCell::new(None));
-            spawn_accepts(
+            spawn_accept_loop(
                 &host.rt.spawner(), &handle, args.port, tcp_config,
-                args.proto == Proto::Ws, ACCEPTS, Some(startup_error.clone()),
+                args.proto == Proto::Ws, BACKLOG, Some(startup_error.clone()),
             )?;
             host.round()?;
             let error = startup_error.borrow_mut().take();
@@ -82,7 +81,7 @@ pub fn run(args: &Args) -> Result<(), String> {
 fn socket_slots(proto: Proto) -> usize {
     match proto {
         Proto::Udp => 1,
-        Proto::Tcp | Proto::Ws => MAX_CONNS + ACCEPTS,
+        Proto::Tcp | Proto::Ws => MAX_CONNS + BACKLOG,
     }
 }
 
@@ -157,59 +156,54 @@ async fn echo_datagrams(handle: NetHandle, mut rx: UdpRx, mut tx: UdpTx) {
     }
 }
 
-/// Keeps `count` accept tasks alive, retrying when socket slots are full.
-fn spawn_accepts(
+/// Opens a listener of `backlog` sockets on `port` and spawns its accept loop.
+fn spawn_accept_loop(
     spawner: &Spawner,
     handle: &NetHandle,
     port: u16,
     config: tcp::Config,
     ws: bool,
-    count: usize,
+    backlog: usize,
     startup_error: Option<std::rc::Rc<std::cell::RefCell<Option<Error>>>>,
 ) -> Result<(), String> {
     let local = IpListenEndpoint { addr: None, port };
-    for _ in 0..count {
-        let first = handle.tcp_accept(config, local);
-        spawner
-            .spawn(accept_loop(first, spawner.clone(), handle.clone(), local, config, ws, startup_error.clone()))
-            .map_err(spawn_error)?;
-    }
-    Ok(())
+    let listener = handle
+        .tcp_listen(config, local, backlog)
+        .map_err(|error| format!("tcp listen: {error:?}"))?;
+    spawner
+        .spawn(accept_loop(listener, spawner.clone(), handle.clone(), port, ws, startup_error))
+        .map_err(spawn_error)
 }
 
-/// One persistent accept: waits for `accepting`'s connection, hands it to its own echo task and
-/// listens again. While every socket slot is in use it retries each round, so it listens again
-/// once a connection closes.
+/// Hands each connection the listener accepts to its own echo task. While the listener has no
+/// socket left (every socket slot is in use) it retries each round.
 #[switch_runtime::task]
 async fn accept_loop(
-    mut accepting: Accepting,
+    mut listener: TcpListener,
     spawner: Spawner,
     handle: NetHandle,
-    local: IpListenEndpoint,
-    config: tcp::Config,
+    port: u16,
     ws: bool,
     startup_error: Option<std::rc::Rc<std::cell::RefCell<Option<Error>>>>,
 ) {
     loop {
-        let stream = match accepting.await {
+        let stream = match listener.accept().await {
             Ok(stream) => stream,
             Err(Error::SocketsFull) => {
                 switch_runtime::yield_now().await;
-                accepting = handle.tcp_accept(config, local);
                 continue;
             }
             Err(error) => {
                 if let Some(startup_error) = startup_error.as_ref() {
                     *startup_error.borrow_mut() = Some(error);
                 }
-                eprintln!("switch-bench serve: tcp accept on {}: {error:?}", local.port);
+                eprintln!("switch-bench serve: tcp accept on {port}: {error:?}");
                 return;
             }
         };
         if let Err(e) = spawner.spawn(serve_conn(handle.clone(), stream, ws)) {
             eprintln!("switch-bench serve: {}", spawn_error(e));
         }
-        accepting = handle.tcp_accept(config, local);
     }
 }
 
@@ -341,7 +335,7 @@ mod tests {
         let result = run(&Args { backend: Backend::Conduit(path), proto, port: 0 });
         std::fs::remove_dir_all(dir).unwrap();
         assert!(
-            matches!(&result, Err(error) if error.starts_with("tcp accept:")),
+            matches!(&result, Err(error) if error.starts_with("tcp listen:")),
             "invalid initial listen must return its error, got {result:?}",
         );
     }
@@ -392,7 +386,7 @@ mod tests {
         }
         let handle = host.net.handle();
         let spawner = host.rt.spawner();
-        spawn_accepts(&spawner, &handle, PORT, tcp_config, true, 1, None).unwrap();
+        spawn_accept_loop(&spawner, &handle, PORT, tcp_config, true, 1, None).unwrap();
         let peer = std::thread::spawn(|| {
             let stream = std::net::TcpStream::connect(("10.78.0.2", PORT)).unwrap();
             stream.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
@@ -436,8 +430,8 @@ mod tests {
         );
     }
 
-    /// Two socket slots, one accept. Connections A and B open together take both slots, so the
-    /// accept cannot listen again; once both close, a third connection is still echoed.
+    /// Two socket slots, backlog 1. Connections A and B open together take both slots, so the
+    /// listener has no socket left; once both close, a third connection is still echoed.
     #[switch_test_support::pinned_test]
     #[ignore = "run in a separate process by accepts_resume_after_socket_exhaustion"]
     fn accepts_resume_after_socket_exhaustion_child() {
@@ -466,7 +460,7 @@ mod tests {
         }
         let handle = host.net.handle();
         let spawner = host.rt.spawner();
-        spawn_accepts(&spawner, &handle, PORT, tcp_config, false, 1, None).unwrap();
+        spawn_accept_loop(&spawner, &handle, PORT, tcp_config, false, 1, None).unwrap();
         let peer = std::thread::spawn(|| {
             let echo = |s: &mut std::net::TcpStream| {
                 s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
@@ -480,8 +474,8 @@ mod tests {
             let mut b = std::net::TcpStream::connect(("10.79.0.2", PORT)).unwrap();
             echo(&mut b);
             drop((a, b));
-            // the slots free once the closes complete; until the accept listens again a connect
-            // is refused
+            // the slots free once the closes complete; until the listener opens a socket again a
+            // connect is refused
             let deadline = Instant::now() + Duration::from_secs(10);
             let mut c = loop {
                 match std::net::TcpStream::connect(("10.79.0.2", PORT)) {
@@ -545,7 +539,7 @@ mod tests {
         }
         let handle = host.net.handle();
         let spawner = host.rt.spawner();
-        spawn_accepts(&spawner, &handle, PORT, tcp_config, false, 1, None).unwrap();
+        spawn_accept_loop(&spawner, &handle, PORT, tcp_config, false, 1, None).unwrap();
 
         let sent: Vec<u8> = (0..ROUNDS * (1460 + SMALL * 64))
             .map(|i| (i % 251) as u8)

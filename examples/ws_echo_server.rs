@@ -16,17 +16,16 @@ use switch::nic::{Config, DEFAULT_NEIGHBOR_CAPACITY, Sizing, open};
 use switch::ws::Limits;
 use switch::{Runtime, Spawner};
 
-// One listening socket plus at most 15 active connections.
+// The listener's 4 waiting connections and up to 12 accepted ones.
 const MAX_SOCKETS: usize = 16;
 const BUFFER: usize = 64 * 1024;
 
 #[switch::task]
 async fn accept(spawner: Spawner, handle: NetHandle, socket: tcp::Config, port: u16) {
     let local = IpListenEndpoint { addr: None, port };
-    let mut accepting = handle.tcp_accept(socket, local);
+    let mut listener = handle.tcp_listen(socket, local, 4).expect("listen TCP");
     loop {
-        let stream = accepting.await.expect("accept TCP");
-        accepting = handle.tcp_accept(socket, local);
+        let stream = listener.accept().await.expect("accept TCP");
         spawner.spawn(echo(handle.clone(), stream)).unwrap();
     }
 }

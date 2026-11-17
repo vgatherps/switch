@@ -29,7 +29,7 @@ use switch::nic::Config;
 use switch::nic::{open, Sizing};
 
 const BUFFER: usize = 64 * 1024;
-// One slot is for the next listener; the others are for active connections.
+// The listener's 4 waiting connections and up to 12 accepted ones.
 const MAX_SOCKETS: usize = 16;
 const IDLE_SLEEP: Duration = Duration::from_millis(1);
 
@@ -44,17 +44,21 @@ async fn accept_loop(
     failure: Failure,
 ) {
     let local = IpListenEndpoint { addr: None, port };
-    let mut accepting = handle.tcp_accept(socket, local);
+    let mut listener = match handle.tcp_listen(socket, local, 4) {
+        Ok(listener) => listener,
+        Err(error) => {
+            *failure.borrow_mut() = Some(format!("listen: {error}"));
+            return;
+        }
+    };
     loop {
-        let stream = match accepting.await {
+        let stream = match listener.accept().await {
             Ok(stream) => stream,
             Err(error) => {
                 *failure.borrow_mut() = Some(format!("accept: {error}"));
                 return;
             }
         };
-        // Each accept is one listening socket. Arm the next before serving this one.
-        accepting = handle.tcp_accept(socket, local);
         if let Err(error) = spawner.spawn(serve(handle.clone(), stream, Rc::clone(&failure))) {
             *failure.borrow_mut() = Some(format!("spawn echo: {:?}", error.reason));
             return;

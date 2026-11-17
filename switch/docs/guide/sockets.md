@@ -1,6 +1,6 @@
 # Opening sockets
 
-A task opens sockets through its [`NetHandle`](crate::net::NetHandle). Each call returns a future that resolves to the socket or to an [`Error`](crate::net::Error). Addresses are IPv4.
+A task opens sockets through its [`NetHandle`](crate::net::NetHandle). Addresses are IPv4.
 
 Every open socket takes one of the places reserved with `max_sockets` (TCP) or `max_udp_sockets` (UDP) in [`Sizing`](crate::nic::Sizing), and an open fails with `SocketsFull` when none is free.
 
@@ -22,7 +22,7 @@ The future resolves when the TCP handshake completes, or to `Refused` if the ser
 
 ## Accepting
 
-One `tcp_accept` call accepts one connection. A server calls it again before it serves each connection, so that a listener is always waiting (from the example `tcp_echo_server`):
+[`tcp_listen`](crate::net::NetHandle::tcp_listen) opens a [`TcpListener`](crate::net::TcpListener), and each [`accept`](crate::net::TcpListener::accept) returns one connection (from the example `tcp_echo_server`):
 
 ```rust
 use switch::Spawner;
@@ -31,18 +31,21 @@ use switch::net::{tcp, Error, IpListenEndpoint, NetHandle, TcpStream};
 #[switch::task]
 async fn accept_loop(spawner: Spawner, handle: NetHandle, socket: tcp::Config, port: u16) {
     let local = IpListenEndpoint { addr: None, port };
-    let mut accepting = handle.tcp_accept(socket, local);
+    let mut listener = match handle.tcp_listen(socket, local, 4) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("listen: {error}");
+            return;
+        }
+    };
     loop {
-        let stream = match accepting.await {
-            Ok(stream) => stream,
+        match listener.accept().await {
+            Ok(stream) => spawner.spawn(serve(stream)).unwrap(),
             Err(error) => {
                 eprintln!("accept: {error}");
                 return;
             }
-        };
-        // Listen for the next connection before serving this one.
-        accepting = handle.tcp_accept(socket, local);
-        spawner.spawn(serve(stream)).unwrap();
+        }
     }
 }
 
@@ -61,7 +64,7 @@ async fn serve(mut stream: TcpStream) {
 }
 ```
 
-The waiting listener counts as a socket in `max_sockets`. There is no accept backlog, so a SYN that arrives while no listener is waiting is answered with an RST.
+The last argument of `tcp_listen` is the backlog, the number of connections that can wait for `accept`. A waiting connection completes the handshake and receives data. The listener takes that many sockets of `max_sockets`. A SYN that arrives when all of them hold a connection is answered with an RST. Dropping the listener resets the connections that were not accepted.
 
 ## Binding UDP
 

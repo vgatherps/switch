@@ -13,7 +13,7 @@ use switch_test_kit::with_eal;
 mod support;
 use support::{
     bind,
-    counted, local, local_at, net_ip, peer_endpoint, peer_listen, peer_send, peer_udp_send_to, tcp_config,
+    counted, local_at, net_ip, peer_endpoint, peer_listen, peer_send, peer_udp_send_to, tcp_config,
     udp_config, udp_config_at, Mixed, LOCAL_PORT, PEER_PORT,
 };
 
@@ -77,9 +77,9 @@ support::both_backends!(connect_from_a_secondary_address_uses_it_conduit, connec
 support::both_backends!(accept_on_a_secondary_address_takes_only_its_connections_conduit, accept_on_a_secondary_address_takes_only_its_connections_junction, |backend| {
     with_eal(|eal| {
         let mut mixed = Mixed::with_owned(eal, ["maca", "macb"], OWNED, backend);
-        let accepting = mixed.handle().tcp_accept(tcp_config(), local_at(SECOND, LOCAL_PORT));
+        let mut listener = mixed.handle().tcp_listen(tcp_config(), local_at(SECOND, LOCAL_PORT), 1).unwrap();
         let slot = mixed.spawn(async move {
-            let mut stream = accepting.await.unwrap();
+            let mut stream = listener.accept().await.unwrap();
             let frame = stream.recv().await.unwrap();
             (stream, frame)
         });
@@ -94,28 +94,6 @@ support::both_backends!(accept_on_a_secondary_address_takes_only_its_connections
         let (stream, frame) = mixed.wait(&slot);
         assert_eq!(frame.payload(), b"accepted on .77");
         drop((stream, frame, peer, refused));
-        mixed.close();
-    })
-});
-
-// The all-IP listener has the lower slot, yet a SYN to the second address
-// goes to the listener bound there; a SYN to the third address, which has no
-// listener of its own, goes to the all-IP one.
-support::both_backends!(listener_bound_to_an_address_beats_the_all_ip_listener_conduit, listener_bound_to_an_address_beats_the_all_ip_listener_junction, |backend| {
-    with_eal(|eal| {
-        let mut mixed = Mixed::with_owned(eal, ["mlpa", "mlpb"], OWNED, backend);
-        let (all, all_polls) = counted(mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT)));
-        let exact = mixed.handle().tcp_accept(tcp_config(), local_at(SECOND, LOCAL_PORT));
-        let all = mixed.spawn(all);
-        let exact = mixed.spawn(exact);
-        mixed.turn();
-        let to_second = peer_connect(&mut mixed, at(SECOND, LOCAL_PORT), PEER_PORT);
-        mixed.until(|_| exact.is_full());
-        assert!(!all.is_full(), "the all-IP listener took the connection to the bound address");
-        assert_eq!(all_polls.get(), 1, "the all-IP listener's task was woken");
-        let to_third = peer_connect(&mut mixed, at(THIRD, LOCAL_PORT), PEER_PORT + 1);
-        let streams = [mixed.wait(&exact).unwrap(), mixed.wait(&all).unwrap()];
-        drop((streams, to_second, to_third));
         mixed.close();
     })
 });
@@ -199,8 +177,8 @@ support::both_backends!(udp_socket_bound_to_an_address_beats_the_all_ip_socket_c
 support::both_backends!(parked_tasks_on_secondary_address_sockets_wake_only_on_their_own_traffic_conduit, parked_tasks_on_secondary_address_sockets_wake_only_on_their_own_traffic_junction, |backend| {
     with_eal(|eal| {
         let mut mixed = Mixed::with_owned(eal, ["mtka", "mtkb"], OWNED, backend);
-        let accepting = mixed.handle().tcp_accept(tcp_config(), local_at(SECOND, LOCAL_PORT));
-        let accepted = mixed.spawn(accepting);
+        let mut listener = mixed.handle().tcp_listen(tcp_config(), local_at(SECOND, LOCAL_PORT), 1).unwrap();
+        let accepted = mixed.spawn(async move { listener.accept().await });
         mixed.turn();
         let tcp_peer = peer_connect(&mut mixed, at(SECOND, LOCAL_PORT), PEER_PORT);
         let mut stream = mixed.wait(&accepted).unwrap();

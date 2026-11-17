@@ -61,6 +61,13 @@ impl Remote {
 
     fn handle(&self) -> NetHandle { self.net.handle() }
 
+    /// A listener of one socket on `local` and its first `accept`; the listener drops with the
+    /// future.
+    fn accept_one(&self, local: IpListenEndpoint) -> impl Future<Output = Result<TcpStream, Error>> + 'static {
+        let mut listener = self.handle().tcp_listen(peer_tcp_config(), local, 1).unwrap();
+        async move { listener.accept().await }
+    }
+
     fn spawn<T: 'static>(&self, future: impl Future<Output = T> + 'static) -> Slot<T> {
         let out = Rc::new(RefCell::new(None));
         self.rt.spawner().spawn(collect(future, out.clone())).unwrap();
@@ -207,7 +214,7 @@ fn remote_connect_tcp_both_directions_fin_and_identity() {
 fn remote_accept_waits_for_connection_and_receives() {
     with_eal(|eal| {
         let mut m = Remote::new(eal, ["raca", "racb"], 2);
-        let slot = m.spawn(m.handle().tcp_accept(peer_tcp_config(), local(LOCAL_PORT)));
+        let slot = m.spawn(m.accept_one(local(LOCAL_PORT)));
         m.rt.poll(0).unwrap();
         assert!(!slot.ready());
         let peer = m.fixture.peer.add_tcp(peer_tcp_config()).unwrap();
@@ -407,7 +414,7 @@ fn remote_session_loss_wakes_operations_and_turn_reports_host_lost() {
         let (mut udp_rx, mut udp_tx) = m.wait(&bound).unwrap().split();
         let udp_receiving: Slot<switch_net::Datagram> = m.spawn(async move { udp_rx.recv().await });
         let receiving = m.spawn(async move { rx.recv().await.unwrap_err() });
-        let accepting = m.spawn(m.handle().tcp_accept(peer_tcp_config(), local(LOCAL_PORT + 1)));
+        let accepting = m.spawn(m.accept_one(local(LOCAL_PORT + 1)));
         let frame = m.frame(b"lost");
         let binding = m.spawn(m.handle().udp_bind(udp_config(7001)));
         m.rt.poll(0).unwrap();
@@ -440,11 +447,11 @@ fn remote_session_loss_wakes_operations_and_turn_reports_host_lost() {
         let handle = m.handle();
         let allocated = m.spawn(async move { handle.tx_frame().await });
         let later_connect = m.spawn(m.handle().tcp_connect(peer_tcp_config(), peer_endpoint(PEER_PORT), local(LOCAL_PORT + 2)));
-        let later_accept = m.spawn(m.handle().tcp_accept(peer_tcp_config(), local(LOCAL_PORT + 3)));
+        let later_listen = m.handle().tcp_listen(peer_tcp_config(), local(LOCAL_PORT + 3), 1);
         let later_bind = m.spawn(m.handle().udp_bind(udp_config(7002)));
         m.rt.poll(0).unwrap();
         assert!(matches!(later_connect.take(), Err(Error::HostLost)));
-        assert!(matches!(later_accept.take(), Err(Error::HostLost)));
+        assert!(matches!(later_listen, Err(Error::HostLost)));
         assert!(matches!(later_bind.take(), Err(Error::HostLost)));
         assert_eq!(room.take(), Err(Error::InvalidState));
         let frame = allocated.take();
@@ -653,7 +660,7 @@ fn closed_before_open_completion(eal: &Eal, accepting: bool, reset: bool, connec
     m.fixture.hold_connected();
     m.fixture.hold_closed();
     let (opening, gate, peer) = if accepting {
-        let (opening, gate) = m.spawn_gated(m.handle().tcp_accept(peer_tcp_config(), local(LOCAL_PORT)));
+        let (opening, gate) = m.spawn_gated(Box::pin(m.accept_one(local(LOCAL_PORT))));
         m.rt.poll(0).unwrap();
         let peer = m.fixture.peer.add_tcp(peer_tcp_config()).unwrap();
         m.fixture.peer.connect(&peer, IpEndpoint::new(net_ip().into(), LOCAL_PORT), PEER_PORT).unwrap();
@@ -839,7 +846,7 @@ fn remote_real_refusal_and_tcp_slot_exhaustion_map_to_distinct_errors() {
         let mut m = Remote::new(eal, ["rtea", "rteb"], 2);
         let mut occupied = Vec::new();
         for port in 0..4 {
-            let accepting = m.spawn(m.handle().tcp_accept(peer_tcp_config(), local(LOCAL_PORT + port)));
+            let accepting = m.spawn(m.accept_one(local(LOCAL_PORT + port)));
             m.rt.poll(0).unwrap();
             occupied.push(accepting);
         }
@@ -847,7 +854,7 @@ fn remote_real_refusal_and_tcp_slot_exhaustion_map_to_distinct_errors() {
         // processed them; Session still has ample free client-side slots.
         let barrier = m.control_barrier(7000);
         assert!(occupied.iter().all(|slot| !slot.ready()));
-        let rejected = m.spawn(m.handle().tcp_accept(peer_tcp_config(), local(LOCAL_PORT + 4)));
+        let rejected = m.spawn(m.accept_one(local(LOCAL_PORT + 4)));
         assert!(matches!(m.wait(&rejected), Err(Error::SocketsFull)));
         drop((barrier, occupied));
         m.close();

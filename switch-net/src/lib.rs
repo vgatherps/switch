@@ -558,10 +558,10 @@ impl Net {
 /// It cannot receive or send packets; only the `Net` does that.
 ///
 /// The opening calls ([`tcp_connect`](NetHandle::tcp_connect),
-/// [`tcp_accept`](NetHandle::tcp_accept), [`udp_bind`](NetHandle::udp_bind)) create the socket
-/// when called, not at the first poll. The returned future waits for the outcome; dropping it
-/// before it resolves drops the socket. Each socket takes one slot in the Net's socket table
-/// until both its halves are dropped.
+/// [`tcp_listen`](NetHandle::tcp_listen), [`udp_bind`](NetHandle::udp_bind)) create their
+/// sockets when called, not at the first poll. The future from `tcp_connect` or `udp_bind`
+/// waits for the outcome; dropping it before it resolves drops the socket. Each socket takes
+/// one slot in the Net's socket table until both its halves are dropped.
 #[derive(Clone)]
 pub struct NetHandle {
     shared: Shared,
@@ -657,10 +657,10 @@ pub enum Error {
     /// without reporting.
     NeighborPending = 16,
     /// When sharing a card: the session with the daemon is gone. Returned by opens that were
-    /// waiting and by every later `tcp_connect`, `tcp_accept` and `udp_bind`. After the loss,
-    /// TCP `recv` returns queued data and then `InvalidState`; `room`, `try_send` and UDP `send`
-    /// return `InvalidState`; `delivered` resolves; UDP `recv` waits forever; `tx_frame` still
-    /// works.
+    /// waiting and by every later `tcp_connect`, `tcp_listen`, `accept` and `udp_bind`. After
+    /// the loss, TCP `recv` returns queued data and then `InvalidState`; `room`, `try_send` and
+    /// UDP `send` return `InvalidState`; `delivered` resolves; UDP `recv` waits forever;
+    /// `tx_frame` still works.
     HostLost = 17,
 }
 
@@ -810,29 +810,6 @@ impl NetHandle {
         }
     }
 
-    /// Opens a TCP socket listening on `local`; it becomes one accepted connection.
-    ///
-    /// There is no accept queue. To serve many connections on a port, call `tcp_accept` again
-    /// as soon as one completes. Several sockets may listen on one port. When owning the card,
-    /// a SYN goes to a listener bound to its destination address if one exists, otherwise to an
-    /// all-IP listener (`addr: None`) on the port.
-    ///
-    /// A reset during the handshake returns the socket to listening and the future keeps
-    /// waiting. A handshake the peer does not complete is given up after five SYN-ACK
-    /// retransmissions, and the socket listens again. If the connection already closed when
-    /// the future completes, it still resolves to a stream: data the peer sent is readable,
-    /// then `recv` reports the end, and [`TcpTx::max_segment_payload`] is `None`.
-    ///
-    /// Errors: `Unaddressable` for port 0, `SocketsFull`, `InvalidState`, and when sharing
-    /// a card `InvalidConfig` and `HostLost`.
-    ///
-    /// # Panics
-    ///
-    /// As [`NetHandle::tcp_connect`].
-    pub fn tcp_accept(&self, config: tcp::Config, local: IpListenEndpoint) -> Accepting {
-        Accepting { opening: Some(self.open_listening(config, local)) }
-    }
-
     /// Opens `backlog` TCP sockets listening on `local`, whose connections
     /// [`TcpListener::accept`] returns.
     ///
@@ -841,6 +818,10 @@ impl NetHandle {
     /// or an address the Net does not own, `SocketsFull`, `InvalidState`, and when sharing a
     /// card `InvalidConfig` and `HostLost`. When sharing a card, the daemon checks the endpoint
     /// and its own socket table after the call, and an open it rejects is returned by `accept`.
+    ///
+    /// Several listeners may use one port. When owning the card, a SYN goes to a listener
+    /// bound to its destination address if one exists, otherwise to an all-IP listener
+    /// (`addr: None`) on the port.
     ///
     /// # Panics
     ///
@@ -1065,14 +1046,14 @@ impl Future for Connecting {
     }
 }
 
-/// Future from [`NetHandle::tcp_accept`]; resolves to `Result<TcpStream, Error>`. Dropping it
-/// before it resolves drops the socket.
+/// One listening socket of a [`TcpListener`]; resolves to `Result<TcpStream, Error>` once its
+/// connection leaves the handshake. Dropping it drops the socket.
 ///
 /// # Panics
 ///
 /// If polled again after it resolved.
-pub struct Accepting {
-    opening: Option<Result<Opening, Error>>,
+struct Accepting {
+    opening: Option<Opening>,
 }
 
 impl Future for Accepting {
@@ -1080,15 +1061,7 @@ impl Future for Accepting {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let opening = match this.opening.as_ref().expect("Accepting polled after completion") {
-            Ok(opening) => opening,
-            Err(error) => {
-                let error = *error;
-                this.opening.take();
-                return Poll::Ready(Err(error));
-            }
-        };
-        let half = &opening.rx.0;
+        let half = &this.opening.as_ref().expect("Accepting polled after completion").rx.0;
         let index = half.index;
         let state = poll_op(&half.shared, index, Interest::Accept, cx, |inner| {
             let Inner::Local(inner) = inner else {
@@ -1101,7 +1074,7 @@ impl Future for Accepting {
         });
         state.map(|result| {
             let opening = this.opening.take().expect("opening present until completion");
-            result.map(|mss| opening.expect("socket opened").finish(mss))
+            result.map(|mss| opening.finish(mss))
         })
     }
 }
@@ -1111,11 +1084,12 @@ impl Future for Accepting {
 ///
 /// The listener keeps up to `backlog` sockets, which bounds the connections waiting for
 /// `accept`, those still in the handshake included. A connection completes the handshake and
-/// receives data while it waits, with no task in `accept`. A handshake the peer does not
-/// complete is given up after five SYN-ACK retransmissions, about 19 s, and the socket listens
-/// again. A SYN that arrives while every socket holds a connection is reset, unless another
-/// socket listens on the port. The listener takes `backlog` slots of the Net's socket table,
-/// and each accepted stream keeps the slot of its socket.
+/// receives data while it waits, with no task in `accept`. A reset during the handshake
+/// returns the socket to listening. A handshake the peer does not complete is given up after
+/// five SYN-ACK retransmissions, about 19 s, and the socket listens again. A SYN that arrives
+/// while every socket holds a connection is reset, unless another socket listens on the port.
+/// The listener takes `backlog` slots of the Net's socket table, and each accepted stream
+/// keeps the slot of its socket.
 ///
 /// Dropping the listener resets the connections not yet accepted and closes its listening
 /// sockets, so a SYN to the port is then refused unless another socket listens on it. When
@@ -1132,14 +1106,16 @@ pub struct TcpListener {
 impl TcpListener {
     /// Resolves to the next connection.
     ///
-    /// Each call first opens sockets until the listener holds `backlog` again, and the socket
+    /// Each poll first opens sockets until the listener holds `backlog` again, and the socket
     /// of the returned connection is replaced. A socket that cannot be opened, for example
-    /// because the socket table is full, is tried again by the next call; its error is
-    /// returned only when the listener has no socket left. When sharing a card, the daemon
-    /// can reject an open after the call that made it returned, and one call of `accept`
-    /// returns that error. When several connections are waiting, which one is returned is
-    /// unspecified. A connection that closed before `accept` is still returned, as for
-    /// [`NetHandle::tcp_accept`].
+    /// because the socket table is full, is opened at a later poll: a new call of `accept`, or
+    /// a waiting one woken by a connection on one of the listener's sockets. Its error is
+    /// returned only when the listener has no socket left. When sharing a card, the daemon can
+    /// reject an open after the call that made it returned, and one call of `accept` returns
+    /// that error. When several connections are waiting, which one is returned is
+    /// unspecified. A connection that closed before `accept` is still returned: `recv` gives
+    /// the data it received and then reports the end, and [`TcpTx::max_segment_payload`] is
+    /// `None`.
     ///
     /// Dropping the future leaves the waiting connections in the listener.
     pub fn accept(&mut self) -> Accept<'_> {
@@ -1148,7 +1124,7 @@ impl TcpListener {
 
     fn open(&self) -> Result<Accepting, Error> {
         let opening = self.handle.open_listening(self.config, self.local)?;
-        Ok(Accepting { opening: Some(Ok(opening)) })
+        Ok(Accepting { opening: Some(opening) })
     }
 }
 
@@ -1156,9 +1132,7 @@ impl Drop for TcpListener {
     fn drop(&mut self) {
         let mut inner = self.handle.shared.borrow_mut();
         for accepting in &self.queue {
-            let Some(Ok(opening)) = &accepting.opening else {
-                unreachable!("a queued accept holds an open socket")
-            };
+            let opening = accepting.opening.as_ref().expect("a queued accept holds an open socket");
             inner.abort(opening.rx.0.index);
         }
     }

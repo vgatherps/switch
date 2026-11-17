@@ -18,8 +18,21 @@ mod support;
 use support::{
     bind,
     cancel_after_one_poll, connect, counted, local, net_ip, peer_endpoint, peer_listen, peer_send, peer_udp_send,
-    inject_syn, silent_syn, tcp_config, udp_config, Mixed, LOCAL_PORT, PEER_PORT, SILENT_MAC, UNRESOLVED_IP,
+    inject_syn, silent_syn, tcp_config, udp_config, Counted, Mixed, Slot, LOCAL_PORT, PEER_PORT, SILENT_MAC,
+    UNRESOLVED_IP,
 };
+
+/// A listener of one socket on `LOCAL_PORT` and one `accept` in a task, which drops the
+/// listener once `accept` resolves; also the count of polls of `accept`.
+fn accept_one(mixed: &Mixed) -> (Slot<Result<TcpStream, Error>>, Rc<Cell<usize>>) {
+    let mut listener = mixed.handle().tcp_listen(tcp_config(), local(LOCAL_PORT), 1).unwrap();
+    let polls = Rc::new(Cell::new(0));
+    let counter = polls.clone();
+    let slot = mixed.spawn(async move {
+        Counted { future: Box::pin(listener.accept()), polls: counter }.await
+    });
+    (slot, polls)
+}
 
 /// The peer's queued segments all acknowledged, then a reset from the peer
 /// that reaches the Net and is turned.
@@ -298,13 +311,15 @@ support::both_backends!(canceled_connect_drops_the_socket_without_waking_conduit
     })
 });
 
-// Dropping `Accepting` drops its listener: a later SYN is refused.
-support::both_backends!(canceled_accept_drops_the_listener_without_waking_conduit, canceled_accept_drops_the_listener_without_waking_junction, |backend| {
+// A listener dropped after one poll of its `accept` closes its socket: a later SYN is refused,
+// and the task is not woken.
+support::both_backends!(dropped_listener_refuses_without_waking_conduit, dropped_listener_refuses_without_waking_junction, |backend| {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["ccaa", "ccab"], backend);
-        let accepting = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
+        let mut listener = mixed.handle().tcp_listen(tcp_config(), local(LOCAL_PORT), 1).unwrap();
         let (task, polls) = counted(async move {
-            cancel_after_one_poll(accepting).await;
+            cancel_after_one_poll(listener.accept()).await;
+            drop(listener);
             pending::<()>().await;
         });
         mixed.spawn(task);
@@ -323,10 +338,11 @@ support::both_backends!(canceled_accept_drops_the_listener_without_waking_condui
 support::both_backends!(connect_and_accept_resolve_established_conduit, connect_and_accept_resolve_established_junction, |backend| {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["acca", "accb"], backend);
-        let accepting = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
-        let (accepting, polls) = counted(accepting);
+        let mut listener = mixed.handle().tcp_listen(tcp_config(), local(LOCAL_PORT), 1).unwrap();
+        let polls = Rc::new(Cell::new(0));
+        let counter = polls.clone();
         let slot = mixed.spawn(async move {
-            let mut stream = accepting.await.unwrap();
+            let mut stream = Counted { future: Box::pin(listener.accept()), polls: counter }.await.unwrap();
             let frame = stream.recv().await.unwrap();
             (stream, frame)
         });
@@ -350,9 +366,7 @@ support::both_backends!(accept_survives_rst_in_syn_received_conduit, accept_surv
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["arsa", "arsb"], backend);
         resolve_neighbors(&mut mixed);
-        let accepting = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
-        let (accepting, polls) = counted(accepting);
-        let slot = mixed.spawn(accepting);
+        let (slot, polls) = accept_one(&mixed);
         mixed.turn();
         let net_end = IpEndpoint::new(net_ip().into(), LOCAL_PORT);
         let gone = mixed.peer.add_tcp(tcp_config()).unwrap();
@@ -396,8 +410,7 @@ support::both_backends!(accept_survives_unanswered_syn_ack_conduit, accept_survi
             }
             Verdict::Deliver
         });
-        let accepting = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
-        let slot = mixed.spawn(accepting);
+        let (slot, _) = accept_one(&mixed);
         mixed.turn();
         silent_syn(&mut mixed, PEER_PORT);
         mixed.turn();
@@ -434,8 +447,7 @@ support::both_backends!(accept_survives_unresolved_syn_source_conduit, accept_su
             }
             Verdict::Deliver
         });
-        let accepting = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
-        let slot = mixed.spawn(accepting);
+        let (slot, _) = accept_one(&mixed);
         mixed.turn();
         inject_syn(&mut mixed, UNRESOLVED_IP, PEER_PORT);
         mixed.turn();
@@ -477,14 +489,11 @@ fn run_to(mixed: &mut Mixed, at: switch_net::Instant) {
     }
 }
 
-// Two accepts on one port serve two connections.
-support::both_backends!(two_accepts_on_one_port_serve_two_connections_conduit, two_accepts_on_one_port_serve_two_connections_junction, |backend| {
+// Two listeners on one port serve two connections.
+support::both_backends!(two_listeners_on_one_port_serve_two_connections_conduit, two_listeners_on_one_port_serve_two_connections_junction, |backend| {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["a2pa", "a2pb"], backend);
-        let slots = [0, 1].map(|_| {
-            let accepting = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
-            mixed.spawn(accepting)
-        });
+        let slots = [0, 1].map(|_| accept_one(&mixed).0);
         mixed.turn();
         let net_end = IpEndpoint::new(net_ip().into(), LOCAL_PORT);
         let peers = [PEER_PORT, PEER_PORT + 1].map(|port| {

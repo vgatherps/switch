@@ -15,7 +15,7 @@ use dpdk_smoltcp::{Eal, Stack, StackConfig, TcpHandle, frame_reserve, rx_reserve
 use switch_ws::Limits;
 use switch_runtime::{Runtime, Spawner};
 use switch_ws::net::accept_ws;
-use switch_net::{Accepting, Error, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, tcp};
+use switch_net::{Error, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, TcpListener, tcp};
 use switch_test_kit::pair::{self, BUDGET, Side, T0, assert_lossless};
 use switch_test_kit::ring_port::RingPort;
 use switch_test_kit::wire::Link;
@@ -60,7 +60,7 @@ struct Bench {
 
 impl Bench {
     /// The client connected to the echo task `spawn` starts on the Net's accepted stream.
-    fn new(eal: &Eal, name: &str, spawn: impl FnOnce(&Spawner, NetHandle, Accepting) -> bool) -> Self {
+    fn new(eal: &Eal, name: &str, spawn: impl FnOnce(&Spawner, NetHandle, TcpListener) -> bool) -> Self {
         let fixtures = ["a", "b"].map(|side| RingPort::new(&format!("{name}{side}"), 16, 16));
         let [a, b] = &fixtures;
         let net = Net::new(open(eal, a, Side::A), NetConfig { ingress_budget: BUDGET });
@@ -68,8 +68,9 @@ impl Bench {
         let (to_peer, to_net) = (a.link_to(b), b.link_to(a));
         let rt = Runtime::new(0);
         let handle = net.handle();
-        let accepting = handle.tcp_accept(tcp_config(), IpListenEndpoint { addr: None, port: SERVER_PORT });
-        assert!(spawn(&rt.spawner(), handle, accepting), "spawn");
+        let local = IpListenEndpoint { addr: None, port: SERVER_PORT };
+        let listener = handle.tcp_listen(tcp_config(), local, 1).expect("listen");
+        assert!(spawn(&rt.spawner(), handle, listener), "spawn");
         let client = peer.add_tcp(tcp_config()).unwrap();
         let remote = IpEndpoint::new(Side::A.ip().into(), SERVER_PORT);
         peer.connect(&client, remote, IpListenEndpoint { addr: None, port: CLIENT_PORT }).unwrap();
@@ -153,8 +154,9 @@ impl Bench {
 
 /// serve.rs's tcp echo: each received segment back, frame by frame.
 #[switch_runtime::task]
-async fn tcp_echo(handle: NetHandle, accepting: Accepting) {
-    let Ok(stream) = accepting.await else { return };
+async fn tcp_echo(handle: NetHandle, mut listener: TcpListener) {
+    let Ok(stream) = listener.accept().await else { return };
+    drop(listener);
     let (mut rx, mut tx) = stream.split();
     loop {
         let Ok(received) = rx.recv().await else {
@@ -186,8 +188,9 @@ async fn tcp_echo(handle: NetHandle, accepting: Accepting) {
 
 /// serve.rs's ws echo: each message back with its kind, through switch-ws.
 #[switch_runtime::task]
-async fn ws_echo(handle: NetHandle, accepting: Accepting) {
-    let Ok(stream) = accepting.await else { return };
+async fn ws_echo(handle: NetHandle, mut listener: TcpListener) {
+    let Ok(stream) = listener.accept().await else { return };
+    drop(listener);
     let Ok(mut ws) = accept_ws(&handle, stream, Limits::default()).await else {
         return;
     };

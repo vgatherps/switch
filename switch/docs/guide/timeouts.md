@@ -75,7 +75,8 @@ When the limit passes or `b` wins, the other future is dropped. The effect depen
 
 | Dropped while waiting | Effect |
 |---|---|
-| `tcp_connect`, `tcp_accept`, `udp_bind` | The socket being opened is closed. |
+| `tcp_connect`, `udp_bind` | The socket being opened is closed. |
+| `accept` | Nothing is lost. Waiting connections stay in the listener. |
 | `recv` on TCP or UDP | Nothing is lost. Data stays queued for the next `recv`. |
 | `room`, `delivered`, `tx_frame` | Nothing is lost. Call it again. |
 | An `async` block of yours | Its sockets close as in [Dropping a stream](crate::guide::tcp) and its frames return to the pool. |

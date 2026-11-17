@@ -3,7 +3,7 @@
 A [`TcpStream`](crate::net::TcpStream) is an open connection. `split` divides it into a receiving half, [`TcpRx`](crate::net::TcpRx), and a sending half, [`TcpTx`](crate::net::TcpTx), so one task can hold both or two tasks can hold one each.
 
 ```text
-        tcp_connect / tcp_accept
+        tcp_connect / accept
                   |
                   v
   rx.recv() <-- open --> tx.room(len), tx.try_send(frame)

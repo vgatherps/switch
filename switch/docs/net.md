@@ -4,7 +4,8 @@ The loop owns a [`Net`] and calls [`round`] on it to receive packets, run tasks 
 
 - [`Net`]: the network as the loop sees it. Made with [`Net::new`] from an opened card, or [`Net::remote`] from a session with the sharing daemon.
 - [`round`]: one trip through the loop.
-- [`NetHandle`]: `tcp_connect`, `tcp_accept`, `udp_bind` and `tx_frame`, for tasks.
+- [`NetHandle`]: `tcp_connect`, `tcp_listen`, `udp_bind` and `tx_frame`, for tasks.
+- [`TcpListener`]: a listening TCP port; `accept` returns its connections.
 - [`TcpStream`], with its halves [`TcpRx`] and [`TcpTx`]: an open TCP connection.
 - [`UdpSocket`], with [`UdpRx`] and [`UdpTx`]: a bound UDP port.
 - [`OwnedFrame`] and [`ImmutableFrame`]: the packet buffers data is sent and received in.

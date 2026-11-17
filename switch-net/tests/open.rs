@@ -2,12 +2,12 @@ use std::future::{Future, poll_fn};
 use std::pin::pin;
 use std::task::Poll;
 
-use switch_net::{Error, IpEndpoint, tcp};
+use switch_net::{Error, IpEndpoint, TcpStream, tcp};
 use switch_test_kit::pair::BUDGET;
 use switch_test_kit::with_eal;
 
 mod support;
-use support::{Mixed, LOCAL_PORT, PEER_PORT, local, local_at, net_ip, peer_endpoint, tcp_config, udp_config};
+use support::{Mixed, Slot, LOCAL_PORT, PEER_PORT, local, local_at, net_ip, peer_endpoint, tcp_config, udp_config};
 
 async fn first_poll<F: Future>(future: F, backend: support::Backend) -> F::Output {
     let mut future = pin!(future);
@@ -18,24 +18,25 @@ async fn first_poll<F: Future>(future: F, backend: support::Backend) -> F::Outpu
     }).await
 }
 
+/// `tcp_listen` on `LOCAL_PORT` with a backlog of 1, and its first `accept` in a task.
+fn accept_one(mixed: &Mixed) -> Slot<Result<TcpStream, Error>> {
+    let mut listener = mixed.handle().tcp_listen(tcp_config(), local(LOCAL_PORT), 1).unwrap();
+    mixed.spawn(async move { listener.accept().await })
+}
+
 support::both_backends!(tcp_slots_full_on_first_poll_and_drop_releases_slot_conduit, tcp_slots_full_on_first_poll_and_drop_releases_slot_junction, |backend| {
     with_eal(|eal| {
         let mut mixed = Mixed::with_sockets(eal, ["ofsa", "ofsb"], 1, 1, backend);
-        let held = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
+        let held = mixed.handle().tcp_listen(tcp_config(), local(LOCAL_PORT), 1).unwrap();
         let failed = mixed.handle().tcp_connect(tcp_config(), peer_endpoint(PEER_PORT), local(LOCAL_PORT + 1));
         let slot = mixed.spawn(first_poll(failed, backend));
         mixed.rt.poll(0).unwrap();
         assert!(matches!(mixed.wait(&slot), Err(Error::SocketsFull)));
         drop(held);
-        // Junction applies the drop asynchronously; a pending replacement proves no release.
+        // Junction applies the drop asynchronously; a listen that succeeds proves the release.
         if matches!(backend, support::Backend::Conduit) {
-            let replacement = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
-            let slot = mixed.spawn(async move {
-                let mut replacement = pin!(replacement);
-                poll_fn(|cx| Poll::Ready(matches!(replacement.as_mut().poll(cx), Poll::Pending))).await
-            });
-            mixed.rt.poll(0).unwrap();
-            assert!(slot.take(), "failed add leaked or drop retained the only TCP slot");
+            let replacement = mixed.handle().tcp_listen(tcp_config(), local(LOCAL_PORT), 1);
+            assert!(replacement.is_ok(), "failed add leaked or drop retained the only TCP slot");
         }
         mixed.close();
     });
@@ -68,8 +69,7 @@ support::both_backends!(failed_connect_start_releases_only_socket_slot_conduit, 
         let slot = mixed.spawn(first_poll(failed, backend));
         mixed.rt.poll(0).unwrap();
         assert!(matches!(mixed.wait(&slot), Err(Error::Unaddressable)));
-        let accepting = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
-        let slot = mixed.spawn(accepting);
+        let slot = accept_one(&mixed);
         let peer = mixed.peer.add_tcp(tcp_config()).unwrap();
         mixed.peer.connect(&peer, IpEndpoint::new(net_ip().into(), LOCAL_PORT), PEER_PORT).unwrap();
         let stream = mixed.wait(&slot).expect("failed start leaked the only TCP slot");
@@ -78,15 +78,23 @@ support::both_backends!(failed_connect_start_releases_only_socket_slot_conduit, 
     });
 });
 
-support::both_backends!(accepting_error_is_ready_on_first_poll_and_releases_socket_conduit, accepting_error_is_ready_on_first_poll_and_releases_socket_junction, |backend| {
+// Port 0: owning the card, `tcp_listen` fails at the call; sharing a card, the daemon rejects
+// the open and the first `accept` returns the error. Either way the only TCP slot is free again.
+support::both_backends!(listen_error_releases_socket_conduit, listen_error_releases_socket_junction, |backend| {
     with_eal(|eal| {
         let mut mixed = Mixed::with_sockets(eal, ["oaea", "oaeb"], 1, 1, backend);
-        let failed = mixed.handle().tcp_accept(tcp_config(), local(0));
-        let slot = mixed.spawn(first_poll(failed, backend));
-        mixed.rt.poll(0).unwrap();
-        assert!(matches!(mixed.wait(&slot), Err(Error::Unaddressable)));
-        let accepting = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
-        let slot = mixed.spawn(accepting);
+        match mixed.handle().tcp_listen(tcp_config(), local(0), 1) {
+            Err(error) => {
+                assert!(matches!(backend, support::Backend::Conduit), "sharing a card, the session checked the port");
+                assert_eq!(error, Error::Unaddressable);
+            }
+            Ok(mut listener) => {
+                assert!(matches!(backend, support::Backend::Junction), "owning the card, port 0 was accepted");
+                let slot = mixed.spawn(async move { listener.accept().await.map(drop) });
+                assert_eq!(mixed.wait(&slot), Err(Error::Unaddressable));
+            }
+        }
+        let slot = accept_one(&mixed);
         let peer = mixed.peer.add_tcp(tcp_config()).unwrap();
         mixed.peer.connect(&peer, IpEndpoint::new(net_ip().into(), LOCAL_PORT), PEER_PORT).unwrap();
         let stream = mixed.wait(&slot).expect("failed accept kept the only TCP slot");
@@ -142,8 +150,7 @@ support::both_backends!(connecting_caches_peer_negotiated_mss_across_reset_condu
 support::both_backends!(accepting_caches_peer_negotiated_mss_across_reset_conduit, accepting_caches_peer_negotiated_mss_across_reset_junction, |backend| {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["omaa", "omab"], backend);
-        let opening = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
-        let slot = mixed.spawn(opening);
+        let slot = accept_one(&mixed);
         let peer = mixed.peer.add_tcp(tcp::Config { mss_cap: Some(700), ..tcp_config() }).unwrap();
         mixed.peer.connect(&peer, IpEndpoint::new(net_ip().into(), LOCAL_PORT), PEER_PORT).unwrap();
         let stream = mixed.wait(&slot).unwrap();
@@ -155,7 +162,7 @@ support::both_backends!(accepting_caches_peer_negotiated_mss_across_reset_condui
 support::both_backends!(accepting_already_closed_preserves_queued_data_without_mss_conduit, accepting_already_closed_preserves_queued_data_without_mss_junction, |backend| {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["ocaa", "ocab"], backend);
-        let opening = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
+        let mut listener = mixed.handle().tcp_listen(tcp_config(), local(LOCAL_PORT), 1).unwrap();
         let peer = mixed.peer.add_tcp(tcp_config()).unwrap();
         mixed.peer.connect(&peer, IpEndpoint::new(net_ip().into(), LOCAL_PORT), PEER_PORT).unwrap();
         // No accept task exists while the connection opens, receives data, and closes.
@@ -169,7 +176,7 @@ support::both_backends!(accepting_already_closed_preserves_queued_data_without_m
         if matches!(backend, support::Backend::Junction) {
             mixed.until(|m| m.net.tcp_reset_by_peer());
         }
-        let slot = mixed.spawn(first_poll(opening, backend));
+        let slot = mixed.spawn(async move { first_poll(listener.accept(), backend).await });
         mixed.rt.poll(0).unwrap();
         let stream = mixed.wait(&slot).expect("accept must preserve an already closed stream");
         let (mut rx, tx) = stream.split();

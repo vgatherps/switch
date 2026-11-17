@@ -84,9 +84,9 @@ pub struct Sizing {
     pub frame_share: usize,
     /// TCP sockets the program can have at once. Must be positive.
     ///
-    /// Count every connection, every `tcp_accept` that is waiting, and connections that
+    /// Count every connection, the backlog of every listener, and connections that
     /// were dropped and are still closing: such a connection keeps its place until TCP has
-    /// finished the close. When all places are taken, `tcp_connect` and `tcp_accept` return
+    /// finished the close. When all places are taken, `tcp_connect` and `tcp_listen` return
     /// `SocketsFull`.
     pub max_sockets: usize,
     /// UDP sockets the program can have at once. With zero, or when all are in use,

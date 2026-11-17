@@ -258,7 +258,7 @@ support::both_backends!(reset_during_handshake_keeps_the_socket_conduit, reset_d
 
 // A connection that was established, received data and was reset by the peer before `accept`
 // is still returned: its data is readable, then `recv` reports `InvalidState`, and it has no
-// MSS (as `tcp_accept` documents).
+// MSS (as `accept` documents).
 support::both_backends!(closed_before_accept_is_returned_conduit, closed_before_accept_is_returned_junction, |backend| {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["lcra", "lcrb"], backend);
@@ -313,12 +313,11 @@ const RING_RECORDS: usize = 4096;
 // dropping the listener refuses a new connection to the port and resets both peers. Sharing a
 // card, the listener's sockets must be aborted, not closed gracefully: the daemon holds a
 // graceful close until every send ring is empty, and the listening socket would take the next
-// SYN meanwhile. A busy stream keeps the send ring non-empty; a `tcp_accept` dropped at the
-// same time (a graceful close) shows the hold: it still takes a connection after the
-// listener's port refused one.
+// SYN meanwhile. A busy stream keeps the send ring non-empty; an established stream dropped at
+// the same time (a graceful close) shows the hold: its peer gets no FIN until after the
+// listener's port refused a connection.
 support::both_backends!(dropping_listener_resets_unaccepted_conduit, dropping_listener_resets_unaccepted_junction, |backend| {
     with_eal(|eal| {
-        const WITNESS_PORT: u16 = LOCAL_PORT + 2;
         let mut mixed = Mixed::with_sockets(eal, ["ldla", "ldlb"], 6, 0, backend);
         let sharing = matches!(backend, Backend::Junction);
         let listener = listen(&mut mixed, 3);
@@ -329,7 +328,7 @@ support::both_backends!(dropping_listener_resets_unaccepted_conduit, dropping_li
         let mut witness = None;
         if sharing {
             let (stream, busy_peer) = support::connect(&mut mixed, LOCAL_PORT + 1);
-            witness = Some(mixed.handle().tcp_accept(tcp_config(), local(WITNESS_PORT)));
+            witness = Some(support::connect(&mut mixed, LOCAL_PORT + 2));
             let handle = mixed.handle();
             let slot = mixed.spawn(async move {
                 let (rx, mut tx) = stream.split();
@@ -344,21 +343,23 @@ support::both_backends!(dropping_listener_resets_unaccepted_conduit, dropping_li
             mixed.rt.poll(0).unwrap();
             busy = Some((slot.take(), busy_peer));
         }
-        drop((listener, witness));
+        let witness_peer = witness.map(|(stream, peer)| {
+            drop(stream);
+            peer
+        });
+        drop(listener);
         let refused = peer_connect(&mut mixed, PEER_PORT + 12);
         reset(&mut mixed, &refused, "the dropped listener's port accepted a connection");
         reset(&mut mixed, &first, "an unaccepted connection was not reset");
         reset(&mut mixed, &second, "an unaccepted connection was not reset");
-        if sharing {
-            // The `tcp_accept` dropped with the listener still listens: its graceful close
-            // waits for the send ring, which the listener's abort did not.
-            let held = peer_connect_to(&mut mixed, IpEndpoint::new(net_ip().into(), WITNESS_PORT), PEER_PORT + 13);
-            established(&mut mixed, &[&held]);
+        if let Some(witness_peer) = &witness_peer {
+            // The stream dropped with the listener is still open: its graceful close waits for
+            // the send ring, which the listener's abort did not.
+            assert_eq!(mixed.peer.tcp(witness_peer).state(), State::Established, "the send ring drained too early");
             // Once the ring drains, the held close sends its FIN.
-            mixed.until(|m| m.peer.tcp(&held).state() == State::CloseWait);
-            drop(held);
+            mixed.until(|m| m.peer.tcp(witness_peer).state() == State::CloseWait);
         }
-        drop((busy, first, second, refused));
+        drop((busy, first, second, refused, witness_peer));
         mixed.close();
     })
 });

@@ -217,7 +217,7 @@ struct Tally {
 enum Failure {
     Spawn,
     Round(RoundError),
-    /// The server role's next listener.
+    /// The server role's `tcp_listen` or `accept`.
     Listen(NetError),
     /// The tester's server-ready marker did not appear within `SERVER_READY_LIMIT`.
     NoServerReady,
@@ -361,17 +361,15 @@ async fn run_role(
     *outcome.borrow_mut() = Some(result);
 }
 
-/// The echo server on `ECHO_PORT`, one connection at a time, forever. The next connection's
-/// listener opens as soon as one is accepted, so a client's next SYN finds it even while the
-/// previous connection still closes.
+/// The echo server on `ECHO_PORT`, one connection at a time, forever. The listener (backlog 1)
+/// replaces its socket as soon as a connection is accepted, so a client's next SYN finds it
+/// even while the previous connection still closes.
 async fn server(handle: &NetHandle, spawner: &Spawner, deadline: Duration, tally: &RefCell<Tally>) -> Result<(), Failure> {
     let local = IpListenEndpoint { addr: None, port: ECHO_PORT };
-    let listen = || handle.tcp_accept(SOCKET, local);
-    let mut next = listen();
+    let mut listener = handle.tcp_listen(SOCKET, local, 1).map_err(Failure::Listen)?;
     let mut buf = Vec::new();
     loop {
-        let stream = next.await.map_err(Failure::Listen)?;
-        next = listen();
+        let stream = listener.accept().await.map_err(Failure::Listen)?;
         let n = tally.borrow().connections;
         tally.borrow_mut().connections += 1;
         let session = async {
