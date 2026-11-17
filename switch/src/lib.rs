@@ -35,6 +35,9 @@ pub mod nic {
 #[cfg(feature = "tls")]
 pub mod tls {
     #![doc = include_str!("../docs/tls.md")]
+    /// The TLS library, with its `ring` provider. Build the `ClientConfig` that
+    /// [`net::tls_connect`] and `switch::ws` take from it.
+    pub use rustls;
     pub use switch_tls::*;
 }
 

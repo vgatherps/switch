@@ -12,7 +12,7 @@ all-features = true
 [features]
 default = []
 net = ["dep:switch-net", "dep:switch-junction", "dep:switch-open", "dep:switch-netconf", "dep:dpdk-smoltcp"]
-tls = ["net", "dep:switch-tls"]
+tls = ["net", "dep:switch-tls", "dep:rustls"]
 ws = ["tls", "dep:switch-ws"]
 
 [dependencies]
@@ -25,9 +25,7 @@ switch-netconf = { workspace = true, optional = true }
 dpdk-smoltcp = { workspace = true, optional = true }
 switch-tls = { workspace = true, optional = true, features = ["switch-net"] }
 switch-ws = { workspace = true, optional = true, features = ["switch-net"] }
-
-[dev-dependencies]
-rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std"] }
+rustls = { workspace = true, optional = true, features = ["ring", "std"] }
 
 [lints]
 workspace = true

@@ -1426,7 +1426,6 @@ dependencies = [
 name = "switch-examples"
 version = "0.1.0"
 dependencies = [
- "rustls",
  "switch",
 ]
 

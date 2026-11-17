@@ -7,12 +7,11 @@ publish = false
 
 [features]
 net = ["switch/net"]
-tls = ["net", "switch/tls", "dep:rustls"]
+tls = ["net", "switch/tls"]
 ws = ["tls", "switch/ws"]
 
 [dependencies]
 switch.workspace = true
-rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std"], optional = true }
 
 [[example]]
 name = "first_task"

@@ -18,8 +18,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant as WallInstant};
 
-use rustls::pki_types::{CertificateDer, pem::PemObject};
-use rustls::{ClientConfig, RootCertStore};
+use switch::tls::rustls::pki_types::{CertificateDer, pem::PemObject};
+use switch::tls::rustls::{self, ClientConfig, RootCertStore};
 use switch::Runtime;
 use switch::net::{Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, tcp};
 use switch::nic::{Config, DEFAULT_NEIGHBOR_CAPACITY, Sizing, open};

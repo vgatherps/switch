@@ -7,12 +7,12 @@ The functions a program starts from are in [`net`]:
 - [`net::send_bytes`]: encrypts and sends bytes on the session's `tx` half.
 - [`net::Error`]: what can fail.
 
-The client config is a `rustls::ClientConfig`, so the program depends on `rustls` as well; the guide chapter shows the `Cargo.toml` this needs.
+The client config is a `ClientConfig` from `rustls`, which this module re-exports.
 
 ```rust,no_run
 use std::sync::Arc;
 
-use rustls::ClientConfig;
+use switch::tls::rustls::ClientConfig;
 use switch::net::{NetHandle, TcpStream};
 use switch::tls::net::{send_bytes, tls_connect, Error};
 

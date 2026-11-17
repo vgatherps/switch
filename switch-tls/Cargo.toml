@@ -13,12 +13,12 @@ switch-net = ["dep:switch-net"]
 e2e = ["switch-net", "switch-net/testkit", "dep:switch-test-support"]
 
 [dependencies]
-rustls = { version = "=0.23.43", default-features = false, features = ["std"] }
+rustls = { workspace = true, features = ["std"] }
 switch-net = { workspace = true, optional = true }
 switch-test-support = { workspace = true, optional = true }
 
 [dev-dependencies]
-rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { workspace = true, features = ["ring", "std", "tls12"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 switch-runtime.workspace = true
 libc.workspace = true

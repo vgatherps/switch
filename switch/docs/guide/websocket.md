@@ -2,26 +2,20 @@
 
 With the `ws` feature, a task can run WebSocket over a TCP stream as a client of `wss://` (over TLS 1.3) or `ws://` servers, and as a `ws://` server. A connection is a [`Wss`](crate::ws::net::Wss) or a [`Ws`](crate::ws::net::Ws). Both have the same `recv`, `send` and `close`, and each is used from one task.
 
-The program also depends on `rustls` for the TLS client config, and its `Cargo.toml` needs the `[patch]` section below, because switch works only with the copy of rustls in the repository. Without that section the program builds and then panics on the first TLS data it receives.
-
 ```toml
 [dependencies]
 switch = { path = "<clone>/switch", features = ["ws"] }
-rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std"] }
-
-[patch.crates-io]
-rustls = { path = "<clone>/vendor/rustls" }
 ```
 
 ## The TLS client config
 
-A `wss://` connection needs a `rustls::ClientConfig` holding the trust roots. Build it in `main` before the card is opened:
+A `wss://` connection needs a `rustls::ClientConfig` holding the trust roots, built with the rustls that switch re-exports as `switch::tls::rustls`. Build it in `main` before the card is opened:
 
 ```rust
 use std::sync::Arc;
 
-use rustls::pki_types::{CertificateDer, pem::PemObject};
-use rustls::{ClientConfig, RootCertStore};
+use switch::tls::rustls::pki_types::{CertificateDer, pem::PemObject};
+use switch::tls::rustls::{self, ClientConfig, RootCertStore};
 
 fn tls_config(ca_file: &str) -> Result<Arc<ClientConfig>, Box<dyn std::error::Error>> {
     let mut roots = RootCertStore::empty();
@@ -45,7 +39,7 @@ Open the TCP connection as usual, then hand the stream to [`connect`](crate::ws:
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustls::ClientConfig;
+use switch::tls::rustls::ClientConfig;
 use switch::Spawner;
 use switch::net::{tcp, within, IpEndpoint, IpListenEndpoint, NetHandle};
 use switch::ws::Limits;

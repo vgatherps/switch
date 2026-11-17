@@ -9,7 +9,7 @@ switch-ws = { workspace = true, features = ["switch-net"] }
 switch-runtime.workspace = true
 switch-net.workspace = true
 switch-tap-echo.workspace = true
-rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std"] }
+rustls = { workspace = true, features = ["ring", "std"] }
 webpki-roots = "=1.0.9"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

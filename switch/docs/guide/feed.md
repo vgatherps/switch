@@ -10,10 +10,6 @@ edition = "2024"
 
 [dependencies]
 switch = { path = "<clone>/switch", features = ["ws"] }
-rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std"] }
-
-[patch.crates-io]
-rustls = { path = "<clone>/vendor/rustls" }
 ```
 
 ## Imports and limits
@@ -26,8 +22,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant as WallInstant};
 
-use rustls::pki_types::{CertificateDer, pem::PemObject};
-use rustls::{ClientConfig, RootCertStore};
+use switch::tls::rustls::pki_types::{CertificateDer, pem::PemObject};
+use switch::tls::rustls::{self, ClientConfig, RootCertStore};
 use switch::net::{Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, tcp, within};
 use switch::nic::{Config, DEFAULT_NEIGHBOR_CAPACITY, Sizing, open};
 use switch::ws::Limits;
@@ -219,8 +215,8 @@ struct Feed {
 # use std::sync::Arc;
 # use std::time::{Duration, Instant as WallInstant};
 # 
-# use rustls::pki_types::{CertificateDer, pem::PemObject};
-# use rustls::{ClientConfig, RootCertStore};
+# use switch::tls::rustls::pki_types::{CertificateDer, pem::PemObject};
+# use switch::tls::rustls::{self, ClientConfig, RootCertStore};
 # use switch::net::{Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, tcp, within};
 # use switch::nic::{Config, DEFAULT_NEIGHBOR_CAPACITY, Sizing, open};
 # use switch::ws::Limits;
@@ -414,8 +410,8 @@ Closing is as in [WebSocket](crate::guide::websocket). The feed keeps sending up
 # use std::sync::Arc;
 # use std::time::{Duration, Instant as WallInstant};
 # 
-# use rustls::pki_types::{CertificateDer, pem::PemObject};
-# use rustls::{ClientConfig, RootCertStore};
+# use switch::tls::rustls::pki_types::{CertificateDer, pem::PemObject};
+# use switch::tls::rustls::{self, ClientConfig, RootCertStore};
 # use switch::net::{Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, tcp, within};
 # use switch::nic::{Config, DEFAULT_NEIGHBOR_CAPACITY, Sizing, open};
 # use switch::ws::Limits;
@@ -607,8 +603,8 @@ The blocking setup, here DNS resolution and reading the certificate file, comes 
 # use std::sync::Arc;
 # use std::time::{Duration, Instant as WallInstant};
 # 
-# use rustls::pki_types::{CertificateDer, pem::PemObject};
-# use rustls::{ClientConfig, RootCertStore};
+# use switch::tls::rustls::pki_types::{CertificateDer, pem::PemObject};
+# use switch::tls::rustls::{self, ClientConfig, RootCertStore};
 # use switch::net::{Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, tcp, within};
 # use switch::nic::{Config, DEFAULT_NEIGHBOR_CAPACITY, Sizing, open};
 # use switch::ws::Limits;
@@ -800,8 +796,8 @@ This is the setup of [the first network program](crate::guide::first_connection)
 # use std::sync::Arc;
 # use std::time::{Duration, Instant as WallInstant};
 # 
-# use rustls::pki_types::{CertificateDer, pem::PemObject};
-# use rustls::{ClientConfig, RootCertStore};
+# use switch::tls::rustls::pki_types::{CertificateDer, pem::PemObject};
+# use switch::tls::rustls::{self, ClientConfig, RootCertStore};
 # use switch::net::{Instant, IpEndpoint, IpListenEndpoint, Net, NetConfig, NetHandle, tcp, within};
 # use switch::nic::{Config, DEFAULT_NEIGHBOR_CAPACITY, Sizing, open};
 # use switch::ws::Limits;
