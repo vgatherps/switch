@@ -326,6 +326,12 @@ impl Remote {
         assert_eq!(self.session.outstanding_rx_frames(), 0, "remote RX frames outlived the body");
     }
 
+    #[cfg(feature = "testkit")]
+    pub fn outstanding_rx_frames(&mut self) -> usize {
+        self.drain_packets();
+        self.session.outstanding_rx_frames()
+    }
+
     pub fn tx_frame(&mut self, cx: &Context<'_>) -> Poll<OwnedFrame> {
         if let Some(frame) = self.pool.take() { return Poll::Ready(frame); }
         let waker = StoredWaker::new(cx);

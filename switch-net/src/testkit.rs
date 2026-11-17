@@ -198,6 +198,19 @@ impl Net {
         }
     }
 
+    /// Sharing a card: socket slots of the session that are not free.
+    pub fn remote_slots_in_use(&self) -> usize {
+        let crate::Inner::Remote(remote) = &*self.shared.borrow() else { panic!("not sharing a card") };
+        remote.session.slots_in_use()
+    }
+
+    /// Sharing a card: received frames still held after the ring's waiting packets are routed.
+    /// Unlike `assert_remote_frames_returned`, sockets' queued frames are not cleared first.
+    pub fn remote_outstanding_rx_frames(&mut self) -> usize {
+        let crate::Inner::Remote(remote) = &mut *self.shared.borrow_mut() else { panic!("not sharing a card") };
+        remote.outstanding_rx_frames()
+    }
+
     /// Test inspection: whether the peer reset any TCP socket open on this Net.
     pub fn tcp_reset_by_peer(&self) -> bool {
         let inner = self.shared.borrow();

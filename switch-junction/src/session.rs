@@ -450,6 +450,12 @@ impl Session {
         self.rx.outstanding_frames()
     }
 
+    /// Socket slots that are not free: open, or closing until `Freed` or `Rejected`.
+    #[cfg(feature = "testkit")]
+    pub fn slots_in_use(&self) -> usize {
+        self.slots.iter().filter(|slot| slot.state != State::Free).count()
+    }
+
     fn allocate(&mut self, tcp: bool) -> Result<SocketId, OpenError> {
         let (index, slot) = self
             .slots

@@ -386,11 +386,12 @@ support::both_backends!(short_listener_keeps_accepting_conduit, short_listener_k
         let second_stream = second_stream.expect("the remaining socket takes the connection");
         peer_resets(&mut mixed, first, first_stream);
         peer_resets(&mut mixed, second, second_stream);
-        let listener = reopen(&mut mixed, listener, backend);
-        // Sharing a card, a second `Freed` may arrive a round later; this poll opens its socket.
-        mixed.rounds(2);
+        if matches!(backend, Backend::Junction) {
+            // Sharing a card, the slots are free once both `Freed` arrive.
+            mixed.until(|m| m.net.remote_slots_in_use() == 0);
+        }
         let (listener, polled) = accept_once(&mut mixed, listener);
-        assert!(polled.is_none(), "accept resolved with no connection waiting");
+        assert!(polled.is_none(), "accept with both slots free did not reopen a socket");
         let peers = [peer_connect(&mut mixed, PEER_PORT + 2), peer_connect(&mut mixed, PEER_PORT + 3)];
         established(&mut mixed, &[&peers[0], &peers[1]]);
         let (listener, third) = accept(&mut mixed, listener);
@@ -510,3 +511,53 @@ support::both_backends!(address_listener_beats_all_ip_listener_conduit, address_
         mixed.close();
     })
 });
+
+// Sharing a card, with a daemon TCP table of 2 and 3 session slots: the daemon rejects the
+// listener's third socket, and one `accept` returns `SocketsFull`. Its replacement is rejected
+// too and stays queued; a connection to one of the two listening sockets is still accepted,
+// and that `accept`'s replacement reuses the rejected socket's session slot. Dropping the
+// listener then aborts the listening socket and the replacement, and leaves the rejected
+// socket, which the daemon no longer holds and whose slot another socket now uses, alone.
+#[switch_test_support::pinned_test]
+fn rejected_socket_is_returned_once_and_skipped_on_drop() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::with_sockets(eal, ["lrja", "lrjb"], 2, 1, Backend::Junction);
+        let mut listener = mixed.handle().tcp_listen(tcp_config(), local(LOCAL_PORT), 3).unwrap();
+        let slot = mixed.spawn(async move {
+            let result = listener.accept().await.map(drop);
+            (listener, result)
+        });
+        let (listener, result) = mixed.wait(&slot);
+        assert_eq!(result, Err(Error::SocketsFull), "the daemon's rejection of the third socket");
+        // The replacement opened by that `accept` is rejected too, which frees its slot.
+        mixed.until(|m| m.net.remote_slots_in_use() == 2);
+        let peer = peer_connect(&mut mixed, PEER_PORT);
+        established(&mut mixed, &[&peer]);
+        let (listener, stream) = accept(&mut mixed, listener);
+        assert_eq!(mixed.net.remote_slots_in_use(), 3, "the replacement did not reuse the free slot");
+        drop(listener);
+        let peer_reused = peer_connect(&mut mixed, PEER_PORT + 1);
+        reset(&mut mixed, &peer_reused, "the dropped listener's port accepted a connection");
+        drop((stream, peer, peer_reused));
+        mixed.close();
+    })
+}
+
+// Sharing a card: received frames of a connection nobody accepted are returned to the session
+// when the listener is dropped.
+#[switch_test_support::pinned_test]
+fn dropping_listener_returns_unaccepted_frames() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["lrfa", "lrfb"], Backend::Junction);
+        let listener = listen(&mut mixed, 1);
+        let peer = peer_connect(&mut mixed, PEER_PORT);
+        established(&mut mixed, &[&peer]);
+        peer_send(&mut mixed, &peer, b"unaccepted");
+        mixed.until(|m| m.net.remote_outstanding_rx_frames() > 0);
+        drop(listener);
+        assert_eq!(mixed.net.remote_outstanding_rx_frames(), 0, "the dropped listener kept received frames");
+        reset(&mut mixed, &peer, "the unaccepted connection was not reset");
+        drop(peer);
+        mixed.close();
+    })
+}

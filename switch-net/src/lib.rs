@@ -815,9 +815,10 @@ impl NetHandle {
     ///
     /// Each socket takes a slot in the Net's socket table. If one cannot be opened, the
     /// sockets already opened are closed and its error is returned: `Unaddressable` for port 0
-    /// or an address the Net does not own, `SocketsFull`, `InvalidState`, and when sharing a
-    /// card `InvalidConfig` and `HostLost`. When sharing a card, the daemon checks the endpoint
-    /// and its own socket table after the call, and an open it rejects is returned by `accept`.
+    /// or an address the Net does not own, `SocketsFull`, and when sharing a card
+    /// `InvalidConfig` and `HostLost`. When sharing a card, the slots of the closed sockets are
+    /// free once the daemon confirms, and the daemon checks the endpoint and its own socket
+    /// table after the call; an open it rejects is returned by `accept`.
     ///
     /// Several listeners may use one port. When owning the card, a SYN goes to a listener
     /// bound to its destination address if one exists, otherwise to an all-IP listener
@@ -1093,7 +1094,7 @@ impl Future for Accepting {
 ///
 /// Dropping the listener resets the connections not yet accepted and closes its listening
 /// sockets, so a SYN to the port is then refused unless another socket listens on it. When
-/// sharing a card, the daemon does this asynchronously.
+/// sharing a card, the slots of these sockets are free once the daemon confirms.
 pub struct TcpListener {
     handle: NetHandle,
     config: tcp::Config,
@@ -1109,13 +1110,17 @@ impl TcpListener {
     /// Each poll first opens sockets until the listener holds `backlog` again, and the socket
     /// of the returned connection is replaced. A socket that cannot be opened, for example
     /// because the socket table is full, is opened at a later poll: a new call of `accept`, or
-    /// a waiting one woken by a connection on one of the listener's sockets. Its error is
-    /// returned only when the listener has no socket left. When sharing a card, the daemon can
-    /// reject an open after the call that made it returned, and one call of `accept` returns
-    /// that error. When several connections are waiting, which one is returned is
-    /// unspecified. A connection that closed before `accept` is still returned: `recv` gives
-    /// the data it received and then reports the end, and [`TcpTx::max_segment_payload`] is
-    /// `None`.
+    /// a waiting one woken by a connection on one of the listener's sockets. When several
+    /// connections are waiting, which one is returned is unspecified. A connection that closed
+    /// before `accept` is still returned: `recv` gives the data it received and then reports
+    /// the end, and [`TcpTx::max_segment_payload`] is `None`.
+    ///
+    /// Errors: when the listener has no socket left, the error of the open that failed, one of
+    /// those of [`tcp_listen`](NetHandle::tcp_listen). When sharing a card, the daemon can
+    /// reject a socket after the call that opened it returned; one call then returns
+    /// `Unaddressable`, or `SocketsFull` when the daemon's own socket table is full, and the
+    /// listener keeps its other sockets. Once the session is lost, every call returns
+    /// `HostLost`, also for connections that were waiting.
     ///
     /// Dropping the future leaves the waiting connections in the listener.
     pub fn accept(&mut self) -> Accept<'_> {
