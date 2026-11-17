@@ -5604,6 +5604,40 @@ mod test {
         assert_eq!(s.remote_endpoint(), Some(other));
     }
 
+    /// A duplicate SYN in SYN-RECEIVED is answered at once and restarts the timer at the
+    /// current backoff without advancing it: the give-up moves later but still follows exactly
+    /// `SYNACK_RETRIES` timer retransmissions.
+    #[test]
+    fn syn_received_duplicate_syn_delays_give_up() {
+        let mut s = socket();
+        s.socket.listen(LISTEN_END).unwrap();
+        let syn = SEND_TEMPL.syn().seq(REMOTE_SEQ).no_ack();
+        let syn_ack = RECV_TEMPL.syn().seq(LOCAL_SEQ).ack(REMOTE_SEQ + 1).mss(BASE_MSS);
+        send!(s, time 0, syn);
+        recv!(s, time 0, [syn_ack]);
+        recv!(s, time 300, [syn_ack]);
+        recv!(s, time 900, [syn_ack]);
+        assert_eq!(s.rto_backoff, 2);
+        send!(s, time 1000, syn);
+        recv!(s, time 1000, [syn_ack]);
+        // RTO 300 ms · 2^2 from the answer.
+        assert_eq!(s.timer, Timer::Retransmit { expires_at: Instant::from_millis(2200) });
+        assert_eq!(s.rto_backoff, 2);
+        for (expiry, (at, next)) in (3..).zip([(2200, 4600), (4600, 9400), (9400, 19_000)]) {
+            recv_nothing!(s, time at - 1);
+            recv!(s, time at, [syn_ack]);
+            assert_eq!(s.rto_backoff, expiry);
+            assert_eq!(s.timer, Timer::Retransmit { expires_at: Instant::from_millis(next) });
+        }
+        assert_eq!(s.rto_backoff, SYNACK_RETRIES);
+        recv_nothing!(s, time 18_999);
+        assert_eq!(s.state(), State::SynReceived);
+        recv_nothing!(s, time 19_000);
+        assert_eq!(s.state(), State::Listen);
+        assert_eq!(s.listen_endpoint(), LISTEN_END);
+        assert_eq!(s.tuple, None);
+    }
+
     #[test]
     fn syn_received_without_listen_endpoint_keeps_retransmitting() {
         let mut s = socket_syn_received();
