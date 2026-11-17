@@ -134,6 +134,9 @@ impl Mailbox {
 /// standard `Waker` behaves the same way when cloned, dropped or woken on another thread,
 /// so code that hands its waker to a background thread works unchanged.
 ///
+/// A wake carries no data. Store what the task waits for before calling `wake`, and have the
+/// task check for it every time it is polled.
+///
 /// A `RemoteWaker` may outlive its task. Waking it then does nothing, or gives one extra
 /// poll to a newer task that took the old task's place. After the runtime shut down, the
 /// wake is dropped.

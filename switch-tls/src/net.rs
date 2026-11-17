@@ -392,6 +392,8 @@ pub async fn tls_connect(
 
 /// Sends `bytes` through `lower` (for TLS, `&mut tls.tx`), a frame and one record at a time,
 /// waiting for TCP room for each. The error is `lower`'s, [`TxError`] for TLS.
+/// It does not read, so if the peer also sends without reading, both sides can end up
+/// waiting for TCP room.
 ///
 /// Dropped before it returns, it may have sent a prefix of `bytes` in whole records. Dropped
 /// while a sealed record waits for room, it breaks the connection: later sends fail with
