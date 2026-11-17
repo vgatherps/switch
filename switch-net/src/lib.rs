@@ -247,6 +247,19 @@ impl Inner {
             }
         }
     }
+
+    /// Resets the TCP socket of entry `index` now, before its halves drop. Sharing a card,
+    /// dropping the halves then sends no `Close`, which the daemon would hold until every
+    /// send ring is empty.
+    fn abort(&mut self, index: u32) {
+        match self {
+            Self::Local(local) => {
+                let (stack, handle) = local.tcp(index);
+                stack.abort(handle);
+            }
+            Self::Remote(remote) => remote.abort(index),
+        }
+    }
 }
 
 /// A side's readiness token: entry index and side.
@@ -817,6 +830,38 @@ impl NetHandle {
     ///
     /// As [`NetHandle::tcp_connect`].
     pub fn tcp_accept(&self, config: tcp::Config, local: IpListenEndpoint) -> Accepting {
+        Accepting { opening: Some(self.open_listening(config, local)) }
+    }
+
+    /// Opens `backlog` TCP sockets listening on `local`, whose connections
+    /// [`TcpListener::accept`] returns.
+    ///
+    /// Each socket takes a slot in the Net's socket table. If one cannot be opened, the
+    /// sockets already opened are closed and its error is returned: `Unaddressable` for port 0
+    /// or an address the Net does not own, `SocketsFull`, `InvalidState`, and when sharing a
+    /// card `InvalidConfig` and `HostLost`. When sharing a card, the daemon checks the endpoint
+    /// and its own socket table after the call, and an open it rejects is returned by `accept`.
+    ///
+    /// # Panics
+    ///
+    /// If `backlog` is 0, and as [`NetHandle::tcp_connect`].
+    pub fn tcp_listen(
+        &self,
+        config: tcp::Config,
+        local: IpListenEndpoint,
+        backlog: usize,
+    ) -> Result<TcpListener, Error> {
+        assert!(backlog != 0, "tcp_listen backlog must be at least 1");
+        let mut listener = TcpListener { handle: self.clone(), config, local, backlog, queue: VecDeque::new() };
+        for _ in 0..backlog {
+            let accepting = listener.open()?;
+            listener.queue.push_back(accepting);
+        }
+        Ok(listener)
+    }
+
+    /// One TCP socket listening on `local`.
+    fn open_listening(&self, config: tcp::Config, local: IpListenEndpoint) -> Result<Opening, Error> {
         let index = {
             let mut inner = self.shared.borrow_mut();
             match &mut *inner {
@@ -825,13 +870,9 @@ impl NetHandle {
             }
         };
         if let Some(index) = index {
-            return Accepting { opening: Some(index.map(|index| self.opening(index))) };
+            return index.map(|index| self.opening(index));
         }
-        Accepting {
-            opening: Some(self.open_tcp(config, |stack, handle| {
-                stack.listen(handle, local).map_err(Error::from)
-            })),
-        }
+        self.open_tcp(config, |stack, handle| stack.listen(handle, local).map_err(Error::from))
     }
 
     fn open_tcp(
@@ -1062,6 +1103,100 @@ impl Future for Accepting {
             let opening = this.opening.take().expect("opening present until completion");
             result.map(|mss| opening.expect("socket opened").finish(mss))
         })
+    }
+}
+
+/// TCP sockets listening on one endpoint, from [`NetHandle::tcp_listen`];
+/// [`accept`](TcpListener::accept) returns their connections.
+///
+/// The listener keeps up to `backlog` sockets, which bounds the connections waiting for
+/// `accept`, those still in the handshake included. A connection completes the handshake and
+/// receives data while it waits, with no task in `accept`. A handshake the peer does not
+/// complete is given up after five SYN-ACK retransmissions, about 19 s, and the socket listens
+/// again. A SYN that arrives while every socket holds a connection is reset, unless another
+/// socket listens on the port. The listener takes `backlog` slots of the Net's socket table,
+/// and each accepted stream keeps the slot of its socket.
+///
+/// Dropping the listener resets the connections not yet accepted and closes its listening
+/// sockets, so a SYN to the port is then refused unless another socket listens on it. When
+/// sharing a card, the daemon does this asynchronously.
+pub struct TcpListener {
+    handle: NetHandle,
+    config: tcp::Config,
+    local: IpListenEndpoint,
+    backlog: usize,
+    /// Each holds an open socket; an accept that resolves is removed.
+    queue: VecDeque<Accepting>,
+}
+
+impl TcpListener {
+    /// Resolves to the next connection.
+    ///
+    /// Each call first opens sockets until the listener holds `backlog` again, and the socket
+    /// of the returned connection is replaced. A socket that cannot be opened, for example
+    /// because the socket table is full, is tried again by the next call; its error is
+    /// returned only when the listener has no socket left. When sharing a card, the daemon
+    /// can reject an open after the call that made it returned, and one call of `accept`
+    /// returns that error. When several connections are waiting, which one is returned is
+    /// unspecified. A connection that closed before `accept` is still returned, as for
+    /// [`NetHandle::tcp_accept`].
+    ///
+    /// Dropping the future leaves the waiting connections in the listener.
+    pub fn accept(&mut self) -> Accept<'_> {
+        Accept { listener: self }
+    }
+
+    fn open(&self) -> Result<Accepting, Error> {
+        let opening = self.handle.open_listening(self.config, self.local)?;
+        Ok(Accepting { opening: Some(Ok(opening)) })
+    }
+}
+
+impl Drop for TcpListener {
+    fn drop(&mut self) {
+        let mut inner = self.handle.shared.borrow_mut();
+        for accepting in &self.queue {
+            let Some(Ok(opening)) = &accepting.opening else {
+                unreachable!("a queued accept holds an open socket")
+            };
+            inner.abort(opening.rx.0.index);
+        }
+    }
+}
+
+/// Future from [`TcpListener::accept`]; resolves to `Result<TcpStream, Error>`.
+pub struct Accept<'a> {
+    listener: &'a mut TcpListener,
+}
+
+impl Future for Accept<'_> {
+    type Output = Result<TcpStream, Error>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let listener = &mut *self.get_mut().listener;
+        let mut failed = None;
+        while listener.queue.len() < listener.backlog {
+            match listener.open() {
+                Ok(accepting) => listener.queue.push_back(accepting),
+                Err(error) => {
+                    failed = Some(error);
+                    break;
+                }
+            }
+        }
+        for position in 0..listener.queue.len() {
+            if let Poll::Ready(result) = Pin::new(&mut listener.queue[position]).poll(cx) {
+                listener.queue.remove(position);
+                if let Ok(accepting) = listener.open() {
+                    listener.queue.push_back(accepting);
+                }
+                return Poll::Ready(result);
+            }
+        }
+        match failed {
+            Some(error) if listener.queue.is_empty() => Poll::Ready(Err(error)),
+            _ => Poll::Pending,
+        }
     }
 }
 

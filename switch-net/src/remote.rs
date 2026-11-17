@@ -157,6 +157,19 @@ impl Remote {
         }
     }
 
+    /// Sends `AbortTcp`, which the daemon applies at once, and unregisters the socket, so
+    /// `release` sends no `Close`. A rejected open has nothing to abort.
+    pub fn abort(&mut self, index: u32) {
+        let id = self.entry(index).id;
+        if self.by_slot[id.slot as usize] != Some(index) {
+            return;
+        }
+        self.by_slot[id.slot as usize] = None;
+        if !self.lost {
+            self.session.abort(id);
+        }
+    }
+
     fn drain_packets(&mut self) {
         let entries = &mut self.entries;
         let by_slot = &self.by_slot;

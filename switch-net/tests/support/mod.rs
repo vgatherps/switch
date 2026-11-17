@@ -31,13 +31,15 @@ pub enum Backend {
 
 #[allow(unused_macros)]
 macro_rules! both_backends {
-    ($conduit:ident, $junction:ident, |$backend:ident| $body:block) => {
+    ($(#[$attr:meta])* $conduit:ident, $junction:ident, |$backend:ident| $body:block) => {
         #[switch_test_support::pinned_test]
+        $(#[$attr])*
         fn $conduit() {
             let $backend = support::Backend::Conduit;
             $body
         }
         #[switch_test_support::pinned_test]
+        $(#[$attr])*
         fn $junction() {
             let $backend = support::Backend::Junction;
             $body
