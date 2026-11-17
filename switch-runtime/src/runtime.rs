@@ -293,6 +293,13 @@ pub struct Spawner {
     control: Rc<Control>,
 }
 
+#[crate::task]
+fn dynamic<O: 'static>(
+    future: std::pin::Pin<Box<dyn Future<Output = O>>>,
+) -> impl Future<Output = O> {
+    future
+}
+
 impl Spawner {
     /// A sleep that completes once the runtime's tick reaches `deadline`. A deadline at or
     /// before the current tick completes on its first poll.
@@ -362,6 +369,34 @@ impl Spawner {
         let (sender, receiver) = oneshot::channel();
         self.submit(token, Some(sender))?;
         Ok(JoinHandle::new(receiver))
+    }
+
+    /// Spawns any `'static` future, which need not be `Send`, without a task function, and
+    /// returns a [`JoinHandle`] that resolves to its output. The future is boxed, which costs
+    /// one more allocation per spawn and one more dynamic call per poll than
+    /// [`Self::spawn_join`] with a task function. Otherwise as `spawn_join`.
+    ///
+    /// ```
+    /// use switch_runtime::{Runtime, Spawner};
+    ///
+    /// #[switch_runtime::task]
+    /// async fn parent(spawner: Spawner) {
+    ///     let handle = spawner.spawn_dynamic(async { 6 * 7 }).unwrap();
+    ///     assert_eq!(handle.await, Ok(42));
+    /// }
+    ///
+    /// let mut runtime = Runtime::new(0);
+    /// runtime.spawner().spawn(parent(runtime.spawner())).unwrap();
+    /// while runtime.poll(0).unwrap().live_tasks != 0 {}
+    /// ```
+    pub fn spawn_dynamic<F>(
+        &self,
+        future: F,
+    ) -> Result<JoinHandle<F::Output>, SpawnError<impl Task<Output = F::Output> + use<F>>>
+    where
+        F: Future + 'static,
+    {
+        self.spawn_join(dynamic(Box::pin(future)))
     }
 
     #[inline]

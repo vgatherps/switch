@@ -37,6 +37,8 @@ child polled
 
 A [`JoinHandle`](crate::JoinHandle) ([Your first task](crate::guide::first_task)) resolves to `Err(Canceled)` if the task panicked or the runtime was shut down. Dropping the handle leaves the task running.
 
+[`Spawner::spawn_dynamic`](crate::Spawner::spawn_dynamic) spawns any `'static` future without a task function and returns its `JoinHandle`. It boxes the future, which costs an allocation per spawn and a dynamic call per poll.
+
 ## Sleeping
 
 [Your first task](crate::guide::first_task) slept with `spawner.sleep(ticks)`; `spawner.sleep_until(tick)` waits for an absolute tick.

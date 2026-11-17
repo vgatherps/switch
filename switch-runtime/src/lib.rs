@@ -22,8 +22,9 @@ mod waker;
 
 /// Turns a boxed future into a [`SpawnToken`], for spawns where writing a
 /// [`#[task]`](../switch/attr.task.html) function is not practical. It costs one heap allocation per
-/// spawn and one dynamic call per poll; a task function's future is stored in place, with
-/// neither.
+/// spawn and one more dynamic call per poll than a task function, whose future is stored in
+/// place. [`Spawner::spawn_dynamic`] spawns a boxed future of any output type and returns its
+/// `JoinHandle`.
 #[task]
 pub fn boxed(future: std::pin::Pin<Box<dyn Future<Output = ()>>>) -> impl Future<Output = ()> {
     future
