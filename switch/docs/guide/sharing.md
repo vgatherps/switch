@@ -125,8 +125,6 @@ async fn send(tx: &mut TcpTx, mut frame: ImmutableFrame) -> Result<(), Error> {
 }
 ```
 
-Because a slow peer exerts no backpressure through the daemon, a program that streams without end to such a peer should pace itself by its own protocol's acknowledgements.
-
 ## When the daemon goes away
 
 If the daemon stops or crashes, `round` soon returns `RoundError::Turn(TurnError::HostLost(_))`. Leave the loop, shut the runtime down and exit; the session cannot be resumed.

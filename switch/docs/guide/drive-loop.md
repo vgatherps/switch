@@ -63,7 +63,7 @@ Both times must be monotonic, which `std::time::Instant` guarantees. Pass the sa
 
 ## Going round without pause, or sleeping
 
-The loop above busy-polls, which is how a latency-sensitive program runs on an isolated CPU. `docs/operations/cpus.md` in the repository explains how to isolate one.
+The loop above busy-polls. `docs/operations/cpus.md` in the repository explains how to isolate a CPU for it.
 
 A program that shares its CPU can sleep when a round did nothing. `round` returns `false` when no packet was received or sent, none is waiting, and no task ran:
 

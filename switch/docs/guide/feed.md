@@ -983,7 +983,7 @@ This is the setup of [the first network program](crate::guide::first_connection)
 }
 ```
 
-The [loop](crate::guide::drive_loop) sleeps a millisecond after an idle round, which suits a program that prints to a terminal. A latency-sensitive feed handler busy-polls on an isolated CPU instead.
+The [loop](crate::guide::drive_loop) sleeps a millisecond after an idle round; without the sleep it busy-polls.
 
 The loop needs no time limit, because every wait in the task has one and the task always ends. When it has, the program [shuts down](crate::guide::shutdown) in order.
 

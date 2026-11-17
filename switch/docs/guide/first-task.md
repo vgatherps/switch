@@ -109,10 +109,6 @@ ten ticks passed
 tick 10: polled 1, live 0
 ```
 
-`spawner.sleep(10)` creates a timer that is due ten ticks after the latest tick the runtime was given, here at tick 10. The task runs as far as the sleep at tick 0, the polls at ticks 5 and 9 find nothing to run, and the poll at tick 10 wakes it.
-
-A sleep ends only when a poll passes a tick that has reached its deadline. The two earlier loops pass 0 on every poll, which works for tasks that never sleep. Had `hello` slept, its loop would have spun forever at tick 0.
-
-A real program reads a clock once per iteration of its loop and passes the reading as the tick. The network programs in this guide use nanoseconds since the program started.
+`spawner.sleep(10)` creates a timer that is due ten ticks after the latest tick the runtime was given, and the sleep ends in the first poll whose tick has reached that deadline. A loop that passes a constant tick, as the two earlier loops do, therefore never ends a nonzero sleep. A real program reads a clock once per iteration and passes the reading as the tick; the network programs in this guide use nanoseconds since the program started.
 
 Network programs need more than cargo to build. Next: [Setting up for network programs](crate::guide::setup).

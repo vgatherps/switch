@@ -7,7 +7,7 @@ A program that uses the network enables the `net` feature of `switch`:
 switch = { path = "<clone>/switch", features = ["net"] }
 ```
 
-The feature builds only on Linux with DPDK 25.11.3 installed, the exact version switch is built against. The repository has a Docker image with everything installed, which is the quickest way to start on any machine, a Mac included.
+The feature builds only on Linux with DPDK 25.11.3 installed. The repository's Docker image has both and runs on any Docker host, macOS included.
 
 ## In a container
 

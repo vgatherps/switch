@@ -24,7 +24,7 @@ The frames come from a pool of fixed size that all sockets share, sized by `fram
 
 The sending calls, `try_send` on TCP and `send` on UDP, take the `ImmutableFrame` and return at once. A call that fails returns the same frame with the error, so the frame can be sent again.
 
-A frame with no other handle that still starts where `tx_frame` gave it is sent in place, provided it goes out as one packet of its own. A shared or sliced frame is copied, TCP copies a frame it has to split or merge with the one before it, and a retransmission can copy again. The references for [`TcpTx::try_send`](crate::net::TcpTx::try_send) and [`UdpTx::send`](crate::net::UdpTx::send) give the exact rules.
+A frame can be sent in place, without a copy. [`TcpTx::try_send`](crate::net::TcpTx::try_send) and [`UdpTx::send`](crate::net::UdpTx::send) list the cases in which it is copied instead.
 
 ## Receiving
 

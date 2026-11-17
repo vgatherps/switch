@@ -1,6 +1,6 @@
 # switch
 
-switch is an async userspace network stack for Rust, built on DPDK, for programs that need low, predictable latency such as market-data feeds and order gateways. It provides TCP and UDP sockets, a TLS 1.3 client, and WebSocket clients and servers.
+switch is a userspace network stack and async runtime for Rust, built on DPDK. It provides TCP and UDP sockets, a TLS 1.3 client, and WebSocket clients and servers.
 
 ## Using it
 
