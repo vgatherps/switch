@@ -18,7 +18,7 @@ mod support;
 use support::{
     bind,
     cancel_after_one_poll, connect, counted, local, net_ip, peer_endpoint, peer_listen, peer_send, peer_udp_send,
-    silent_syn, tcp_config, udp_config, Mixed, LOCAL_PORT, PEER_PORT, SILENT_MAC,
+    inject_syn, silent_syn, tcp_config, udp_config, Mixed, LOCAL_PORT, PEER_PORT, SILENT_MAC, UNRESOLVED_IP,
 };
 
 /// The peer's queued segments all acknowledged, then a reset from the peer
@@ -418,6 +418,64 @@ support::both_backends!(accept_survives_unanswered_syn_ack_conduit, accept_survi
         mixed.close();
     })
 });
+
+// A SYN from an address whose MAC never resolves: no SYN-ACK can leave. The listener still
+// gives the handshake up (later than when its SYN-ACKs leave, about 22 s, since a socket
+// waiting for a neighbor is retried once a second) and the accept resolves on the next
+// connection.
+support::both_backends!(accept_survives_unresolved_syn_source_conduit, accept_survives_unresolved_syn_source_junction, |backend| {
+    with_eal(|eal| {
+        let mut mixed = Mixed::new(eal, ["asra", "asrb"], backend);
+        mixed.to_peer.impair(|bytes| {
+            let eth = EthernetFrame::new_checked(bytes).unwrap();
+            if eth.ethertype() == EthernetProtocol::Ipv4 {
+                let ip = Ipv4Packet::new_checked(eth.payload()).unwrap();
+                assert_ne!(ip.dst_addr(), UNRESOLVED_IP, "a segment left for the unresolved address");
+            }
+            Verdict::Deliver
+        });
+        let accepting = mixed.handle().tcp_accept(tcp_config(), local(LOCAL_PORT));
+        let slot = mixed.spawn(accepting);
+        mixed.turn();
+        inject_syn(&mut mixed, UNRESOLVED_IP, PEER_PORT);
+        mixed.turn();
+        let start = mixed.now;
+        let net_end = IpEndpoint::new(net_ip().into(), LOCAL_PORT);
+
+        run_to(&mut mixed, start + Duration::from_secs(18));
+        assert!(!slot.is_full(), "accept resolved on an unfinished handshake");
+        // The listener is still held by the unresolved handshake: a SYN now is refused.
+        let refused = mixed.peer.add_tcp(tcp_config()).unwrap();
+        mixed.peer.connect(&refused, net_end, PEER_PORT + 1).unwrap();
+        mixed.until(|m| m.peer.tcp(&refused).state() == State::Closed);
+        assert!(mixed.peer.tcp(&refused).reset_by_peer());
+        mixed.peer.remove_tcp(refused);
+
+        // Nothing is scheduled once the handshake is given up, so the clock is stepped.
+        run_to(&mut mixed, start + Duration::from_secs(23));
+        assert!(!slot.is_full(), "accept resolved on an unfinished handshake");
+        let peer = mixed.peer.add_tcp(tcp_config()).unwrap();
+        mixed.peer.connect(&peer, net_end, PEER_PORT + 2).unwrap();
+        mixed.until(|m| matches!(m.peer.tcp(&peer).state(), State::Established | State::Closed));
+        assert_eq!(mixed.peer.tcp(&peer).state(), State::Established, "the listener refused the next SYN");
+        let stream = mixed.wait(&slot).unwrap();
+        drop((stream, peer));
+        mixed.close();
+    })
+});
+
+/// Steps the clock 100 ms at a time up to `at`, with rounds at each step until nothing moves
+/// (at most 10).
+fn run_to(mixed: &mut Mixed, at: switch_net::Instant) {
+    while mixed.now < at {
+        mixed.now = (mixed.now + Duration::from_millis(100)).min(at);
+        for _ in 0..10 {
+            if !mixed.round() {
+                break;
+            }
+        }
+    }
+}
 
 // Two accepts on one port serve two connections.
 support::both_backends!(two_accepts_on_one_port_serve_two_connections_conduit, two_accepts_on_one_port_serve_two_connections_junction, |backend| {

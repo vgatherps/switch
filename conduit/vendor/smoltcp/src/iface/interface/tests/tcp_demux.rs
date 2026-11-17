@@ -1001,6 +1001,51 @@ fn synack_give_up_rekeys_to_listener_chain() {
     sockets.check_flow_index();
 }
 
+/// A passive open whose SYN-ACK can never leave (the peer's MAC never resolves) is still given
+/// up: only ARP requests go out, the socket listens again within 23 s, and once the peer
+/// resolves another peer's SYN reaches it.
+#[test]
+fn synack_give_up_without_neighbor() {
+    let (mut iface, mut sockets, mut device) = crate::tests::setup(crate::phy::Medium::Ethernet);
+    let mut listener = socket();
+    listener.listen(LOCAL_PORT).unwrap();
+    let handle = sockets.add(listener);
+    receive(&mut iface, &mut sockets, &mut device, Instant::ZERO, segment(TcpControl::Syn, REMOTE_SEQ, None));
+    // Every millisecond, so no deadline of the socket or its neighbor retry is skipped.
+    for ms in 0..=23_000 {
+        iface.poll(Instant::from_millis(ms), &mut device, &mut sockets);
+        for frame in device.tx_queue.drain(..) {
+            let eth = EthernetFrame::new_checked(&frame[..]).unwrap();
+            assert_eq!(eth.ethertype(), EthernetProtocol::Arp, "only ARP requests can leave");
+        }
+        if ms == 18_000 {
+            assert_eq!(sockets.get(handle).state(), tcp::State::SynReceived);
+        }
+    }
+    assert_eq!(sockets.get(handle).state(), tcp::State::Listen);
+    assert_eq!(sockets.get(handle).remote_endpoint(), None);
+    sockets.check_flow_index();
+
+    iface.resolve_neighbor(crate::tests::PEER, crate::tests::PEER_HARDWARE);
+    receive(
+        &mut iface,
+        &mut sockets,
+        &mut device,
+        Instant::from_millis(23_000),
+        TcpRepr {
+            src_port: REMOTE_PORT + 1,
+            ..segment(TcpControl::Syn, REMOTE_SEQ, None)
+        },
+    );
+    assert_eq!(sockets.get(handle).state(), tcp::State::SynReceived);
+    assert_eq!(sockets.get(handle).remote_endpoint().unwrap().port, REMOTE_PORT + 1);
+    let bytes = take_reply(&mut device);
+    let synack = reply(&bytes);
+    assert_eq!(synack.dst_port, REMOTE_PORT + 1);
+    assert_eq!(synack.control, TcpControl::Syn);
+    sockets.check_flow_index();
+}
+
 /// A listener bound to the SYN's destination address beats an all-IP listener on the port,
 /// in either slot order; then an exact tuple beats any listener.
 #[test]

@@ -330,13 +330,19 @@ pub fn peer_send(mixed: &mut Mixed, peer: &dpdk_smoltcp::TcpHandle, data: &[u8])
 pub const SILENT_IP: Ipv4Address = Ipv4Address::new(10, 0, 0, 3);
 /// No Stack owns this MAC: the Net's frames to it reach the peer's port, whose Stack drops them.
 pub const SILENT_MAC: EthernetAddress = EthernetAddress([0x02, 0, 0, 0, 0, 0x0f]);
+/// An address in the Net's subnet that nothing answers ARP for.
+pub const UNRESOLVED_IP: Ipv4Address = Ipv4Address::new(10, 0, 0, 4);
 
 /// Injects an ARP request that teaches the Net `SILENT_MAC` for `SILENT_IP`, then a SYN from
 /// `SILENT_IP:port` to the Net's `LOCAL_PORT`. Nothing ever answers the Net's replies.
 pub fn silent_syn(mixed: &mut Mixed, port: u16) {
-    let silent = (SILENT_MAC, SILENT_IP);
-    let request = arp(ArpOperation::Request, EthernetAddress::BROADCAST, silent, (EthernetAddress([0; 6]), net_ip()));
+    let request = arp(ArpOperation::Request, EthernetAddress::BROADCAST, (SILENT_MAC, SILENT_IP), (EthernetAddress([0; 6]), net_ip()));
     mixed.to_net.inject(&request);
+    inject_syn(mixed, SILENT_IP, port);
+}
+
+/// Injects a SYN from `src:port` (sent from `SILENT_MAC`) to the Net's `LOCAL_PORT`.
+pub fn inject_syn(mixed: &mut Mixed, src: Ipv4Address, port: u16) {
     let syn = TcpRepr {
         src_port: port,
         dst_port: LOCAL_PORT,
@@ -351,7 +357,7 @@ pub fn silent_syn(mixed: &mut Mixed, port: u16) {
         timestamp: None,
         payload: &[],
     };
-    mixed.to_net.inject(&pair::tcp_frame_between(silent, (Side::A.mac(), net_ip()), &syn));
+    mixed.to_net.inject(&pair::tcp_frame_between((SILENT_MAC, src), (Side::A.mac(), net_ip()), &syn));
 }
 
 /// Peer sends `payload` to the Net's `port`, turning until the Net's MAC is resolved.

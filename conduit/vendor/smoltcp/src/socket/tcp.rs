@@ -3293,7 +3293,13 @@ impl<'a> Socket<'a> {
         if self.orphaned && self.state == State::Closed {
             self.tuple = None;
         }
-        if result.is_err() && (self.orphaned || self.retry_limited) && segment_len > 0 {
+        // A passive open retries its SYN-ACK even when it cannot leave (no neighbor), so the
+        // SYN-ACK give-up still returns the socket to LISTEN.
+        if result.is_err()
+            && (self.orphaned || self.retry_limited
+                || (self.state == State::SynReceived && self.listen_endpoint.port != 0))
+            && segment_len > 0
+        {
             let delay = self.retransmission_timeout();
             if is_zero_window_probe {
                 self.timer.set_for_zero_window_probe(cx.now(), delay);
@@ -5562,6 +5568,40 @@ mod test {
         assert_eq!(s.state(), State::Listen);
         assert_eq!(s.tuple, None);
         recv_nothing(&mut s, t);
+    }
+
+    /// Every SYN-ACK emit fails (no neighbor): the retransmit timer still runs, at the same
+    /// deadlines as for sent SYN-ACKs, and the passive open is given up at the same time.
+    #[test]
+    fn syn_received_failed_synack_emits_give_up_and_listen() {
+        let mut s = socket();
+        s.socket.listen(LISTEN_END).unwrap();
+        send(&mut s, Instant::ZERO, &SEND_TEMPL.syn().seq(REMOTE_SEQ).no_ack());
+        let fail = |s: &mut TestSocket, at: Instant| {
+            s.cx.set_now(at);
+            s.socket.dispatch(&mut s.cx, |_, _, (_, repr, frame)| {
+                assert_eq!(repr.control, TcpControl::Syn);
+                (Err::<(), _>(()), frame.map(OwnedFrame::freeze))
+            })
+        };
+        assert_eq!(fail(&mut s, Instant::ZERO), Err(()));
+        for (expiry, at) in (1..).zip([300, 900, 2100, 4500, 9300]) {
+            assert_eq!(s.timer, Timer::Retransmit { expires_at: Instant::from_millis(at) });
+            assert_eq!(fail(&mut s, Instant::from_millis(at)), Err(()));
+            assert_eq!(s.rto_backoff, expiry);
+            assert_eq!(s.state(), State::SynReceived);
+        }
+        let give_up = Instant::from_millis(18_900);
+        assert_eq!(s.timer, Timer::Retransmit { expires_at: give_up });
+        recv_nothing(&mut s, give_up);
+        assert_eq!(s.state(), State::Listen);
+        assert_eq!(s.listen_endpoint(), LISTEN_END);
+        assert_eq!(s.tuple, None);
+
+        let other = IpEndpoint { port: REMOTE_PORT + 1, ..REMOTE_END };
+        send(&mut s, give_up, &TcpRepr { src_port: other.port, ..SEND_TEMPL.syn().seq(REMOTE_SEQ).no_ack() });
+        assert_eq!(s.state(), State::SynReceived);
+        assert_eq!(s.remote_endpoint(), Some(other));
     }
 
     #[test]
