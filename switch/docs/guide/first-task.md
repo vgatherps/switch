@@ -109,6 +109,6 @@ ten ticks passed
 tick 10: polled 1, live 0
 ```
 
-`spawner.sleep(10)` creates a timer that is due ten ticks after the latest tick the runtime was given, and the sleep ends in the first poll whose tick has reached that deadline. A program reads a clock once per iteration and passes the reading as the tick; the network programs in this guide use nanoseconds since the program started.
+`spawner.sleep(10)` completes once the tick is at least 10 more than it was when `sleep` was called. The tick is usually a clock reading, and the network programs in this guide use nanoseconds since the program started.
 
-Network programs need more than cargo to build. Next: [Setting up for network programs](crate::guide::setup).
+Next: [Setting up for network programs](crate::guide::setup).
