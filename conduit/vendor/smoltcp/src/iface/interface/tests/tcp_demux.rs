@@ -2202,3 +2202,114 @@ fn time_wait_syn_fin_is_acked_with_or_without_listener() {
         sockets.check_flow_index();
     }
 }
+
+/// The control flag of the one reply to `tcp` sent to `dst`, which must come from `dst`, or
+/// `None` if there is no reply.
+fn reply_control(
+    iface: &mut Interface,
+    sockets: &mut TcpSet,
+    device: &mut TestingDevice,
+    tcp: TcpRepr,
+    dst: Ipv4Address,
+) -> Option<TcpControl> {
+    device.rx_queue.push_back(wrap_eth(&packet_bytes_to(tcp, dst)));
+    iface.poll(Instant::ZERO, device, sockets);
+    let bytes = device.tx_queue.pop_front()?;
+    assert!(device.tx_queue.is_empty());
+    let (src, reply) = reply_from(&bytes);
+    assert_eq!(src, dst);
+    Some(reply.control)
+}
+
+fn syn_from(port: u16) -> TcpRepr<'static> {
+    TcpRepr { src_port: port, ..segment(TcpControl::Syn, REMOTE_SEQ, None) }
+}
+
+/// A registered listener endpoint with no socket in LISTEN: a pure SYN to it gets no reply,
+/// while a SYN-ACK, an ACK and a data segment that match no socket still get an RST, and so does
+/// a SYN to a port that is not registered.
+#[test]
+fn registered_endpoint_drops_only_a_pure_syn() {
+    let (mut iface, mut sockets, mut device) = setup_eth();
+    sockets.add_listener_port(IpListenEndpoint::from(LOCAL_PORT));
+    let ack = Some(TcpSeqNumber(7));
+    for (tcp, expected) in [
+        (syn_from(REMOTE_PORT), None),
+        (segment(TcpControl::Syn, REMOTE_SEQ, ack), Some(TcpControl::Rst)),
+        (segment(TcpControl::None, REMOTE_SEQ, ack), Some(TcpControl::Rst)),
+        (
+            TcpRepr { payload: b"abc", ..segment(TcpControl::None, REMOTE_SEQ, ack) },
+            Some(TcpControl::Rst),
+        ),
+        (TcpRepr { dst_port: LOCAL_PORT + 1, ..syn_from(REMOTE_PORT) }, Some(TcpControl::Rst)),
+    ] {
+        assert_eq!(
+            reply_control(&mut iface, &mut sockets, &mut device, tcp, LOCAL_ADDR),
+            expected,
+            "{tcp:?}"
+        );
+    }
+}
+
+/// A registration without an address covers the port on every owned address; one with an
+/// address covers only that address.
+#[test]
+fn listener_port_covers_its_addresses() {
+    let (mut iface, mut sockets, mut device) = setup_eth();
+    own_prefix(&mut iface);
+    let owned = Ipv4Address::new(10, 9, 0, 1);
+    let all = IpListenEndpoint::from(LOCAL_PORT);
+    sockets.add_listener_port(all);
+    for dst in [LOCAL_ADDR, owned] {
+        let reply = reply_control(&mut iface, &mut sockets, &mut device, syn_from(REMOTE_PORT), dst);
+        assert_eq!(reply, None, "{dst}");
+    }
+    sockets.remove_listener_port(all);
+    sockets.add_listener_port(IpListenEndpoint::from((owned, LOCAL_PORT)));
+    let reply = reply_control(&mut iface, &mut sockets, &mut device, syn_from(REMOTE_PORT), owned);
+    assert_eq!(reply, None);
+    let reply = reply_control(&mut iface, &mut sockets, &mut device, syn_from(REMOTE_PORT), LOCAL_ADDR);
+    assert_eq!(reply, Some(TcpControl::Rst));
+}
+
+/// Two registrations of one endpoint need two removals before a SYN to it is reset again.
+#[test]
+fn each_listener_port_registration_needs_its_removal() {
+    let (mut iface, mut sockets, mut device) = setup_eth();
+    let local = IpListenEndpoint::from(LOCAL_PORT);
+    sockets.add_listener_port(local);
+    sockets.add_listener_port(local);
+    sockets.remove_listener_port(local);
+    let reply = reply_control(&mut iface, &mut sockets, &mut device, syn_from(REMOTE_PORT), LOCAL_ADDR);
+    assert_eq!(reply, None);
+    sockets.remove_listener_port(local);
+    let reply = reply_control(&mut iface, &mut sockets, &mut device, syn_from(REMOTE_PORT), LOCAL_ADDR);
+    assert_eq!(reply, Some(TcpControl::Rst));
+}
+
+#[test]
+#[should_panic(expected = "not added")]
+fn removing_an_unregistered_listener_port_panics() {
+    let (_, mut sockets, _) = setup_eth();
+    sockets.add_listener_port(IpListenEndpoint::from((LOCAL_ADDR, LOCAL_PORT)));
+    sockets.remove_listener_port(IpListenEndpoint::from(LOCAL_PORT));
+}
+
+/// A socket in LISTEN on a registered endpoint takes the SYN; once it holds the connection, the
+/// next SYN from another port gets no reply.
+#[test]
+fn listening_socket_on_registered_endpoint_takes_the_syn() {
+    let (mut iface, mut sockets, mut device) = setup_eth();
+    sockets.add_listener_port(IpListenEndpoint::from(LOCAL_PORT));
+    let handle = sockets.add(socket());
+    sockets.listen(handle, LOCAL_PORT).unwrap();
+    let reply = reply_control(&mut iface, &mut sockets, &mut device, syn_from(REMOTE_PORT), LOCAL_ADDR);
+    assert_eq!(reply, Some(TcpControl::Syn));
+    assert_eq!(sockets.get(handle).state(), tcp::State::SynReceived);
+    let reply = reply_control(&mut iface, &mut sockets, &mut device, syn_from(REMOTE_PORT + 1), LOCAL_ADDR);
+    assert_eq!(reply, None);
+    assert_eq!(
+        sockets.get(handle).remote_endpoint(),
+        Some(IpEndpoint::new(REMOTE_ADDR.into(), REMOTE_PORT))
+    );
+}

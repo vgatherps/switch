@@ -54,6 +54,13 @@ pub(crate) fn flow_key(socket: &tcp::Socket) -> FlowKey {
     }
 }
 
+fn bind_key(local: IpListenEndpoint) -> BindKey {
+    let addr = local.addr.map(|addr| match addr {
+        IpAddress::Ipv4(addr) => addr,
+    });
+    (addr, local.port)
+}
+
 #[derive(Debug, Clone, Copy)]
 #[repr(align(64))]
 struct FlowSlot {
@@ -230,6 +237,8 @@ pub struct TcpSet<'a> {
     ready: VecDeque<usize>,
     reapable: Vec<SocketHandle>,
     fired: Vec<u32>,
+    /// The endpoints of the application's listeners, one entry per registration.
+    listener_ports: Vec<BindKey>,
 }
 
 impl<'a> TcpSet<'a> {
@@ -255,6 +264,7 @@ impl<'a> TcpSet<'a> {
             ready: VecDeque::with_capacity(slot_count),
             reapable: Vec::with_capacity(slot_count),
             fired: Vec::with_capacity(2 * slot_count),
+            listener_ports: Vec::new(),
         }
     }
 
@@ -399,6 +409,34 @@ impl<'a> TcpSet<'a> {
         self.update_identity(handle.index);
         self.identity_changed(handle.index);
         Ok(())
+    }
+
+    /// Register `local` as a listener's endpoint: a pure SYN to it that no socket takes is
+    /// dropped without a reply, so the client retransmits it. Each call adds one registration.
+    pub fn add_listener_port(&mut self, local: IpListenEndpoint) {
+        self.listener_ports.push(bind_key(local));
+    }
+
+    /// Remove one registration of `local` made by [`add_listener_port`](Self::add_listener_port).
+    ///
+    /// # Panics
+    /// This function panics if `local` has no registration.
+    pub fn remove_listener_port(&mut self, local: IpListenEndpoint) {
+        let key = bind_key(local);
+        let position = self
+            .listener_ports
+            .iter()
+            .position(|&registered| registered == key)
+            .expect("removing a listener port that was not added");
+        self.listener_ports.swap_remove(position);
+    }
+
+    /// Whether a registration covers `dst`: its port, on every address or on `dst`'s.
+    pub(crate) fn has_listener_port(&self, dst: IpEndpoint) -> bool {
+        let IpAddress::Ipv4(addr) = dst.addr;
+        self.listener_ports
+            .iter()
+            .any(|&(bound, port)| port == dst.port && bound.is_none_or(|bound| bound == addr))
     }
 
     /// [`tcp::Socket::close`] through the set: a listener, or a connection still in SYN-SENT or

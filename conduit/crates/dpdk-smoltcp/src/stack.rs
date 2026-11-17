@@ -882,6 +882,22 @@ impl Stack {
         self.sockets.listen(raw, local)
     }
 
+    /// Register `local` as a listener's endpoint: a SYN to it that no socket takes, for example
+    /// while none listens, is dropped instead of reset, and the client retransmits it. Each call
+    /// adds one registration; [`remove_listener_port`](Self::remove_listener_port) removes one.
+    pub fn add_listener_port(&mut self, local: IpListenEndpoint) {
+        self.sockets.add_listener_port(local);
+    }
+
+    /// Remove one registration of `local` made by [`add_listener_port`](Self::add_listener_port).
+    ///
+    /// # Panics
+    ///
+    /// If `local` has no registration.
+    pub fn remove_listener_port(&mut self, local: IpListenEndpoint) {
+        self.sockets.remove_listener_port(local);
+    }
+
     /// `tcp::Socket::close`: send FIN after the queued data, or, in LISTEN and
     /// SYN-SENT, close at once; in SYN-RECEIVED, reset.
     ///

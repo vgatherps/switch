@@ -64,7 +64,7 @@ async fn serve(mut stream: TcpStream) {
 }
 ```
 
-The last argument of `tcp_listen` is the backlog, the number of connections that can wait for `accept`. A waiting connection completes the handshake and receives data. The listener takes that many sockets of `max_sockets`. A SYN that arrives when all of them hold a connection is answered with an RST. Dropping the listener resets the connections that were not accepted.
+The last argument of `tcp_listen` is the backlog, the number of connections that can wait for `accept`. A waiting connection completes the handshake and receives data. The listener takes that many sockets of `max_sockets`. A SYN that arrives when all of them hold a connection is dropped, and the client retransmits it. When sharing a card it is answered with an RST instead. Dropping the listener resets the connections that were not accepted.
 
 ## Binding UDP
 

@@ -835,6 +835,9 @@ impl NetHandle {
     ) -> Result<TcpListener, Error> {
         assert!(backlog != 0, "tcp_listen backlog must be at least 1");
         let mut listener = TcpListener { handle: self.clone(), config, local, backlog, queue: VecDeque::new() };
+        if let Inner::Local(inner) = &mut *self.shared.borrow_mut() {
+            inner.stack.add_listener_port(local);
+        }
         for _ in 0..backlog {
             let accepting = listener.open()?;
             listener.queue.push_back(accepting);
@@ -1087,14 +1090,14 @@ impl Future for Accepting {
 /// `accept`, those still in the handshake included. A connection completes the handshake and
 /// receives data while it waits, with no task in `accept`. A reset during the handshake
 /// returns the socket to listening. A handshake the peer does not complete is given up after
-/// five SYN-ACK retransmissions, about 19 s, and the socket listens again. A SYN that arrives
-/// while every socket holds a connection is reset, unless another socket listens on the port.
-/// The listener takes `backlog` slots of the Net's socket table, and each accepted stream
-/// keeps the slot of its socket.
+/// five SYN-ACK retransmissions, about 19 s, and the socket listens again. A SYN that finds no
+/// socket listening on the endpoint is dropped, and the client retransmits it; when sharing a
+/// card it is reset. The listener takes `backlog` slots of the Net's socket table, and each
+/// accepted stream keeps the slot of its socket.
 ///
 /// Dropping the listener resets the connections not yet accepted and closes its listening
-/// sockets, so a SYN to the port is then refused unless another socket listens on it. When
-/// sharing a card, the slots of these sockets are free once the daemon confirms.
+/// sockets. A SYN to the port is then refused, unless another listener or socket listens on
+/// it. When sharing a card, the slots of these sockets are free once the daemon confirms.
 pub struct TcpListener {
     handle: NetHandle,
     config: tcp::Config,
@@ -1136,6 +1139,9 @@ impl TcpListener {
 impl Drop for TcpListener {
     fn drop(&mut self) {
         let mut inner = self.handle.shared.borrow_mut();
+        if let Inner::Local(local) = &mut *inner {
+            local.stack.remove_listener_port(self.local);
+        }
         for accepting in &self.queue {
             let opening = accepting.opening.as_ref().expect("a queued accept holds an open socket");
             inner.abort(opening.rx.0.index);

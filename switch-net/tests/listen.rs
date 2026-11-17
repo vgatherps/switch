@@ -167,28 +167,83 @@ support::both_backends!(backlog_n_takes_n_simultaneous_connects_conduit, backlog
     })
 });
 
-// With both sockets holding unaccepted connections, a third peer is reset. An `accept` opens a
-// replacement, which takes the next peer.
-support::both_backends!(connect_beyond_backlog_is_refused_conduit, connect_beyond_backlog_is_refused_junction, |backend| {
+// With both sockets holding unaccepted connections, a third peer connects. Owning the card, its
+// SYN gets no reply; after one `accept` the replacement socket takes its retransmitted SYN.
+// Sharing a card, it is reset, and the replacement takes the next peer. Every connection then
+// carries data.
+support::both_backends!(connect_beyond_backlog_waits_or_is_refused_conduit, connect_beyond_backlog_waits_or_is_refused_junction, |backend| {
     with_eal(|eal| {
         let mut mixed = Mixed::with_sockets(eal, ["lcba", "lcbb"], 4, 0, backend);
         let listener = listen(&mut mixed, 2);
         let first = peer_connect(&mut mixed, PEER_PORT);
         let second = peer_connect(&mut mixed, PEER_PORT + 1);
         established(&mut mixed, &[&first, &second]);
-        let refused = peer_connect(&mut mixed, PEER_PORT + 2);
-        reset(&mut mixed, &refused, "a third connection got in with a backlog of 2");
-        mixed.peer.remove_tcp(refused);
+        let extra = peer_connect(&mut mixed, PEER_PORT + 2);
+        let waiting = match backend {
+            Backend::Conduit => {
+                mixed.rounds(4);
+                let socket = mixed.peer.tcp(&extra);
+                assert!(socket.state() == State::SynSent && !socket.reset_by_peer(), "the extra SYN got a reply: {}", socket.state());
+                Some(extra)
+            }
+            Backend::Junction => {
+                reset(&mut mixed, &extra, "a third connection got in with a backlog of 2");
+                mixed.peer.remove_tcp(extra);
+                None
+            }
+        };
         let (listener, accepted) = accept(&mut mixed, listener);
         mixed.turn();
-        let later = peer_connect(&mut mixed, PEER_PORT + 3);
+        let later = waiting.unwrap_or_else(|| peer_connect(&mut mixed, PEER_PORT + 3));
         established(&mut mixed, &[&later]);
         let (listener, second_accepted) = accept(&mut mixed, listener);
         let (listener, third_accepted) = accept(&mut mixed, listener);
-        drop((listener, accepted, second_accepted, third_accepted, first, second, later));
+        let peers = [first, second, later];
+        for (i, peer) in peers.iter().enumerate() {
+            peer_send(&mut mixed, peer, &[i as u8]);
+        }
+        let mut streams = Vec::new();
+        let mut seen = Vec::new();
+        for stream in [accepted, second_accepted, third_accepted] {
+            let (stream, payload) = recv(&mut mixed, stream);
+            streams.push(stream);
+            seen.extend(payload);
+        }
+        seen.sort();
+        assert_eq!(seen, [0, 1, 2], "a connection carried no data or another's");
+        drop((listener, streams, peers));
         mixed.close();
     })
 });
+
+// Owning the card, a listener with no socket left (backlog 1 in a table of 1, its stream handed
+// out) drops a SYN; once the listener is dropped, the retransmitted SYN is refused. A failed
+// `tcp_listen` leaves the port refusing. The peer forgets the accepted connection without a
+// word, so its own table of 1 has room for the next connect while the Net's stream lives.
+#[switch_test_support::pinned_test]
+fn listener_with_no_socket_drops_syn_until_dropped() {
+    with_eal(|eal| {
+        let mut mixed = Mixed::with_sockets(eal, ["lnda", "lndb"], 1, 0, Backend::Conduit);
+        let handle = mixed.handle();
+        assert!(matches!(handle.tcp_listen(tcp_config(), local(LOCAL_PORT), 2), Err(Error::SocketsFull)));
+        let refused = peer_connect(&mut mixed, PEER_PORT);
+        reset(&mut mixed, &refused, "a SYN after a failed tcp_listen");
+        mixed.peer.remove_tcp(refused);
+        let listener = listen(&mut mixed, 1);
+        let first = peer_connect(&mut mixed, PEER_PORT + 1);
+        established(&mut mixed, &[&first]);
+        let (listener, stream) = accept(&mut mixed, listener);
+        mixed.peer.remove_tcp(first);
+        let waiting = peer_connect(&mut mixed, PEER_PORT + 2);
+        mixed.rounds(4);
+        let socket = mixed.peer.tcp(&waiting);
+        assert!(socket.state() == State::SynSent && !socket.reset_by_peer(), "the SYN got a reply: {}", socket.state());
+        drop(listener);
+        reset(&mut mixed, &waiting, "a SYN after the listener was dropped");
+        drop((stream, waiting, handle));
+        mixed.close();
+    })
+}
 
 // The peer sends bytes and a FIN before any `accept`; the accepted stream reads them, then
 // `Finished`.

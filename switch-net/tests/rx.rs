@@ -435,7 +435,8 @@ support::both_backends!(accept_survives_unanswered_syn_ack_conduit, accept_survi
 // A SYN from an address whose MAC never resolves: no SYN-ACK can leave. The listener still
 // gives the handshake up (later than when its SYN-ACKs leave, about 22 s, since a socket
 // waiting for a neighbor is retried once a second) and the accept resolves on the next
-// connection.
+// connection. Until then another SYN gets no reply when owning the card, and is refused when
+// sharing a card.
 support::both_backends!(accept_survives_unresolved_syn_source_conduit, accept_survives_unresolved_syn_source_junction, |backend| {
     with_eal(|eal| {
         let mut mixed = Mixed::new(eal, ["asra", "asrb"], backend);
@@ -456,12 +457,21 @@ support::both_backends!(accept_survives_unresolved_syn_source_conduit, accept_su
 
         run_to(&mut mixed, start + Duration::from_secs(18));
         assert!(!slot.is_full(), "accept resolved on an unfinished handshake");
-        // The listener is still held by the unresolved handshake: a SYN now is refused.
-        let refused = mixed.peer.add_tcp(tcp_config()).unwrap();
-        mixed.peer.connect(&refused, net_end, PEER_PORT + 1).unwrap();
-        mixed.until(|m| m.peer.tcp(&refused).state() == State::Closed);
-        assert!(mixed.peer.tcp(&refused).reset_by_peer());
-        mixed.peer.remove_tcp(refused);
+        // The listener is still held by the unresolved handshake.
+        let extra = mixed.peer.add_tcp(tcp_config()).unwrap();
+        mixed.peer.connect(&extra, net_end, PEER_PORT + 1).unwrap();
+        match backend {
+            support::Backend::Conduit => {
+                run_to(&mut mixed, start + Duration::from_secs(19));
+                let socket = mixed.peer.tcp(&extra);
+                assert!(socket.state() == State::SynSent && !socket.reset_by_peer(), "the SYN got a reply: {}", socket.state());
+            }
+            support::Backend::Junction => {
+                mixed.until(|m| m.peer.tcp(&extra).state() == State::Closed);
+                assert!(mixed.peer.tcp(&extra).reset_by_peer());
+            }
+        }
+        mixed.peer.remove_tcp(extra);
 
         // Nothing is scheduled once the handshake is given up, so the clock is stepped.
         run_to(&mut mixed, start + Duration::from_secs(23));

@@ -314,6 +314,13 @@ impl InterfaceInner {
             // Never reply to a TCP RST packet with another TCP RST packet.
             // Never send a TCP RST packet with unspecified addresses.
             None
+        } else if tcp_repr.control == TcpControl::Syn
+            && tcp_repr.ack_number.is_none()
+            && sockets.has_listener_port(dst)
+        {
+            // A listener holds the endpoint but has no socket in LISTEN: drop the SYN so the
+            // client retransmits it.
+            None
         } else {
             // The packet wasn't handled by a socket, send a TCP RST packet.
             let (ip, tcp) = Socket::rst_reply(&ip_repr, &tcp_repr);
