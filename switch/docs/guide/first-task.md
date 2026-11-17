@@ -1,13 +1,13 @@
 # Your first task
 
-A switch program needs one dependency. switch is used from a clone of its repository, so the line in your `Cargo.toml` points at the clone:
+switch is used from a clone of its repository, so the dependency in `Cargo.toml` is a path into the clone:
 
 ```toml
 [dependencies]
 switch = { path = "<clone>/switch" }
 ```
 
-With no features enabled, `switch` has tasks and timers and no network, and it builds on any machine with cargo. The example `first_task` does the three things below in one `main`; here each is shown as a small program of its own. From the clone, run the example with:
+With no features enabled, `switch` is the runtime alone, tasks and timers without the network, and builds on any machine with cargo. The three programs below are combined into one `main` in the example `first_task`, which runs from the clone with:
 
 ```sh
 cargo run -p switch-examples --example first_task
@@ -15,7 +15,7 @@ cargo run -p switch-examples --example first_task
 
 ## Hello, task
 
-A task is one call of a function marked [`#[switch::task]`](macro@crate::task), started on a [`Runtime`](crate::Runtime).
+A task is one call of a function marked [`#[switch::task]`](macro@crate::task), spawned on a [`Runtime`](crate::Runtime).
 
 ```rust
 use switch::Runtime;
@@ -37,13 +37,11 @@ fn main() {
 Hello, switch!
 ```
 
-`Runtime::new(0)` creates the runtime. `runtime.spawner()` returns a [`Spawner`](crate::Spawner), a handle that starts tasks and can be cloned freely. Calling `hello("switch")` does not run the body. It packs the argument into a token, and `spawner.spawn` starts the task from that token.
-
-The task still has not run. Tasks run inside [`runtime.poll`](crate::Runtime::poll), which runs the tasks that are ready and returns a [`PollReport`](crate::PollReport). The report's `live_tasks` field counts the tasks that have not finished, so this loop polls until `hello` is done. The runtime never runs anything by itself: it has no threads, and between two calls to `poll` nothing happens.
+`runtime.spawner()` returns a [`Spawner`](crate::Spawner), a handle that starts tasks and can be cloned freely. Calling a `#[switch::task]` function returns a token holding the arguments instead of running the body, and `spawner.spawn` turns that token into a task. The task runs only inside [`runtime.poll`](crate::Runtime::poll), which runs the tasks that are ready and returns a [`PollReport`](crate::PollReport). The report's `live_tasks` field counts the tasks that have not finished, so the loop above polls until `hello` is done. The runtime has no threads of its own, so nothing happens between two calls to `poll`.
 
 ## Getting a value back
 
-`spawn` drops whatever the task returns. `spawn_join` keeps it and gives you a [`JoinHandle`](crate::JoinHandle), which another task awaits:
+`spawn` discards the task's return value. `spawn_join` returns a [`JoinHandle`](crate::JoinHandle) instead, which resolves to that value when another task awaits it:
 
 ```rust
 use switch::{JoinHandle, Runtime};
@@ -72,13 +70,13 @@ fn main() {
 double(21) = 42
 ```
 
-The handle is awaited in a task because `main` cannot wait for it: `main` is the code that polls, and `double` only runs while it does.
+`double` runs only while `main` is polling, so `main` cannot wait for the handle itself and a second task awaits it.
 
 ## A timer, and the tick
 
-The number passed to `Runtime::new` and to every `poll` is the tick. It is the runtime's only clock: a `u64` that tells the runtime what time it is now. You choose the unit. A tick may repeat from one poll to the next, and it must never go down.
+The `u64` passed to `Runtime::new` and to every `poll` is the tick, the runtime's only clock, in a unit the program chooses. It may repeat from one poll to the next but must never decrease.
 
-A task waits for time to pass with a sleep from its spawner:
+A task sleeps through its spawner:
 
 ```rust
 use switch::{Runtime, Spawner};
@@ -111,10 +109,10 @@ ten ticks passed
 tick 10: polled 1, live 0
 ```
 
-`spawner.sleep(10)` makes a timer that is due ten ticks after the latest tick the runtime was given, here at tick 10. At tick 0 the task runs as far as the sleep and waits. The polls at ticks 5 and 9 find nothing to run. The poll at tick 10 wakes the task, and it prints and finishes.
+`spawner.sleep(10)` creates a timer that is due ten ticks after the latest tick the runtime was given, here at tick 10. The task runs as far as the sleep at tick 0, the polls at ticks 5 and 9 find nothing to run, and the poll at tick 10 wakes it.
 
-The two earlier loops passed 0 on every poll. That works for tasks that never sleep. Had `hello` slept, its loop would have spun forever at tick 0, because a sleep ends only when a poll passes a tick that has reached its deadline.
+A sleep ends only when a poll passes a tick that has reached its deadline. The two earlier loops pass 0 on every poll, which works for tasks that never sleep. Had `hello` slept, its loop would have spun forever at tick 0.
 
-A real program reads a clock once each time round its loop and passes the reading as the tick. The network programs in this guide use nanoseconds since the program started.
+A real program reads a clock once per iteration of its loop and passes the reading as the tick. The network programs in this guide use nanoseconds since the program started.
 
 Network programs need more than cargo to build. Next: [Setting up for network programs](crate::guide::setup).

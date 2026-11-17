@@ -1,6 +1,4 @@
-switch is a Rust library for network programs that need low, predictable latency, such as market-data feeds and order gateways. It is a userspace network stack: your program sends and receives packets through the network card directly, without going through the Linux kernel.
-
-You write the program as async tasks. A task opens TCP or UDP sockets and awaits them. TLS 1.3 and WebSocket run on top of TCP.
+switch is an async userspace network stack for Rust, built on DPDK, for programs that need low, predictable latency such as market-data feeds and order gateways. It provides TCP and UDP sockets, a TLS 1.3 client, and WebSocket clients and servers.
 
 ```rust
 # #[cfg(feature = "net")] mod example {
@@ -23,8 +21,6 @@ async fn print_stream(handle: NetHandle, server: IpEndpoint, socket: tcp::Config
 # fn main() {}
 ```
 
-Your program runs one loop on one CPU. Each time round, the loop receives packets, runs the tasks that were waiting for them, and sends what those tasks wrote. One call, [`net::round`](crate::net::round), does all three.
+The program calls [`net::round`](crate::net::round) in a loop on one thread, and each call receives packets, polls the tasks that are ready, and sends what they queued.
 
-The network parts need Linux with DPDK 25.11.3 to build; tasks and timers alone build anywhere with cargo.
-
-Start with the [guide](crate::guide).
+The network features need Linux and DPDK 25.11.3 to build. Without them the crate is the runtime alone, tasks and timers, and builds anywhere with cargo. The [guide](crate::guide) starts there.

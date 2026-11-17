@@ -1,8 +1,8 @@
 # Opening sockets
 
-A task opens sockets through its [`NetHandle`](crate::net::NetHandle): it connects to a TCP server, accepts a TCP connection, or binds a UDP port. Each call returns a future that resolves to the socket or to an [`Error`](crate::net::Error). Addresses are IPv4.
+A task opens sockets through its [`NetHandle`](crate::net::NetHandle), which connects to a TCP server, accepts a TCP connection, or binds a UDP port. Each call returns a future that resolves to the socket or to an [`Error`](crate::net::Error). Addresses are IPv4.
 
-Every open socket takes one of the places you reserved with `max_sockets` (TCP) or `max_udp_sockets` (UDP) in [`Sizing`](crate::nic::Sizing). When none is free, the open fails with `SocketsFull`.
+Every open socket takes one of the places reserved with `max_sockets` (TCP) or `max_udp_sockets` (UDP) in [`Sizing`](crate::nic::Sizing), and an open fails with `SocketsFull` when none is free.
 
 ## Connecting
 
@@ -16,13 +16,13 @@ async fn connect(handle: &NetHandle, socket: tcp::Config) -> Result<TcpStream, E
 }
 ```
 
-`local` is where the connection comes from. `addr: None` means the program's own address, and the port is yours to choose: switch has no automatic port selection, and port 0 is refused with `Unaddressable`. Two connections from one local address to the same server address and port need different local ports; a pair already in use gives `PortInUse`.
+`local` is the connection's source endpoint, where `addr: None` means the program's own address. The program chooses the port, because switch has no automatic port selection and refuses port 0 with `Unaddressable`. Two connections from one local address to the same server address and port need different local ports; a pair already in use gives `PortInUse`.
 
-The future resolves when the TCP handshake completes. A server that answers with a reset gives `Refused`. A server that never answers gives nothing: the connect keeps retrying, so put a [time limit](crate::guide::timeouts) on it. Dropping the future abandons the attempt and frees the socket.
+The future resolves when the TCP handshake completes, or to `Refused` if the server answers with a reset. If the server never answers, the connect keeps retrying and the future does not resolve, so put a [time limit](crate::guide::timeouts) on it. Dropping the future abandons the attempt and frees the socket.
 
 ## Accepting
 
-`tcp_accept` listens on a port and resolves to the first connection that arrives. One call accepts one connection. A server that takes many calls it again each time, and does so before it starts serving the connection it just got, so that a listener is always waiting (from the example `tcp_echo_server`):
+`tcp_accept` listens on a port and resolves to the first connection that arrives, so one call accepts one connection. A server that takes many calls it again before it starts serving each connection, so that a listener is always waiting (from the example `tcp_echo_server`):
 
 ```rust
 use switch::Spawner;
@@ -80,12 +80,12 @@ async fn bind(handle: &NetHandle) -> Result<UdpSocket, Error> {
 }
 ```
 
-`port` must not be 0. `local_addr: None` receives on every address the program has. `rx_queue` is how many received datagrams the socket holds for you before it drops new ones. `tx_checksum: true` gives sent datagrams a UDP checksum, and `broadcast: true` allows sending to a broadcast address.
+`port` must not be 0. `local_addr: None` receives on every address the program has. `rx_queue` is the number of received datagrams the socket holds before it drops new ones. `tx_checksum: true` gives sent datagrams a UDP checksum, and `broadcast: true` allows sending to a broadcast address.
 
 ## Errors
 
 The reference for each call on [`NetHandle`](crate::net::NetHandle) lists what it can return, and [`Error`](crate::net::Error) describes every variant. `Error` implements `Display` and `std::error::Error`, so `?` into a `Box<dyn Error>` works.
 
-Await socket futures, here and in the following chapters, in switch tasks. On another executor, a socket future that has to wait panics.
+Socket futures, here and in the following chapters, must be awaited in switch tasks. On another executor, a socket future that has to wait panics.
 
 Next: [Frames](crate::guide::frames).

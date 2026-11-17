@@ -17,7 +17,7 @@ A [`TcpStream`](crate::net::TcpStream) is an open connection. `split` divides it
 
 ## Receiving
 
-`recv` resolves to the next data from the peer, in order, as a [frame](crate::guide::frames). A frame holds whatever one packet carried; TCP does not keep your message boundaries, so a protocol on top has to find them itself.
+`recv` resolves to the next data from the peer, in order, as a [frame](crate::guide::frames). A frame holds whatever one packet carried, so a protocol on top has to find its own message boundaries.
 
 ```rust
 use switch::net::{Error, TcpRx};
@@ -33,7 +33,7 @@ async fn print_all(rx: &mut TcpRx) -> Result<(), Error> {
 }
 ```
 
-Data that has arrived is always delivered first. After it, `recv` says how the stream ended: `Finished` when the peer closed its side normally, `InvalidState` when the connection was reset. After `Finished` you can still send.
+Data that has arrived is always delivered before `recv` reports how the stream ended, which is `Finished` when the peer closed its side normally and `InvalidState` when the connection was reset. Sending is still possible after `Finished`.
 
 ## Sending
 
@@ -57,15 +57,13 @@ async fn send_all(handle: &NetHandle, tx: &mut TcpTx, mut rest: &[u8]) -> Result
 }
 ```
 
-`max_segment_payload` is the most bytes one TCP packet of this connection can carry. A frame no longer than that can go out as one packet.
+`max_segment_payload` is the most bytes one TCP packet of this connection can carry, and a frame no longer than that can go out as one packet.
 
-`room` fails with `InvalidState` once the connection can no longer send, and with `TooLarge` if `len` is more than the socket's `tx_capacity`. `try_send` fails with `Full` if you did not wait for room. Its error comes with the frame, as the `map_err` above shows.
+`room` fails with `InvalidState` once the connection can no longer send, and with `TooLarge` if `len` is more than the socket's `tx_capacity`. `try_send` fails with `Full` if the caller did not wait for room, and its error comes with the frame, as the `map_err` above shows.
 
 ## When the peer is slow
 
-A sent frame stays with its socket until the peer acknowledges it. The socket holds at most `tx_capacity` bytes that are queued or unacknowledged, and `room` waits while it is full. That wait is how a slow peer slows your sender down: until the peer acknowledges more, no space is freed and your task stays in `room`.
-
-A task that must not wait behind a slow peer puts a [time limit](crate::guide::timeouts) on `room`.
+A sent frame stays with its socket until the peer acknowledges it. The socket holds at most `tx_capacity` bytes that are queued or unacknowledged, and `room` waits while it is full, so a slow peer holds the sending task in `room` until it acknowledges more. A task that must not wait behind a slow peer puts a [time limit](crate::guide::timeouts) on `room`.
 
 ## Finishing
 
@@ -77,9 +75,9 @@ tx.delivered().await;
 # }
 ```
 
-`shutdown` closes your sending side: the peer sees the end of your stream after everything already queued. Receiving continues. `delivered` resolves once the peer has acknowledged every byte and the end of the stream, or once the connection is gone and nothing more can arrive there.
+`shutdown` closes the sending side, so the peer sees the end of the stream after everything already queued, and receiving continues. `delivered` resolves once the peer has acknowledged every byte and the end of the stream, or once the connection is gone and nothing more can arrive there.
 
-Wait for `delivered` before the program exits. Queued data lives only in the socket until then, and it is sent by the loop, so data still queued when the loop stops is never sent.
+Wait for `delivered` before the program exits. Until then queued data lives only in the socket and is sent by the loop, so data still queued when the loop stops is never sent.
 
 ## Dropping a stream
 
@@ -89,7 +87,7 @@ A dropped connection keeps its place among the program's sockets, and its local 
 
 ## When the peer is silent
 
-A connection your task holds never gives up: it retransmits until the peer answers. There is no keep-alive either, so an idle connection sends nothing, and a peer that vanished is noticed only when you send. `connect`, `recv`, `room` and `delivered` can therefore each wait forever. [Timeouts and cancelling](crate::guide::timeouts) shows how to bound them.
+A connection that a task holds never gives up and retransmits until the peer answers. There is no keep-alive either, so an idle connection sends nothing, and a peer that vanished is noticed only when the program sends. `connect`, `recv`, `room` and `delivered` can therefore each wait forever. [Timeouts and cancelling](crate::guide::timeouts) shows how to bound them.
 
 Small writes are sent at once; there is no Nagle delay.
 

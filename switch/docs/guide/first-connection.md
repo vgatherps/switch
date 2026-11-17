@@ -1,8 +1,8 @@
 # Your first network program
 
-The first network program is a TCP client. It connects to a server, sends one line, prints what the server sends back, and exits when the server closes the connection.
+The first network program is a TCP client that connects to a server, sends one line, prints what the server sends back, and exits when the server closes the connection.
 
-It needs no spare network card. The program opens a tap device: a virtual card that also appears in Linux as an ordinary interface, here `cdnic0`. Your program is on one side of it with the address 192.0.2.2. The Linux kernel is on the other side with 192.0.2.1, and a few lines of Python there play the server.
+It needs no spare network card, because it opens a tap device, a virtual card that also appears in Linux as an ordinary interface, here `cdnic0`. The program is on one side of it with the address 192.0.2.2, and the Linux kernel is on the other with 192.0.2.1, where a few lines of Python act as the server.
 
 ```text
    your program (one CPU)                        Linux kernel
@@ -236,25 +236,25 @@ A real card is described by the same kind of file; `docs/operations/config.md` i
 
 ## Opening the card
 
-Before it opens the card, `main` looks up the server's address. Name lookup is a blocking call into the kernel, and switch has none of its own. Do it, and any other blocking setup such as reading files, before the loop starts.
+`main` resolves the server's address before it opens the card, because name lookup is a blocking call into the kernel and switch has none of its own. Any other blocking setup, such as reading files, also belongs before the loop starts.
 
-[`open`](crate::nic::open) starts DPDK, opens the card the config names, and returns the network stack running on it, `opened.stack`. It fails unless the calling thread is allowed on exactly one CPU. `taskset -c 0` arranges that on a Linux machine; in the one-CPU container it changes nothing. `open` is `unsafe` because DPDK and the card write to memory the compiler cannot check; the comment above the call states what the program promises, and the reference for `open` has the full list. The program keeps `opened.eal`, DPDK's own state, in `_eal` until the end.
+[`open`](crate::nic::open) starts DPDK, opens the card the config names, and returns the network stack running on it as `opened.stack`. It fails unless the calling thread is allowed on exactly one CPU. On a Linux machine `taskset -c 0` arranges that, and the one-CPU container already satisfies it. `open` is `unsafe` because DPDK and the card write to memory the compiler cannot check; the comment above the call states what the program promises, and the reference for `open` has the full list. The program keeps `opened.eal`, DPDK's own state, in `_eal` until the end.
 
-The third argument, `None`, leaves DPDK's helper threads where `open` puts them by default. The fourth is a clock: `open` needs the time while it starts up, and it must be the clock the loop will use. The network counts time in microseconds and the runtime in ticks, here nanoseconds; `Clock` gives both from one reading, and [The drive loop](crate::guide::drive_loop) says why.
+The third argument, `None`, leaves DPDK's helper threads where `open` puts them by default. The fourth is the clock `open` reads while it starts up, which must be the clock the loop will use. The network stack counts time in microseconds and the runtime in ticks, here nanoseconds, so `Clock` gives both from one reading; [The drive loop](crate::guide::drive_loop) says why.
 
-[`tcp::Config`](crate::net::tcp::Config) sizes one socket. `tx_capacity` is how many bytes the socket holds that are queued or not yet acknowledged. `rx_capacity` is the TCP receive window the socket advertises: how many bytes the server may have on their way to you at once. The examples use 64 KiB for both. `mss_cap` limits the payload of one TCP packet: the largest packet the config allows towards the server, less 40 bytes of IP and TCP headers.
+[`tcp::Config`](crate::net::tcp::Config) sizes one socket. `tx_capacity` is the number of bytes the socket holds that are queued or not yet acknowledged, and `rx_capacity` is the TCP receive window it advertises. The examples use 64 KiB for both. `mss_cap` limits the payload of one TCP packet, here to the largest packet the config allows towards the server less 40 bytes of IP and TCP headers.
 
-[`Sizing`](crate::nic::Sizing) sizes the whole program. `max_sockets` and `max_udp_sockets` are the number of TCP and UDP sockets you will have open at once. `frame_share` is the number of buffers for data being sent; `tcp::tx_mbuf_budget` gives what one TCP socket needs. The other three values can stay as they are here. The reference for `Sizing` says how to choose each one and what happens when it is too small.
+[`Sizing`](crate::nic::Sizing) sizes the whole program. `max_sockets` and `max_udp_sockets` are the numbers of TCP and UDP sockets open at once, and `frame_share` is the number of buffers for data being sent, for which `tcp::tx_mbuf_budget` gives what one TCP socket needs. The other three values can stay as they are here. The reference for `Sizing` says how to choose each one and what happens when it is too small.
 
 ## The Net and its handle
 
-[`Net::new`](crate::net::Net::new) takes the stack. The [`Net`](crate::net::Net) belongs to the loop in `main` and is the only thing that moves packets. Tasks get a [`NetHandle`](crate::net::NetHandle) from `net.handle()`, which opens sockets and can be cloned. `ingress_budget` is the most received packets the network stack processes each time round the loop; any others wait for the next round.
+[`Net::new`](crate::net::Net::new) takes the stack. The [`Net`](crate::net::Net) belongs to the loop in `main` and is the only thing that moves packets, while tasks open sockets through a [`NetHandle`](crate::net::NetHandle) from `net.handle()`, which can be cloned. `ingress_budget` is the most received packets the network stack processes each time round the loop; any others wait for the next round.
 
 ## The task
 
-`talk` is the conversation. `tcp_connect` names the server and a local port. When the connection is up, `split` gives a receiving half and a sending half.
+`talk` connects with `tcp_connect`, which takes the server and a local port, and splits the connected stream into a receiving half and a sending half.
 
-Data is sent and received in frames, which are packet buffers. The task takes an empty frame from the handle, copies its line in, cuts the frame to that length and freezes it. `room` waits until the connection can take that many bytes, and `try_send` queues the frame. [Frames](crate::guide::frames) and [TCP streams](crate::guide::tcp) cover each call.
+Data is sent and received in frames, which are packet buffers. The task takes an empty frame from the handle, copies its line in, truncates the frame to that length and freezes it. `room` then waits until the connection can take that many bytes, and `try_send` queues the frame. [Frames](crate::guide::frames) and [TCP streams](crate::guide::tcp) cover each call.
 
 `recv` returns the next data from the server, in order, and `Err(Error::Finished)` once the server has closed its side. The task then closes its own side with `shutdown` and waits in `delivered` until the server has acknowledged everything.
 
@@ -262,8 +262,8 @@ A task cannot return a value to `main` directly, so `hello` leaves the result in
 
 ## The loop
 
-The loop in `main` reads the clock and calls [`round`](crate::net::round), which receives packets, runs the tasks and sends what they queued. `round` returns whether anything happened. When nothing did, this loop sleeps a millisecond, because the Python server needs the same CPU. `LIMIT` ends the program after thirty seconds if the server never answers. [The drive loop](crate::guide::drive_loop) explains the round and when to sleep.
+The loop in `main` reads the clock and calls [`round`](crate::net::round), which receives packets, runs the tasks, sends what they queued, and returns whether anything happened. When nothing did, this loop sleeps a millisecond, because the Python server needs the same CPU. `LIMIT` ends the program after thirty seconds if the server never answers. [The drive loop](crate::guide::drive_loop) explains the round and when to sleep.
 
-When the task has left its result, the program takes itself apart in order: the runtime with its tasks, then the `Net`, then the card. [Shutting down](crate::guide::shutdown) explains the order.
+Once the task has left its result, the program shuts down in order: the runtime with its tasks, then the `Net`, then the card. [Shutting down](crate::guide::shutdown) explains the order.
 
 Next: [Tasks](crate::guide::tasks).

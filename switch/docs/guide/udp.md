@@ -41,17 +41,17 @@ async fn echo(handle: NetHandle, port: u16) {
 
 ## Receiving
 
-`recv` resolves to the next [`Datagram`](crate::net::Datagram) and has no error: when nothing has arrived, it waits. Besides its `payload()`, a datagram knows the sender, `src()`, and the address it was sent to, `dst_addr()`.
+`recv` resolves to the next [`Datagram`](crate::net::Datagram) and has no error. Besides its `payload()`, a datagram carries the sender, `src()`, and the address it was sent to, `dst_addr()`.
 
-The socket holds up to `rx_queue` datagrams. One that arrives when the queue is full is dropped, and `tx.stats().rx_dropped_full` counts those; the socket's counters are read through the sending half. A datagram your task still holds counts as queued, so drop each one when you are done with it.
+The socket holds up to `rx_queue` datagrams and drops one that arrives when the queue is full. `tx.stats().rx_dropped_full` counts those drops; the socket's counters are read through the sending half. A datagram the task still holds counts as queued, so drop each one once it has been handled.
 
 ## Sending
 
-`send(Some(to), frame)` sends one [frame](crate::guide::frames) as one datagram. It does not wait: the datagram is queued for the round's send step, or `send` returns the frame with an error. Always pass `Some`: these sockets have no default destination, and `None` returns `NoDestination`.
+`send(Some(to), frame)` sends one [frame](crate::guide::frames) as one datagram without waiting. Either the datagram is queued for the round's send step, or `send` returns the frame with an error. These sockets have no default destination, so always pass `Some`; `None` returns `NoDestination`.
 
-`Full` and `NeighborPending` are worth retrying, and the echo does so after a [`yield_now`](crate::guide::tasks), which lets the loop go round once. `Full` means the datagram cannot be queued now, usually because the card has not yet taken the packets queued before it. `NeighborPending` means the hardware address of the destination is not known yet; switch has asked for it, and the send succeeds once the answer has arrived. This is normal for the first datagram to a new address. A destination that never answers stays `NeighborPending`, so a program that must not wait forever bounds its retries.
+`Full` and `NeighborPending` are worth retrying, and the echo does so after a [`yield_now`](crate::guide::tasks), which lets the loop go round once. `Full` means the datagram cannot be queued now, usually because the card has not yet taken the packets queued before it. `NeighborPending` means the hardware address of the destination is not known yet. switch has asked for it and the send succeeds once the answer has arrived, which is normal for the first datagram to a new address. A destination that never answers stays `NeighborPending`, so a program that must not wait forever bounds its retries.
 
-The others will not pass by waiting: `NoRoute` and `Unaddressable` for a destination the program cannot send to, and `TooLarge`.
+The other errors do not clear by waiting. They are `NoRoute` and `Unaddressable` for a destination the program cannot send to, and `TooLarge`.
 
 ## Running the echo
 

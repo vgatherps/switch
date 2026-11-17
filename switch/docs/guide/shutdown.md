@@ -26,13 +26,13 @@ fn close(mut rt: Runtime, net: Net) -> Result<(), Box<dyn std::error::Error>> {
 
 ## Let the tasks finish first
 
-Shutting the runtime down drops tasks where they stand, and data still queued when the loop stops is never sent ([TCP streams](crate::guide::tcp)). If data must reach the peer, let the tasks finish first: have each call `shutdown` and await `delivered` on its connections, and keep the loop going round until they are done. A [oneshot channel](crate::guide::tasks) per task, or a shared flag the tasks check, tells them it is time. Put a time limit on that wait in the loop, as the first network program does with `LIMIT`.
+Shutting the runtime down drops tasks where they stand, and data still queued when the loop stops is never sent ([TCP streams](crate::guide::tcp)). If data must reach the peer, have each task call `shutdown` and await `delivered` on its connections, and keep the loop going round until the tasks are done. A [oneshot channel](crate::guide::tasks) per task, or a shared flag the tasks check, tells them it is time. Put a time limit on that wait in the loop, as the first network program does with `LIMIT`.
 
 ## The steps
 
 [`rt.shutdown()`](crate::Runtime::shutdown) drops all remaining tasks, in no particular order.
 
-[`net.into_stack()`](crate::net::Net::into_stack) succeeds only when the `Net` is the last thing referring to the network: no `NetHandle`, no socket half and no unfinished open is alive. Otherwise it returns the `Net` in `Err`, unchanged. The usual cause is that `main` still has a handle or a socket in a variable, or a task stored one in a shared cell. Drop it and call `into_stack` again.
+[`net.into_stack()`](crate::net::Net::into_stack) succeeds only when the `Net` is the last thing referring to the network, with no `NetHandle`, socket half or unfinished open alive. Otherwise it returns the `Net` in `Err`, unchanged. The usual cause is that `main` still has a handle or a socket in a variable, or a task stored one in a shared cell. Drop it and call `into_stack` again.
 
 `stack.into_port()` drops the remaining sockets and everything still queued to send. `try_close()` then closes the card and checks that every packet buffer is back. If a frame is still held somewhere, it fails with `OutstandingBuffers { rx, tx, frame }`, which counts the missing buffers of each kind, and returns the port with the error. Frames outlive the `Net`, so step 3 does not catch this. Drop the frame and call `try_close` on the returned port.
 

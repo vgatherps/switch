@@ -7,7 +7,7 @@ A program that uses the network enables the `net` feature of `switch`:
 switch = { path = "<clone>/switch", features = ["net"] }
 ```
 
-That feature builds only on Linux with DPDK 25.11.3 installed. DPDK is the library that drives the network card from userspace, and switch is built against exactly that version. The repository has a Docker image with everything installed, which is the quickest way to start on any machine, a Mac included.
+The feature builds only on Linux with DPDK 25.11.3 installed, the exact version switch is built against. The repository has a Docker image with everything installed, which is the quickest way to start on any machine, a Mac included.
 
 ## In a container
 
@@ -29,11 +29,9 @@ docker run --rm -it --init \
     switch-dpdk-test:local bash
 ```
 
-The clone is mounted at `/work`, so you edit files on your machine and build in the container. The two named volumes keep cargo's downloads and the Linux build output between containers.
+The clone is mounted at `/work`, so files are edited on the host and built in the container, and the two named volumes keep cargo's downloads and the Linux build output between containers. `--cap-add NET_ADMIN --device /dev/net/tun` lets a program in the container create a virtual network card, which the examples in this guide use instead of a real one.
 
-`--cap-add NET_ADMIN --device /dev/net/tun` lets a program in the container create a virtual network card, which the examples in this guide use instead of a real one.
-
-`--cpuset-cpus=0` allows the container CPU 0 and no other. A switch program that opens a network card must be allowed on exactly one CPU, and in this container every program is. Any CPU the Docker host has will do.
+`--cpuset-cpus=0` allows the container CPU 0 and no other, because a switch program that opens a network card must be allowed on exactly one CPU. Any CPU the Docker host has will do.
 
 ## On a Linux machine
 
@@ -75,7 +73,7 @@ make -C conduit doctor
 
 The examples create a virtual network card, which needs root, or the `CAP_NET_ADMIN` capability and access to `/dev/net/tun`. A program that opens a card must be allowed on exactly one CPU, so on a Linux machine start each one under `taskset -c N`, as the commands in this guide do.
 
-To use a real network card, the machine needs more preparation: `docs/operations/host-setup.md` in the repository covers a Linux machine with a spare card, and `docs/operations/ec2.md` an EC2 instance.
+A real network card needs more preparation of the machine, which `docs/operations/host-setup.md` in the repository covers for a Linux machine with a spare card and `docs/operations/ec2.md` for an EC2 instance.
 
 ## Check the setup
 

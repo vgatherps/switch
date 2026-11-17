@@ -13,7 +13,7 @@ A card opened with [`open`](crate::nic::open) belongs to that one process. When 
                network card
 ```
 
-Only `main` changes: how it gets its [`Net`](crate::net::Net) and how it gives it back.
+Only `main` changes, in how it gets its [`Net`](crate::net::Net) and gives it back.
 
 ## What changes in the code
 
@@ -39,7 +39,7 @@ fn connect(control: &str) -> Result<(Net, tcp::Config), Box<dyn std::error::Erro
 }
 ```
 
-[`Session::connect`](crate::junction::session::Session::connect) takes the path of the daemon's `control.sock` and the number of sockets, TCP and UDP together, the program wants to have open at once. A [`Session`](crate::junction::session::Session) is this program's connection to the daemon. [`Net::remote`](crate::net::Net::remote) wraps it; `tx_frames` is the size of the program's pool of [send frames](crate::guide::frames). `tx_mbuf_budget` takes an MTU and the session reports the size of a frame, which is 28 bytes less, so the code adds them back.
+[`Session::connect`](crate::junction::session::Session::connect) takes the path of the daemon's `control.sock` and the number of sockets, TCP and UDP together, the program wants open at once. A [`Session`](crate::junction::session::Session) is this program's connection to the daemon, and [`Net::remote`](crate::net::Net::remote) wraps it. `tx_frames` is the size of the program's pool of [send frames](crate::guide::frames). `tx_mbuf_budget` takes an MTU and the session reports the size of a frame, which is 28 bytes less, so the code adds them back.
 
 The program has no config file, so it has nothing to compute `mss_cap` from and passes `None`; the daemon's network stack applies the limits of its own config.
 
@@ -70,11 +70,11 @@ fn close(mut rt: Runtime, net: Net) -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`into_session` has the same condition as `into_stack` in [Shutting down](crate::guide::shutdown): no handle or socket may be left. `finish` asks the daemon to end the session and `closed` turns true when the daemon has confirmed it. `poll` keeps the session moving in the meantime; its two callbacks are for socket events and received packets, and with no socket left both are empty. A session that is dropped without this looks like a crash to the daemon, which then resets the program's open connections.
+`into_session` has the same condition as `into_stack` in [Shutting down](crate::guide::shutdown), that no handle or socket is left. `finish` asks the daemon to end the session and `closed` turns true when the daemon has confirmed it. `poll` keeps the session moving in the meantime; its two callbacks are for socket events and received packets, and with no socket left both are empty. A session that is dropped without this looks like a crash to the daemon, which then resets the program's open connections.
 
 ## Running it
 
-This needs a container with three CPUs: start it as in [Setting up for network programs](crate::guide::setup), with `--cpuset-cpus=0-2`. The daemon reads the same config file as a program that owns the card. Here it gets CPU 0 for the network and CPU 1 for its other threads, and the client runs on CPU 2:
+This needs a container with three CPUs, started as in [Setting up for network programs](crate::guide::setup) with `--cpuset-cpus=0-2`. The daemon reads the same config file as a program that owns the card. Here it gets CPU 0 for the network and CPU 1 for its other threads, and the client runs on CPU 2:
 
 ```sh
 cargo build -p switch-junctiond --bin switch-junctiond
@@ -96,7 +96,7 @@ tick
 session finished
 ```
 
-The `EAL:` lines are the daemon's. Start the client under `taskset` as shown: the session starts a helper thread that stays on the CPUs the program was allowed when it connected. Running the daemon on a real card, and its flags, are in `docs/operations/junctiond.md` in the repository.
+The `EAL:` lines are the daemon's. Start the client under `taskset` as shown, because the session starts a helper thread that stays on the CPUs the program was allowed when it connected. Running the daemon on a real card, and its flags, are in `docs/operations/junctiond.md` in the repository.
 
 ## What behaves differently
 

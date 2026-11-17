@@ -10,7 +10,7 @@ The others open a network card and need Linux with DPDK, as the guide chapter Se
 
 ## Running wss_client in a container
 
-`wss_client` connects to a server on the internet. On the tap device the examples use, its packets reach only the container, so the container has to forward them. That takes `nftables`, which is in a second image built on top of the first.
+`wss_client` connects to a server on the internet, but on the tap device the examples use, its packets reach only the container, so the container has to forward them. Forwarding takes `nftables`, which is in a second image built on the first.
 
 1. From the repository root, build both images:
 

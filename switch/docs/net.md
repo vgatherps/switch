@@ -1,6 +1,6 @@
 TCP and UDP sockets for tasks, and the loop that moves their packets.
 
-The program's loop owns a [`Net`] and calls [`round`] on it: receive packets, run the tasks, send what they queued. Tasks hold a [`NetHandle`], which opens sockets and hands out the frames they send.
+The loop owns a [`Net`] and calls [`round`] on it to receive packets, run tasks and send what they queued. Tasks hold a [`NetHandle`], which opens sockets and hands out the frames they send.
 
 - [`Net`]: the network as the loop sees it. Made with [`Net::new`] from an opened card, or [`Net::remote`] from a session with the sharing daemon.
 - [`round`]: one trip through the loop.

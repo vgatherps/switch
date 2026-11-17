@@ -1,4 +1,4 @@
-WebSocket over a TCP stream: a client for `wss://` and `ws://` servers, and a `ws://` server.
+WebSocket over a TCP stream, as a client of `wss://` and `ws://` servers and as a `ws://` server.
 
 Each function in [`net`] takes a connected or accepted [`TcpStream`](crate::net::TcpStream), runs the upgrade, and returns a connection with `recv`, `send` and `close`.
 

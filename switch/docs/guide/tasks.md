@@ -1,10 +1,10 @@
 # Tasks
 
-All the tasks of a runtime share one thread. A task runs until it reaches an `.await` that is not ready, and only then does the next task run; nothing interrupts a task in between. The code comes from runnable examples: `cargo run -p switch-examples --example NAME`.
+All the tasks of a runtime share one thread and are scheduled cooperatively, so a task runs without interruption until it reaches an `.await` that is not ready. The code comes from runnable examples: `cargo run -p switch-examples --example NAME`.
 
 ## Writing and spawning
 
-A task function is an `async fn` with [`#[switch::task]`](macro@crate::task) on it. Its arguments are moved into the task, so pass owned values, or shared ones such as `Rc`. A task that starts other tasks takes a [`Spawner`](crate::Spawner) as an argument (example `tasks`):
+A task function is an `async fn` marked [`#[switch::task]`](macro@crate::task). Its arguments are moved into the task, so they are owned values or shared ones such as `Rc`. A task that spawns other tasks takes a [`Spawner`](crate::Spawner) as an argument (example `tasks`):
 
 ```rust
 use switch::{Runtime, Spawner};
@@ -33,13 +33,13 @@ parent polled
 child polled
 ```
 
-`spawn` fails only when the runtime has been shut down or a task has panicked, and then it gives the token back in the error. A panic in a task is not caught: it comes out of `runtime.poll` into your loop.
+`spawn` fails only when the runtime has been shut down or a task has panicked, and the error then returns the token. A panic in a task is not caught and propagates out of `runtime.poll` into the loop.
 
-To get a task's return value, spawn it with `spawn_join` and await the [`JoinHandle`](crate::JoinHandle) in another task, as in [Your first task](crate::guide::first_task). The handle gives `Err(Canceled)` if the task ended without a value, because it panicked or the runtime was shut down. Dropping the handle leaves the task running.
+A task's return value comes from `spawn_join` and a [`JoinHandle`](crate::JoinHandle) awaited in another task, as in [Your first task](crate::guide::first_task). The handle resolves to `Err(Canceled)` if the task ended without a value, because it panicked or the runtime was shut down. Dropping the handle leaves the task running.
 
 ## Sleeping
 
-[Your first task](crate::guide::first_task) slept with `spawner.sleep(ticks)`; `spawner.sleep_until(tick)` waits for an absolute tick. A sleep is as punctual as your loop: a loop that polls every millisecond can end a sleep a millisecond late.
+[Your first task](crate::guide::first_task) slept with `spawner.sleep(ticks)`; `spawner.sleep_until(tick)` waits for an absolute tick. A sleep is only as punctual as the loop, so a loop that polls every millisecond can end a sleep a millisecond late.
 
 With ticks in nanoseconds, a `Duration` converts directly (example `clock_loop`):
 
@@ -59,7 +59,7 @@ Dropping a sleep cancels it. The errors a sleep can return are on [`SleepError`]
 
 ## Yielding
 
-A task that computes for a long time holds up every other task and, in a network program, the network too: packets are received and sent between polls. [`yield_now`](crate::yield_now) hands the thread back. The other ready tasks run, the loop goes round, and the task continues in the next `runtime.poll`, or sooner if something else wakes it first. This task is in `clock_loop` too:
+A task that computes for a long time holds up every other task and, in a network program, the network too, because packets are received and sent between polls. After [`yield_now`](crate::yield_now) the other ready tasks run, the loop goes round, and the task continues in the next `runtime.poll`, or sooner if something else wakes it first. This task is also in `clock_loop`:
 
 ```rust
 #[switch::task]
@@ -115,11 +115,11 @@ fn main() {
 received 42
 ```
 
-`send` wakes the receiving task. If the receiver has been dropped, `send` returns the value. The sender does not have to be in a task: the loop in `main` can hold it and send between polls, which is a simple way to tell a task to stop. Both ends stay on the runtime's thread.
+`send` wakes the receiving task, or returns the value if the receiver has been dropped. The sender does not have to be in a task. The loop in `main` can hold it and send between polls, which is one way to tell a task to stop. Both ends stay on the runtime's thread.
 
 ## Waking a task from another thread
 
-Everything above stays on one thread, and the types enforce it: none of them is `Send`. The exception is [`RemoteWaker`](crate::RemoteWaker), which another thread uses to wake a task. The task makes one for itself while it is being polled, puts it where the other thread can find it, and checks for its data each time it is woken (example `remote_wake`):
+None of the types above is `Send`, so everything so far stays on the runtime's thread. The exception is [`RemoteWaker`](crate::RemoteWaker), which another thread uses to wake a task. The task creates one for itself while it is being polled, publishes it to the other thread, and checks for its data each time it is woken (example `remote_wake`):
 
 ```rust
 use std::future::poll_fn;

@@ -1,8 +1,8 @@
 # WebSocket
 
-With the `ws` feature, a task can speak WebSocket over a TCP stream: as a client of `wss://` (WebSocket over TLS 1.3) or `ws://` servers, and as a `ws://` server. A connection is a [`Wss`](crate::ws::net::Wss) or a [`Ws`](crate::ws::net::Ws). Both have the same `recv`, `send` and `close`, and each is used from one task.
+With the `ws` feature, a task can run WebSocket over a TCP stream as a client of `wss://` (WebSocket over TLS 1.3) or `ws://` servers, and as a `ws://` server. A connection is a [`Wss`](crate::ws::net::Wss) or a [`Ws`](crate::ws::net::Ws). Both have the same `recv`, `send` and `close`, and each is used from one task.
 
-The program depends on `rustls` too, for the TLS client config, and its `Cargo.toml` needs the `[patch]` section below: switch works only with the copy of rustls in the repository, and without that section the program builds and then panics on the first TLS data it receives.
+The program also depends on `rustls` for the TLS client config, and its `Cargo.toml` needs the `[patch]` section below, because switch works only with the copy of rustls in the repository. Without that section the program builds and then panics on the first TLS data it receives.
 
 ```toml
 [dependencies]
@@ -15,7 +15,7 @@ rustls = { path = "<clone>/vendor/rustls" }
 
 ## The TLS client config
 
-A `wss://` connection needs a `rustls::ClientConfig`, which says which certificate authorities to trust. Build it once in `main`, with the other blocking setup that comes before the card is opened:
+A `wss://` connection needs a `rustls::ClientConfig` holding the certificate authorities to trust. Build it once in `main`, with the other blocking setup that comes before the card is opened:
 
 ```rust
 use std::sync::Arc;
@@ -79,7 +79,7 @@ The host name is used for the certificate check and the `Host` header, and the p
 
 For a `ws://` server, [`connect_ws`](crate::ws::net::connect_ws) takes the same arguments without the config and returns a `Ws`.
 
-[`Limits`](crate::ws::Limits) bounds message sizes. A received message larger than `max_message` fails the connection, and a `send` larger than `max_send` is refused. `Limits::default()` allows 64 MiB each way; set `max_message` to what your peer really sends.
+[`Limits`](crate::ws::Limits) bounds message sizes. A received message larger than `max_message` fails the connection, and a `send` larger than `max_send` is refused. `Limits::default()` allows 64 MiB each way, so set `max_message` to what the peer really sends.
 
 ## Receiving and sending
 
@@ -99,15 +99,15 @@ async fn talk(ws: &mut Wss) -> Result<(), Error> {
 }
 ```
 
-`recv` resolves to the next whole message, however many WebSocket frames the peer split it into, or to `None` when the connection has been closed. A [`Message`](crate::ws::Message) borrows the connection: read it and let it go before the next call. `text()` is `Some` for a text message, already checked to be UTF-8, and `bytes()` is the payload of either kind.
+`recv` resolves to the next whole message, however many WebSocket frames the peer split it into, or to `None` when the connection has been closed. A [`Message`](crate::ws::Message) borrows the connection, so it has to be released before the next call. `text()` is `Some` for a text message, already checked to be UTF-8, and `bytes()` is the payload of either kind.
 
 `send` sends one message of the given [`Kind`](crate::ws::Kind) and returns when all of it has been handed to TCP.
 
-The connection does its work only inside your calls. A ping from the peer is answered during `recv`, so a task that mostly sends must still call `recv` regularly.
+The connection does its work only inside these calls. A ping from the peer is answered during `recv`, so a task that mostly sends must still call `recv` regularly.
 
 ## Closing
 
-To close, send a WebSocket close frame and keep receiving until `recv` returns `None`. Messages the peer sent before it saw your close still arrive in between.
+To close, send a WebSocket close frame and keep receiving until `recv` returns `None`. Messages the peer sent before it saw the close still arrive in between.
 
 ```rust
 use std::time::Duration;
@@ -128,7 +128,7 @@ async fn close(spawner: &Spawner, ws: &mut Wss) -> Result<(), String> {
 }
 ```
 
-1000 is the code for a normal close. When `recv` has returned `None`, the close handshake is done and the `Wss` can be dropped. A peer that never answers the close would keep `recv` waiting, hence the limit.
+Once `recv` has returned `None`, the close handshake is done and the `Wss` can be dropped. The limit is there because a peer that never answers the close would keep `recv` waiting.
 
 When the peer closes first, `recv` answers its close and returns `None` in the same way. `ws.peer_close()` then gives the peer's code and reason.
 
@@ -143,7 +143,7 @@ Every failure of an open connection arrives through `recv`, `send` or `close` as
 | `Tls(_)` | A TLS record from the peer was rejected, or the connection ended without the TLS close. |
 | `Dead` | The TCP connection was reset or closed underneath. |
 
-After a failure, drop the connection. If the peer may still be sending and you want to end without resetting it, call [`linger`](crate::ws::net::Wss::linger) first, inside a `within`.
+After a failure, drop the connection. To end without resetting a peer that may still be sending, call [`linger`](crate::ws::net::Wss::linger) first, inside a `within`.
 
 Errors from `connect` are different variants of the same [`Error`](crate::ws::net::Error): `Tls` or `Handshake` for the TLS handshake, and `Upgrade` when the server did not accept the WebSocket request, for example `Upgrade(UpgradeError::Status(Some(404)))` for a wrong path.
 
@@ -186,7 +186,7 @@ until ip link show cdnic0 >/dev/null 2>&1; do sleep 0.1; done
 ip addr add 192.0.2.1/24 dev cdnic0 && ip link set cdnic0 up
 ```
 
-The image has no WebSocket client, so bring your own: any client run on the Linux side can connect to `ws://192.0.2.2:7000/`. One that sends `hello` gets `hello` back. When it closes with code 1000 the server answers with the same code and prints the line below. `kill %1` stops the server.
+The image has no WebSocket client, but any client run on the Linux side can connect to `ws://192.0.2.2:7000/`. One that sends `hello` gets `hello` back, and when it closes with code 1000 the server answers with the same code and prints the line below. `kill %1` stops the server.
 
 ```text
 WebSocket closed

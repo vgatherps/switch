@@ -1,6 +1,6 @@
 # A complete program
 
-The example `wss_client` is a small market-data client. It connects to Binance's public book-ticker feed over `wss://`, prints a few updates, closes the connection and exits.
+The example `wss_client` is a small market-data client that connects to Binance's public book-ticker feed over `wss://`, prints a few updates, closes the connection and exits.
 
 ```toml
 [package]
@@ -400,11 +400,9 @@ async fn read_feed(
 # }
 ```
 
-Each phase of the task is under [`within`](crate::guide::timeouts).
+Each phase of the task is under [`within`](crate::guide::timeouts). Connecting is one block, the TCP connect followed by [`connect`](crate::ws::net::connect) for TLS and the WebSocket upgrade.
 
-Connecting is one block: the TCP connect, then [`connect`](crate::ws::net::connect) for TLS and the WebSocket upgrade.
-
-The message loop puts a limit on every `recv`: the program gives up when no complete message has arrived for ten seconds. Without the limit a feed that had gone quiet would keep the task waiting, because [TCP has no keep-alive](crate::guide::tcp).
+The message loop limits every `recv`, so the program gives up when no complete message has arrived for ten seconds. Without the limit a feed that had gone quiet would keep the task waiting, because [TCP has no keep-alive](crate::guide::tcp).
 
 Closing is as in [WebSocket](crate::guide::websocket). The feed keeps sending updates until it has seen the close, and the loop reads past them.
 
@@ -601,7 +599,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 # }
 ```
 
-The blocking setup comes before the card is opened, as in [Your first network program](crate::guide::first_connection): here the name lookup and the certificate file.
+The blocking setup, here the name lookup and the certificate file, comes before the card is opened, as in [Your first network program](crate::guide::first_connection).
 
 ## Opening the card
 
@@ -794,7 +792,7 @@ The blocking setup comes before the card is opened, as in [Your first network pr
 # }
 ```
 
-This is the setup of [the first network program](crate::guide::first_connection): one TCP socket, sized for one connection. The server is on the internet, so the config file must name a `gateway`, and `open` fails if the gateway does not answer within three seconds.
+This is the setup of [the first network program](crate::guide::first_connection), with one TCP socket sized for one connection. The server is on the internet, so the config file must name a `gateway`, and `open` fails if the gateway does not answer within three seconds.
 
 ## The loop and the end
 
