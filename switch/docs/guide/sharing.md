@@ -1,6 +1,6 @@
 # Sharing a network card
 
-A card opened with [`open`](crate::nic::open) belongs to that one process. When several programs on a machine need the same card, a daemon, `switch-junctiond`, opens it instead, and each program connects to the daemon. The daemon runs TCP and UDP for all of them on its own CPU and passes each program's data through shared memory.
+A card opened with [`open`](crate::nic::open) belongs to that one process. For several programs to share a card, a daemon, `switch-junctiond`, opens it and runs TCP and UDP for all of them, and each program connects to the daemon.
 
 ```text
   program A (CPU 2)       program B (CPU 3)
@@ -39,9 +39,9 @@ fn connect(control: &str) -> Result<(Net, tcp::Config), Box<dyn std::error::Erro
 }
 ```
 
-[`Session::connect`](crate::junction::session::Session::connect) takes the path of the daemon's `control.sock` and the number of sockets, TCP and UDP together, the program wants open at once. A [`Session`](crate::junction::session::Session) is this program's connection to the daemon, and [`Net::remote`](crate::net::Net::remote) wraps it. `tx_frames` is the size of the program's pool of [send frames](crate::guide::frames). `tx_mbuf_budget` takes an MTU and the session reports the size of a frame, which is 28 bytes less, so the code adds them back.
+[`Session::connect`](crate::junction::session::Session::connect) takes the path of the daemon's `control.sock` and the number of sockets, TCP and UDP together, the program wants open at once. [`Net::remote`](crate::net::Net::remote) wraps the resulting [`Session`](crate::junction::session::Session), with `tx_frames` as the size of the program's pool of [send frames](crate::guide::frames).
 
-The program has no config file, so it has nothing to compute `mss_cap` from and passes `None`; the daemon's network stack applies the limits of its own config.
+`mss_cap` is `None`, because the daemon's network stack applies the limits of its own config.
 
 From there the program is the same: `net.handle()`, the task, and the loop calling [`round`](crate::net::round).
 
@@ -70,7 +70,7 @@ fn close(mut rt: Runtime, net: Net) -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`into_session` has the same condition as `into_stack` in [Shutting down](crate::guide::shutdown), that no handle or socket is left. `finish` asks the daemon to end the session and `closed` turns true when the daemon has confirmed it. `poll` keeps the session moving in the meantime; its two callbacks are for socket events and received packets, and with no socket left both are empty. A session that is dropped without this looks like a crash to the daemon, which then resets the program's open connections.
+`into_session` has the same condition as `into_stack` in [Shutting down](crate::guide::shutdown). `finish` asks the daemon to end the session, and `closed` turns true when the daemon has confirmed it. A session that is dropped without this looks like a crash to the daemon, which then resets the program's open connections.
 
 ## Running it
 
@@ -105,8 +105,6 @@ The `EAL:` lines are the daemon's. Start the client under `taskset` as shown, be
 | After `room(len)` resolves | `try_send` of that length does not return `Full` | `try_send` can still return `Full`; keep the frame and await `room` again |
 | Backpressure from a slow peer | `room` waits while `tx_capacity` bytes are queued or unacknowledged | The daemon holds the bytes, without a limit; `room` does not wait for the peer |
 | UDP `send` to an address that cannot be reached yet | Returns `NoRoute`, `NeighborPending` or `Unaddressable` | Returns `Ok`; the daemon drops the datagram |
-| Size of a frame from `tx_frame` | The config's `mtu` less 28 | `session.frame_capacity()` |
-| Received frames you hold | Keep the card's buffers | Keep space in the session's receive area, which all the program's sockets share |
 
 The reference for [`Net`](crate::net::Net) lists every difference. Code that should run both ways sends like this:
 

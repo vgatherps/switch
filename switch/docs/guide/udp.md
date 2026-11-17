@@ -1,6 +1,6 @@
 # UDP sockets
 
-A [`UdpSocket`](crate::net::UdpSocket) sends and receives datagrams on the port it was [bound](crate::guide::sockets) to. Like a TCP stream it splits into a receiving half, [`UdpRx`](crate::net::UdpRx), and a sending half, [`UdpTx`](crate::net::UdpTx). The example `udp_echo` sends every datagram back to where it came from:
+A [`UdpSocket`](crate::net::UdpSocket), [bound](crate::guide::sockets) to a port, splits into a receiving half, [`UdpRx`](crate::net::UdpRx), and a sending half, [`UdpTx`](crate::net::UdpTx). The example `udp_echo` sends every datagram back to where it came from:
 
 ```rust
 use switch::net::{Error, NetHandle, UdpConfig};
@@ -43,15 +43,13 @@ async fn echo(handle: NetHandle, port: u16) {
 
 `recv` resolves to the next [`Datagram`](crate::net::Datagram) and has no error. Besides its `payload()`, a datagram carries the sender, `src()`, and the address it was sent to, `dst_addr()`.
 
-The socket holds up to `rx_queue` datagrams and drops one that arrives when the queue is full. `tx.stats().rx_dropped_full` counts those drops; the socket's counters are read through the sending half. A datagram the task still holds counts as queued, so drop each one once it has been handled.
+The socket holds up to `rx_queue` datagrams, counting those the task still holds, and drops one that arrives when the queue is full. `tx.stats().rx_dropped_full` counts those drops.
 
 ## Sending
 
-`send(Some(to), frame)` sends one [frame](crate::guide::frames) as one datagram without waiting. Either the datagram is queued for the round's send step, or `send` returns the frame with an error. These sockets have no default destination, so always pass `Some`; `None` returns `NoDestination`.
+`send(Some(to), frame)` sends one [frame](crate::guide::frames) as one datagram without waiting, or returns the frame with an error. These sockets have no default destination, so `None` returns `NoDestination`.
 
-`Full` and `NeighborPending` are worth retrying, and the echo does so after a [`yield_now`](crate::guide::tasks), which lets the loop go round once. `Full` means the datagram cannot be queued now, usually because the card has not yet taken the packets queued before it. `NeighborPending` means ARP resolution of the next hop is still in progress, and a retry succeeds once the reply has arrived. This is normal for the first datagram through a new next hop. A next hop that never answers stays `NeighborPending`, so a program that must not wait forever bounds its retries.
-
-The other errors do not clear by waiting. They are `NoRoute` and `Unaddressable` for a destination the program cannot send to, and `TooLarge`.
+`Full` and `NeighborPending` are worth retrying, as the echo does after a [`yield_now`](crate::guide::tasks). `Full` means the datagram cannot be queued now, and `NeighborPending` that ARP resolution of the next hop is still in progress. A next hop that never answers stays `NeighborPending`. The other errors do not clear by waiting; [`UdpTx::send`](crate::net::UdpTx::send) lists them.
 
 ## Running the echo
 
@@ -66,7 +64,7 @@ python3 -c 'import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.
 kill %1
 ```
 
-The echo prints the report on the card it opened, as the TCP client did, and the Python side prints:
+The echo prints the report on the card it opened, and the Python side prints:
 
 ```text
 echo: hello

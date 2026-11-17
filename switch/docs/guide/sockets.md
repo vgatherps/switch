@@ -1,6 +1,6 @@
 # Opening sockets
 
-A task opens sockets through its [`NetHandle`](crate::net::NetHandle), which connects to a TCP server, accepts a TCP connection, or binds a UDP port. Each call returns a future that resolves to the socket or to an [`Error`](crate::net::Error). Addresses are IPv4.
+A task opens sockets through its [`NetHandle`](crate::net::NetHandle). Each call returns a future that resolves to the socket or to an [`Error`](crate::net::Error). Addresses are IPv4.
 
 Every open socket takes one of the places reserved with `max_sockets` (TCP) or `max_udp_sockets` (UDP) in [`Sizing`](crate::nic::Sizing), and an open fails with `SocketsFull` when none is free.
 
@@ -16,13 +16,13 @@ async fn connect(handle: &NetHandle, socket: tcp::Config) -> Result<TcpStream, E
 }
 ```
 
-`local` is the connection's source endpoint, where `addr: None` means the program's own address. switch does not allocate ephemeral ports, so the program chooses the port, and port 0 is refused with `Unaddressable`. A 4-tuple that is already in use gives `PortInUse`.
+`addr: None` means the program's own address. switch does not allocate ephemeral ports, so the program chooses the local port. Port 0 is refused with `Unaddressable`, and a 4-tuple that is already in use with `PortInUse`.
 
-The future resolves when the TCP handshake completes, or to `Refused` if the server answers the SYN with an RST. If the server never answers, the SYN is retransmitted without limit and the future does not resolve, so put a [time limit](crate::guide::timeouts) on it. Dropping the future abandons the attempt and frees the socket.
+The future resolves when the TCP handshake completes, or to `Refused` if the server answers the SYN with an RST. If the server never answers, the SYN is retransmitted without limit, so put a [time limit](crate::guide::timeouts) on the connect. Dropping the future frees the socket.
 
 ## Accepting
 
-`tcp_accept` listens on a port and resolves to the first connection that arrives, so one call accepts one connection. A server that takes many calls it again before it starts serving each connection, so that a listener is always waiting (from the example `tcp_echo_server`):
+One `tcp_accept` call accepts one connection. A server calls it again before it serves each connection, so that a listener is always waiting (from the example `tcp_echo_server`):
 
 ```rust
 use switch::Spawner;
@@ -61,7 +61,7 @@ async fn serve(mut stream: TcpStream) {
 }
 ```
 
-The waiting listener counts as a socket, so a server that serves up to fifteen connections at once reserves sixteen. There is no accept backlog, so a SYN that arrives while no listener is waiting is answered with an RST.
+The waiting listener counts as a socket in `max_sockets`. There is no accept backlog, so a SYN that arrives while no listener is waiting is answered with an RST.
 
 ## Binding UDP
 
@@ -80,11 +80,11 @@ async fn bind(handle: &NetHandle) -> Result<UdpSocket, Error> {
 }
 ```
 
-`port` must not be 0. `local_addr: None` receives on every address the program has. `rx_queue` is the number of received datagrams the socket holds before it drops new ones. `tx_checksum: true` gives sent datagrams a UDP checksum, and `broadcast: true` allows sending to a broadcast address.
+`port` must not be 0, and `rx_queue` is the number of received datagrams the socket holds before it drops new ones. The reference for [`UdpConfig`](crate::net::UdpConfig) covers the other fields.
 
 ## Errors
 
-The reference for each call on [`NetHandle`](crate::net::NetHandle) lists what it can return, and [`Error`](crate::net::Error) describes every variant. `Error` implements `Display` and `std::error::Error`.
+The reference for each call on [`NetHandle`](crate::net::NetHandle) lists what it can return, and [`Error`](crate::net::Error) describes every variant.
 
 Socket futures, here and in the following chapters, must be awaited in switch tasks. On another executor, a socket future that has to wait panics.
 

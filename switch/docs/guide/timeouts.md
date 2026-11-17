@@ -48,7 +48,7 @@ async fn finish(spawner: &Spawner, rx: &mut TcpRx, tx: &mut TcpTx) -> Result<(),
 }
 ```
 
-The limit is a [sleep](crate::guide::tasks) on the task's runtime, so it is as punctual as any sleep, and the runtime's ticks must be nanoseconds ([The drive loop](crate::guide::drive_loop)). If `work` is ready in the same poll in which the limit expires, `work` wins.
+The limit is a [sleep](crate::guide::tasks) on the task's runtime, whose ticks must be nanoseconds ([The drive loop](crate::guide::drive_loop)). If `work` is ready in the same poll in which the limit expires, `work` wins.
 
 ## Whichever comes first
 
@@ -69,8 +69,6 @@ async fn read_until_stopped(rx: &mut TcpRx, mut stop: Receiver<()>) -> Result<()
 }
 ```
 
-Because `a` is polled first, data that has already arrived is printed before a stop is obeyed.
-
 ## What cancelling does
 
 When the limit passes or `b` wins, the other future is dropped. The effect depends on the future:
@@ -80,8 +78,6 @@ When the limit passes or `b` wins, the other future is dropped. The effect depen
 | `tcp_connect`, `tcp_accept`, `udp_bind` | The socket being opened is closed. |
 | `recv` on TCP or UDP | Nothing is lost. Data stays queued for the next `recv`. |
 | `room`, `delivered`, `tx_frame` | Nothing is lost. Call it again. |
-| An `async` block of yours | Its sockets close as in [Dropping a stream](crate::guide::tcp) and its frames return to the pool. Steps it had finished are not undone. |
-
-Sends cannot be cancelled halfway, because `try_send` and UDP's `send` do not wait and a frame is either queued or handed back.
+| An `async` block of yours | Its sockets close as in [Dropping a stream](crate::guide::tcp) and its frames return to the pool. |
 
 Next: [Shutting down](crate::guide::shutdown).

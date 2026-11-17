@@ -1,6 +1,6 @@
 # TLS without WebSocket
 
-For a protocol of your own over TLS 1.3, [`tls_connect`](crate::tls::net::tls_connect) turns a connected [`TcpStream`](crate::net::TcpStream) into an encrypted stream of bytes. The program's `Cargo.toml` and its `rustls` client config are the same as for [WebSocket](crate::guide::websocket), with the feature `tls` in place of `ws` if you want TLS alone.
+For a protocol of your own over TLS 1.3, [`tls_connect`](crate::tls::net::tls_connect) turns a connected [`TcpStream`](crate::net::TcpStream) into an encrypted stream of bytes. The program's `Cargo.toml` and its `rustls` client config are the same as for [WebSocket](crate::guide::websocket), with the feature `tls` in place of `ws`.
 
 The example `tls_client` sends one line and prints the reply. Here is that exchange as a function:
 
@@ -47,13 +47,13 @@ async fn request(
 
 ## Connecting
 
-`tls_connect(handle, stream, config, host, min_plain)` runs the handshake, with `host` as the SNI name and the name the server's certificate is verified against. `min_plain` is the largest piece the program will send as a single TLS record, and `tls_connect` checks, before anything is sent, that one frame can carry a record of that size. `send_bytes` splits data into records itself, so a program that sends only through it can pass 1; the example passes the length of its line. The result is a [`Tls`](crate::tls::net::Tls) with a sending half `tx` and a receiving half `rx`.
+`tls_connect(handle, stream, config, host, min_plain)` runs the handshake, with `host` as the SNI name and the name the server's certificate is verified against, and returns a [`Tls`](crate::tls::net::Tls) with a sending half `tx` and a receiving half `rx`. `min_plain` is the largest piece the program will send as a single TLS record; a program that sends only through `send_bytes` can pass 1.
 
 A server that negotiates anything other than TLS 1.3 is refused with `Error::Handshake`. A certificate that does not verify is `Error::Tls`. [`Error`](crate::tls::net::Error) lists the other ways the handshake can fail.
 
 ## Writing and reading
 
-[`send_bytes(&mut tls.tx, bytes)`](crate::tls::net::send_bytes) encrypts and sends `bytes`, waiting for room on the connection as it goes, and returns when the last record has been queued on the TCP connection. Because it does not read, two sides that both keep sending without reading can deadlock, so keep receiving as well as sending.
+[`send_bytes(&mut tls.tx, bytes)`](crate::tls::net::send_bytes) encrypts and sends `bytes`, waiting for room on the connection as it goes, and returns when the last record has been queued on the TCP connection.
 
 `tls.ready().await` waits until decrypted bytes are available and returns `Ok(true)`, or `Ok(false)` when the server has sent `close_notify`. `tls.rx.current()` borrows those bytes from the connection, and `tls.rx.consume(n)` marks the first `n` as read. Unconsumed bytes are returned again by the next `ready`, but they are not joined with what arrives later, so a message that spans several pieces must be collected in the program's own buffer.
 
@@ -61,9 +61,9 @@ A connection that ends without the server's `close_notify` is an error from `rea
 
 ## Closing
 
-`tls.close().await` sends `close_notify` followed by a FIN, and waits until the server has acknowledged both or the connection has ended. After it returns, the `Tls` can be dropped.
+`tls.close().await` sends `close_notify` followed by a FIN, and waits until the server has acknowledged both or the connection has ended.
 
-`tls_connect`, `ready` and `close` each wait on the server. The example's `main` gives the whole exchange thirty seconds; a program that goes on running puts each exchange inside [`within`](crate::guide::timeouts).
+`tls_connect`, `ready` and `close` each wait on the server, so put them inside [`within`](crate::guide::timeouts).
 
 ## Running the example
 

@@ -33,11 +33,11 @@ async fn print_all(rx: &mut TcpRx) -> Result<(), Error> {
 }
 ```
 
-Data that has arrived is always delivered before `recv` reports how the stream ended, which is `Finished` after the peer's FIN and `InvalidState` after an RST. Sending is still possible after `Finished`.
+Data that has arrived is delivered before `recv` reports how the stream ended, which is `Finished` after the peer's FIN and `InvalidState` after an RST. Sending is still possible after `Finished`.
 
 ## Sending
 
-To send, wait in `room(len)` until the connection can take `len` more bytes, then queue the frame with `try_send(frame)`, which does not wait. TCP sends queued data in the [round's](crate::guide::drive_loop) send step, as fast as the peer's receive window and the congestion window allow. This function sends a buffer of any length, a frame at a time (from the example `tcp_echo_server`):
+To send, wait in `room(len)` until the connection can take `len` more bytes, then queue the frame with `try_send(frame)`, which does not wait. This function sends a buffer of any length, a frame at a time (from the example `tcp_echo_server`):
 
 ```rust
 use switch::net::{Error, NetHandle, TcpTx};
@@ -59,11 +59,11 @@ async fn send_all(handle: &NetHandle, tx: &mut TcpTx, mut rest: &[u8]) -> Result
 
 `max_segment_payload` is the connection's effective MSS, and a frame no longer than that can go out as one segment.
 
-`room` fails with `InvalidState` once the connection can no longer send, and with `TooLarge` if `len` is more than the socket's `tx_capacity`. `try_send` fails with `Full` if the caller did not wait for room, and its error comes with the frame, as the `map_err` above shows.
+`room` fails with `InvalidState` once the connection can no longer send, and with `TooLarge` if `len` is more than the socket's `tx_capacity`. `try_send` fails with `Full` if the caller did not wait for room, and returns the frame with the error.
 
 ## When the peer is slow
 
-A sent frame stays with its socket until the peer acknowledges it. The socket holds at most `tx_capacity` bytes that are queued or unacknowledged, and `room` waits while it is full, so backpressure from a slow peer reaches the task as a wait in `room`. A task that must not wait behind a slow peer puts a [time limit](crate::guide::timeouts) on `room`.
+The socket holds at most `tx_capacity` bytes that are queued or unacknowledged, and `room` waits while it is full, so backpressure from a slow peer reaches the task as a wait in `room`.
 
 ## Finishing
 
@@ -77,13 +77,13 @@ tx.delivered().await;
 
 `shutdown` half-closes the connection, queuing a FIN behind the data already queued while receiving continues. `delivered` resolves once the peer has acknowledged every byte and the FIN, or once the connection is gone and nothing more can arrive there.
 
-Wait for `delivered` before the program exits. Until then queued data lives only in the socket and is sent by the loop, so data still queued when the loop stops is never sent.
+Wait for `delivered` before the program exits, because data still queued when the loop stops is never sent.
 
 ## Dropping a stream
 
-Dropping both halves closes the connection, like `close()` on a Linux socket. If received data is still unread, the peer gets an RST. Otherwise queued data and the FIN are still sent in later rounds, with a limited number of retransmissions. Dropping one half leaves the other working.
+Dropping both halves closes the connection. If received data is still unread, the peer gets an RST. Otherwise queued data and the FIN are still sent in later rounds. Dropping one half leaves the other working.
 
-A dropped connection keeps its place among the program's sockets, and its 4-tuple, until TCP has finished closing it, which can take ten seconds or more. A program that reconnects often gives each attempt a new local port and reserves more than one place in `max_sockets`.
+When the program owns the card, a dropped connection keeps its place in `max_sockets` and its 4-tuple until TCP has finished closing it, which can take ten seconds or more.
 
 ## When the peer is silent
 

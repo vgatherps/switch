@@ -29,9 +29,9 @@ docker run --rm -it --init \
     switch-dpdk-test:local bash
 ```
 
-The clone is mounted at `/work`, so files are edited on the host and built in the container, and the two named volumes keep cargo's downloads and the Linux build output between containers. `--cap-add NET_ADMIN --device /dev/net/tun` lets a program in the container create a tap device, which the examples in this guide use instead of a real card.
+The clone is mounted at `/work`, and the two named volumes keep cargo's downloads and the build output between containers. `--cap-add NET_ADMIN --device /dev/net/tun` lets a program create a tap device, which the examples in this guide use instead of a real card.
 
-`--cpuset-cpus=0` allows the container CPU 0 and no other, because opening a network card requires the calling thread's CPU affinity mask to contain exactly one CPU. Any CPU the Docker host has will do.
+`--cpuset-cpus=0` gives the container one CPU, because opening a network card requires a CPU affinity mask of exactly one CPU. Any CPU the Docker host has will do.
 
 ## On a Linux machine
 
@@ -71,7 +71,7 @@ make -C conduit doctor
 
 `doctor` prints the tool versions; the last line is DPDK's and must read `25.11.3`. If something is missing it prints one line naming it, for example `Missing libdpdk development package`.
 
-The examples create a tap device, which needs root, or the `CAP_NET_ADMIN` capability and access to `/dev/net/tun`. Opening a card requires a CPU affinity mask of exactly one CPU, so on a Linux machine start each program under `taskset -c N`, as the commands in this guide do.
+The examples create a tap device, which needs root, or the `CAP_NET_ADMIN` capability and access to `/dev/net/tun`. Start each program under `taskset -c N`, as the commands in this guide do, so that it has an affinity mask of one CPU.
 
 A real network card needs more preparation of the machine, which `docs/operations/host-setup.md` in the repository covers for a Linux machine with a spare card and `docs/operations/ec2.md` for an EC2 instance.
 
@@ -83,6 +83,6 @@ In the container's shell, or on the Linux machine, build the example the next ch
 cargo build -p switch-examples --features net --example tcp_client_local
 ```
 
-The first build compiles the DPDK bindings and takes a few minutes. It ends with cargo's usual `Finished` line, and the program is at `target/debug/examples/tcp_client_local`.
+The first build compiles the DPDK bindings and takes a few minutes. The program is at `target/debug/examples/tcp_client_local`.
 
 Next: [Your first network program](crate::guide::first_connection).

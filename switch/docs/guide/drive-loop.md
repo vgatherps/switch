@@ -1,6 +1,6 @@
 # The drive loop
 
-The drive loop is the loop in `main` that receives and sends packets and runs tasks, none of which happens outside it. A round is one iteration of that loop.
+The drive loop is the loop in `main` that receives and sends packets and runs tasks. A round is one iteration of that loop.
 
 ## A round
 
@@ -47,19 +47,15 @@ fn drive(
         back to the top
 ```
 
-Because tasks run between the receive and send steps, a task woken by a packet can run in the same round, and what it sends in answer can leave at the end of that round.
-
-`try_send` on a socket queues data and returns; the data leaves in a send step. A task waiting in `recv` runs again only after a receive step has found data, a FIN or an RST for it.
-
 `round` is three calls, [`Net::receive`](crate::net::Net::receive), [`Runtime::poll`](crate::Runtime::poll) and [`Net::send`](crate::net::Net::send), which a loop with work of its own to do between them can make itself.
 
 ## The clock
 
 `now` is the network's time, an [`Instant`](crate::net::Instant) counted in microseconds, which TCP uses for its timers. `tick` is the runtime's tick from [Your first task](crate::guide::first_task).
 
-Read the clock once per round and derive both from that reading, so tasks and the network agree on the time. Count ticks in nanoseconds, because the [timeout helpers](crate::guide::timeouts) convert a `Duration` to ticks on that assumption. The `Clock` in [Your first network program](crate::guide::first_connection) does both in its `sample`.
+Read the clock once per round and derive both from that reading. Count ticks in nanoseconds, because the [timeout helpers](crate::guide::timeouts) convert a `Duration` to ticks on that assumption. The `Clock` in [Your first network program](crate::guide::first_connection) does both in its `sample`.
 
-Both times must be monotonic, which `std::time::Instant` guarantees. Pass the same clock to `open`, and start the runtime at a tick no later than the first reading. `Runtime::new(0)` will do when ticks count from the program's start.
+Both times must be monotonic. Pass the same clock to `open`, and start the runtime at a tick no later than the first reading.
 
 ## Going round without pause, or sleeping
 
@@ -88,20 +84,10 @@ fn drive(
 }
 ```
 
-While the loop sleeps, nothing is received, no TCP timer runs and no task's sleep ends, so everything can be late by the length of the sleep. The examples sleep one millisecond. [`net.poll_at()`](crate::net::Net::poll_at) gives the time of the network's next timer, for a loop that wants to sleep until then; `None` means it has none. The runtime has no such call for tasks' sleeps, so a loop whose tasks sleep keeps its own sleeps short.
+While the loop sleeps, nothing is received and no timer fires, so everything can be late by the length of the sleep. [`net.poll_at()`](crate::net::Net::poll_at) gives the time of the network's next timer; the runtime has no such call for tasks' sleeps.
 
 ## When a round fails
 
-`round` returns a [`RoundError`](crate::net::RoundError), which says which step failed:
-
-| Error | Meaning |
-|---|---|
-| `Turn(TurnError::Stack(_))` | The network stack or the card reported a failure. This includes `TimeWentBackwards`, when `now` is earlier than in the previous round. |
-| `Turn(TurnError::HostLost(_))` | The connection to the daemon is gone. Only when [sharing a card](crate::guide::sharing). |
-| `Runtime(RuntimeError::TimeRegressed { .. })` | `tick` is lower than in the previous round. |
-| `Runtime(RuntimeError::Closed)` | The runtime was shut down. |
-| `Runtime(RuntimeError::Panicked)` | A task panicked in an earlier round. |
-
-`round` stops at the first failing step. The programs in this guide treat any of these as fatal, leave the loop and [shut down](crate::guide::shutdown). `RoundError` implements only `Debug`, so print it with `{:?}`.
+`round` returns a [`RoundError`](crate::net::RoundError) that names the step that failed, for example `Turn(TurnError::Stack(_))` when the network stack or the card reported a failure and `Runtime(RuntimeError::Panicked)` after a task panicked. The programs in this guide treat any of them as fatal, leave the loop and [shut down](crate::guide::shutdown). `RoundError` implements only `Debug`, so print it with `{:?}`.
 
 Next: [Opening sockets](crate::guide::sockets).

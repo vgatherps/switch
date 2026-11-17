@@ -35,11 +35,11 @@ child polled
 
 `spawn` fails only when the runtime has been shut down or a task has panicked, and the error then returns the token. A panic in a task is not caught and propagates out of `runtime.poll` into the loop.
 
-A task's return value comes from `spawn_join` and a [`JoinHandle`](crate::JoinHandle) awaited in another task, as in [Your first task](crate::guide::first_task). The handle resolves to `Err(Canceled)` if the task ended without a value, because it panicked or the runtime was shut down. Dropping the handle leaves the task running.
+A [`JoinHandle`](crate::JoinHandle) ([Your first task](crate::guide::first_task)) resolves to `Err(Canceled)` if the task panicked or the runtime was shut down. Dropping the handle leaves the task running.
 
 ## Sleeping
 
-[Your first task](crate::guide::first_task) slept with `spawner.sleep(ticks)`; `spawner.sleep_until(tick)` waits for an absolute tick. A sleep is only as punctual as the loop, so a loop that polls every millisecond can end a sleep a millisecond late.
+[Your first task](crate::guide::first_task) slept with `spawner.sleep(ticks)`; `spawner.sleep_until(tick)` waits for an absolute tick.
 
 With ticks in nanoseconds, a `Duration` converts directly (example `clock_loop`):
 
@@ -59,7 +59,7 @@ Dropping a sleep cancels it. The errors a sleep can return are on [`SleepError`]
 
 ## Yielding
 
-A task that runs for a long time without awaiting stalls the network as well as the other tasks, because packets are received and sent between polls. After [`yield_now`](crate::yield_now) the other ready tasks run, the loop goes round, and the task continues in the next `runtime.poll`, or sooner if something else wakes it first. This task is also in `clock_loop`:
+A task that runs for a long time without awaiting stalls the network as well as the other tasks, because packets are received and sent between polls. After [`yield_now`](crate::yield_now) the task continues in the next `runtime.poll`, or sooner if something else wakes it first. This task is also in `clock_loop`:
 
 ```rust
 #[switch::task]
@@ -115,11 +115,11 @@ fn main() {
 received 42
 ```
 
-`send` wakes the receiving task, or returns the value if the receiver has been dropped. The sender does not have to be in a task. The loop in `main` can hold it and send between polls, which is one way to tell a task to stop.
+`send` returns the value if the receiver has been dropped. The sender does not have to be in a task, so the loop in `main` can hold it and send between polls.
 
 ## Waking a task from another thread
 
-None of the types above is `Send`, so everything so far stays on the runtime's thread. The exception is [`RemoteWaker`](crate::RemoteWaker), which another thread uses to wake a task. The task creates one for itself while it is being polled, publishes it to the other thread, and checks for its data each time it is woken (example `remote_wake`):
+None of the types above is `Send`. The exception is [`RemoteWaker`](crate::RemoteWaker), which another thread uses to wake a task. The task creates one for itself while it is being polled (example `remote_wake`):
 
 ```rust
 use std::future::poll_fn;
@@ -168,6 +168,6 @@ fn main() {
 woken with 7
 ```
 
-The other thread stores the data before it calls `wake`, which rules out a lost wakeup. The wake takes effect at the start of the next `runtime.poll`.
+The wake takes effect at the start of the next `runtime.poll`.
 
 Next: [The drive loop](crate::guide::drive_loop).

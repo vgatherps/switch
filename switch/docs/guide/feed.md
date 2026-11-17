@@ -1,6 +1,6 @@
 # A complete program
 
-The example `wss_client` is a small market-data client that connects to Binance's public book-ticker feed over `wss://`, prints a few updates, closes the connection and exits.
+The example `wss_client` connects to Binance's public book-ticker feed over `wss://`, prints a few updates, closes the connection and exits.
 
 ```toml
 [package]
@@ -207,7 +207,7 @@ struct Feed {
 # }
 ```
 
-`WAIT` is the one time limit the program uses, for every step that depends on the server. A book-ticker update is a short line of JSON, so `LIMITS` accepts messages up to 64 KiB where the default would accept 64 MiB.
+`WAIT` is the time limit for every step that depends on the server. `LIMITS` accepts messages up to 64 KiB where the default would accept 64 MiB.
 
 ## The task
 
@@ -400,9 +400,7 @@ async fn read_feed(
 # }
 ```
 
-Each phase of the task is under [`within`](crate::guide::timeouts). Connecting is one block, the TCP connect followed by [`connect`](crate::ws::net::connect) for TLS and the WebSocket upgrade.
-
-The message loop limits every `recv`, so the program gives up when no complete message has arrived for ten seconds. Without the limit a feed that had gone quiet would keep the task waiting, because [TCP has no keep-alive](crate::guide::tcp).
+Each phase of the task is under [`within`](crate::guide::timeouts). The limit on each `recv` is needed because [TCP has no keep-alive](crate::guide::tcp), so a feed that had gone quiet would otherwise keep the task waiting.
 
 Closing is as in [WebSocket](crate::guide::websocket). The feed keeps sending updates until it has seen the close, and the loop reads past them.
 
@@ -790,7 +788,7 @@ The blocking setup, here DNS resolution and reading the certificate file, comes 
 # }
 ```
 
-This is the setup of [the first network program](crate::guide::first_connection), with one TCP socket sized for one connection. The server is on the internet, so the config file must name a `gateway`, and `open` fails if the gateway does not answer ARP within three seconds.
+This is the setup of [the first network program](crate::guide::first_connection). The server is on the internet, so the config file must name a `gateway`, and `open` fails if the gateway does not answer ARP within three seconds.
 
 ## The loop and the end
 
@@ -985,7 +983,7 @@ This is the setup of [the first network program](crate::guide::first_connection)
 
 The [loop](crate::guide::drive_loop) sleeps a millisecond after an idle round; without the sleep it busy-polls.
 
-The loop needs no time limit, because every wait in the task has one and the task always ends. When it has, the program [shuts down](crate::guide::shutdown) in order.
+The loop needs no time limit, because every wait in the task has one. When the task ends, the program [shuts down](crate::guide::shutdown) in order.
 
 ## Running it
 

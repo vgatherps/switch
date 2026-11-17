@@ -7,7 +7,7 @@ switch is used from a clone of its repository, so the dependency in `Cargo.toml`
 switch = { path = "<clone>/switch" }
 ```
 
-With no features enabled, `switch` is the runtime alone, tasks and timers without the network, and builds on any machine with cargo. The three programs below are combined into one `main` in the example `first_task`, which runs from the clone with:
+With no features enabled, `switch` is the runtime alone and builds on any machine with cargo. The three programs below are combined in the example `first_task`:
 
 ```sh
 cargo run -p switch-examples --example first_task
@@ -37,7 +37,7 @@ fn main() {
 Hello, switch!
 ```
 
-`runtime.spawner()` returns a [`Spawner`](crate::Spawner), a handle that starts tasks and can be cloned freely. Calling a `#[switch::task]` function returns a token holding the arguments instead of running the body, and `spawner.spawn` turns that token into a task. The task runs only inside [`runtime.poll`](crate::Runtime::poll), which runs the tasks that are ready and returns a [`PollReport`](crate::PollReport). The report's `live_tasks` field counts the tasks that have not finished, so the loop above polls until `hello` is done. The runtime has no threads of its own, so nothing happens between two calls to `poll`.
+Calling a `#[switch::task]` function returns a token instead of running the body, and [`Spawner::spawn`](crate::Spawner) turns the token into a task. Tasks run only inside [`runtime.poll`](crate::Runtime::poll), which returns a [`PollReport`](crate::PollReport) whose `live_tasks` field counts the tasks that have not finished. The runtime has no threads of its own, so nothing happens between two calls to `poll`.
 
 ## Getting a value back
 
@@ -109,6 +109,6 @@ ten ticks passed
 tick 10: polled 1, live 0
 ```
 
-`spawner.sleep(10)` creates a timer that is due ten ticks after the latest tick the runtime was given, and the sleep ends in the first poll whose tick has reached that deadline. A loop that passes a constant tick, as the two earlier loops do, therefore never ends a nonzero sleep. A real program reads a clock once per iteration and passes the reading as the tick; the network programs in this guide use nanoseconds since the program started.
+`spawner.sleep(10)` creates a timer that is due ten ticks after the latest tick the runtime was given, and the sleep ends in the first poll whose tick has reached that deadline. A program reads a clock once per iteration and passes the reading as the tick; the network programs in this guide use nanoseconds since the program started.
 
 Network programs need more than cargo to build. Next: [Setting up for network programs](crate::guide::setup).

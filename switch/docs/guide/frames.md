@@ -2,7 +2,7 @@
 
 Sockets send and receive frames, which are handles to the packet buffers the network card itself uses. A program that owns its card receives zero-copy, and sends zero-copy under the conditions below.
 
-An [`OwnedFrame`](crate::net::OwnedFrame) has one holder and can be written; it dereferences to `&mut [u8]`. An [`ImmutableFrame`](crate::net::ImmutableFrame) is read-only and reference-counted, so cloning it copies no bytes. The buffer goes back to its pool when the last handle to it is dropped.
+An [`OwnedFrame`](crate::net::OwnedFrame) has one holder and can be written. An [`ImmutableFrame`](crate::net::ImmutableFrame) is read-only and reference-counted. The buffer goes back to its pool when the last handle to it is dropped.
 
 ## Sending
 
@@ -18,11 +18,11 @@ async fn filled(handle: &NetHandle, bytes: &[u8]) -> ImmutableFrame {
 }
 ```
 
-[`tx_frame`](crate::net::NetHandle::tx_frame) gives a blank frame of the largest size, which is the config file's `mtu` less 28 bytes, or 1472 for an MTU of 1500. The `bytes` here must fit in one frame; longer data goes out as several.
+[`tx_frame`](crate::net::NetHandle::tx_frame) gives a blank frame of the largest size, which is the config file's `mtu` less 28 bytes. The `bytes` here must fit in one frame; longer data goes out as several.
 
 The frames come from a pool of fixed size that all sockets share, sized by `frame_share` in [`Sizing`](crate::nic::Sizing). When the pool is empty, `tx_frame().await` waits until a frame comes back.
 
-The sending calls, `try_send` on TCP and `send` on UDP, take the `ImmutableFrame` and return at once. A call that fails returns the same frame with the error, so the frame can be sent again.
+`try_send` on TCP and `send` on UDP take the `ImmutableFrame` and return at once. A call that fails returns the same frame with the error.
 
 A frame can be sent in place, without a copy. [`TcpTx::try_send`](crate::net::TcpTx::try_send) and [`UdpTx::send`](crate::net::UdpTx::send) list the cases in which it is copied instead.
 
@@ -43,6 +43,6 @@ fn show(frame: &TcpFrame, datagram: &Datagram) {
 
 ## What holding a frame costs
 
-A held frame is a packet buffer the card cannot reuse. The pools are fixed when the card is opened, so a program that keeps many received frames for a long time leaves the card fewer buffers to receive into. Drop a frame once it has been read, and copy out any data that must be kept for a long time. Every frame must be dropped before the card is closed ([Shutting down](crate::guide::shutdown)).
+A held frame is a packet buffer the card cannot reuse, and the pools are fixed when the card is opened. Copy out data that must be kept. Every frame must be dropped before the card is closed ([Shutting down](crate::guide::shutdown)).
 
 Next: [TCP streams](crate::guide::tcp).
