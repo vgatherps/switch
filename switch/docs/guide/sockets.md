@@ -16,9 +16,9 @@ async fn connect(handle: &NetHandle, socket: tcp::Config) -> Result<TcpStream, E
 }
 ```
 
-`local` is the connection's source endpoint, where `addr: None` means the program's own address. The program chooses the port, because switch has no automatic port selection and refuses port 0 with `Unaddressable`. Two connections from one local address to the same server address and port need different local ports; a pair already in use gives `PortInUse`.
+`local` is the connection's source endpoint, where `addr: None` means the program's own address. switch does not allocate ephemeral ports, so the program chooses the port, and port 0 is refused with `Unaddressable`. A 4-tuple that is already in use gives `PortInUse`.
 
-The future resolves when the TCP handshake completes, or to `Refused` if the server answers with a reset. If the server never answers, the connect keeps retrying and the future does not resolve, so put a [time limit](crate::guide::timeouts) on it. Dropping the future abandons the attempt and frees the socket.
+The future resolves when the TCP handshake completes, or to `Refused` if the server answers the SYN with an RST. If the server never answers, the SYN is retransmitted without limit and the future does not resolve, so put a [time limit](crate::guide::timeouts) on it. Dropping the future abandons the attempt and frees the socket.
 
 ## Accepting
 
@@ -61,7 +61,7 @@ async fn serve(mut stream: TcpStream) {
 }
 ```
 
-The waiting listener counts as a socket, so a server that serves up to fifteen connections at once reserves sixteen. A connection that arrives while no listener is waiting is refused.
+The waiting listener counts as a socket, so a server that serves up to fifteen connections at once reserves sixteen. There is no accept backlog, so a SYN that arrives while no listener is waiting is answered with an RST.
 
 ## Binding UDP
 
@@ -84,7 +84,7 @@ async fn bind(handle: &NetHandle) -> Result<UdpSocket, Error> {
 
 ## Errors
 
-The reference for each call on [`NetHandle`](crate::net::NetHandle) lists what it can return, and [`Error`](crate::net::Error) describes every variant. `Error` implements `Display` and `std::error::Error`, so `?` into a `Box<dyn Error>` works.
+The reference for each call on [`NetHandle`](crate::net::NetHandle) lists what it can return, and [`Error`](crate::net::Error) describes every variant. `Error` implements `Display` and `std::error::Error`.
 
 Socket futures, here and in the following chapters, must be awaited in switch tasks. On another executor, a socket future that has to wait panics.
 

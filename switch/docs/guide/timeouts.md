@@ -28,8 +28,6 @@ async fn connect(
 }
 ```
 
-The first `?` handles the timeout and the second the connect's own error.
-
 `work` can be an `async` block, so one limit can cover several steps:
 
 ```rust
@@ -54,7 +52,7 @@ The limit is a [sleep](crate::guide::tasks) on the task's runtime, so it is as p
 
 ## Whichever comes first
 
-`first(a, b)` waits for both futures and returns `Some(output of a)`, or `None` if `b` finishes first. It usually serves to stop a wait when something else happens. Here a task reads a stream until it ends or until the loop in `main` sends on a [oneshot channel](crate::guide::tasks):
+`first(a, b)` is a two-way select biased towards `a`. It returns `Some(output of a)`, or `None` if `b` finishes first. Here a task reads a stream until it ends or until the loop in `main` sends on a [oneshot channel](crate::guide::tasks):
 
 ```rust
 use switch::net::{first, Error, TcpRx};
@@ -71,18 +69,18 @@ async fn read_until_stopped(rx: &mut TcpRx, mut stop: Receiver<()>) -> Result<()
 }
 ```
 
-`a` is checked before `b`, so data that has already arrived is printed before a stop is obeyed. `stop` is passed as `&mut stop` so that when `recv` wins, only the borrow is dropped and the receiver is still there for the next iteration.
+Because `a` is polled first, data that has already arrived is printed before a stop is obeyed.
 
 ## What cancelling does
 
-When the limit passes or `b` wins, the other future is dropped, which is how a wait is cancelled in switch. The effect depends on the future:
+When the limit passes or `b` wins, the other future is dropped. The effect depends on the future:
 
 | Dropped while waiting | Effect |
 |---|---|
 | `tcp_connect`, `tcp_accept`, `udp_bind` | The socket being opened is closed. |
 | `recv` on TCP or UDP | Nothing is lost. Data stays queued for the next `recv`. |
 | `room`, `delivered`, `tx_frame` | Nothing is lost. Call it again. |
-| An `async` block of yours | Everything the block owns is dropped, so its sockets close as in [Dropping a stream](crate::guide::tcp) and its frames return to the pool. What it only borrowed stays with its owner, and steps it had finished are not undone. |
+| An `async` block of yours | Its sockets close as in [Dropping a stream](crate::guide::tcp) and its frames return to the pool. Steps it had finished are not undone. |
 
 Sends cannot be cancelled halfway, because `try_send` and UDP's `send` do not wait and a frame is either queued or handed back.
 

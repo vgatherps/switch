@@ -1,10 +1,10 @@
 # Tasks
 
-All the tasks of a runtime share one thread and are scheduled cooperatively, so a task runs without interruption until it reaches an `.await` that is not ready. The code comes from runnable examples: `cargo run -p switch-examples --example NAME`.
+All the tasks of a runtime share one thread and are scheduled cooperatively. The code comes from runnable examples: `cargo run -p switch-examples --example NAME`.
 
 ## Writing and spawning
 
-A task function is an `async fn` marked [`#[switch::task]`](macro@crate::task). Its arguments are moved into the task, so they are owned values or shared ones such as `Rc`. A task that spawns other tasks takes a [`Spawner`](crate::Spawner) as an argument (example `tasks`):
+A task function is an `async fn` marked [`#[switch::task]`](macro@crate::task). Its future must be `'static` but need not be `Send`, so its arguments are owned values or shared ones such as `Rc`. A task that spawns other tasks takes a [`Spawner`](crate::Spawner) as an argument (example `tasks`):
 
 ```rust
 use switch::{Runtime, Spawner};
@@ -59,7 +59,7 @@ Dropping a sleep cancels it. The errors a sleep can return are on [`SleepError`]
 
 ## Yielding
 
-A task that computes for a long time holds up every other task and, in a network program, the network too, because packets are received and sent between polls. After [`yield_now`](crate::yield_now) the other ready tasks run, the loop goes round, and the task continues in the next `runtime.poll`, or sooner if something else wakes it first. This task is also in `clock_loop`:
+A task that runs for a long time without awaiting stalls the network as well as the other tasks, because packets are received and sent between polls. After [`yield_now`](crate::yield_now) the other ready tasks run, the loop goes round, and the task continues in the next `runtime.poll`, or sooner if something else wakes it first. This task is also in `clock_loop`:
 
 ```rust
 #[switch::task]
@@ -76,7 +76,7 @@ async fn sum_in_slices(values: Vec<u64>) {
 
 ## Passing one value to a task
 
-A [`oneshot`](crate::oneshot) channel carries one value to one waiting task (example `oneshot`):
+[`oneshot`](crate::oneshot) is a single-threaded oneshot channel whose receiver is awaited in a task (example `oneshot`):
 
 ```rust
 use switch::oneshot::{self, Receiver, Sender};
@@ -115,7 +115,7 @@ fn main() {
 received 42
 ```
 
-`send` wakes the receiving task, or returns the value if the receiver has been dropped. The sender does not have to be in a task. The loop in `main` can hold it and send between polls, which is one way to tell a task to stop. Both ends stay on the runtime's thread.
+`send` wakes the receiving task, or returns the value if the receiver has been dropped. The sender does not have to be in a task. The loop in `main` can hold it and send between polls, which is one way to tell a task to stop.
 
 ## Waking a task from another thread
 
@@ -168,6 +168,6 @@ fn main() {
 woken with 7
 ```
 
-The other thread stores the data first and wakes second, so the task cannot miss it. The wake takes effect at the start of the next `runtime.poll`.
+The other thread stores the data before it calls `wake`, which rules out a lost wakeup. The wake takes effect at the start of the next `runtime.poll`.
 
 Next: [The drive loop](crate::guide::drive_loop).

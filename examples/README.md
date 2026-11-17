@@ -10,7 +10,7 @@ The others open a network card and need Linux with DPDK, as the guide chapter Se
 
 ## Running wss_client in a container
 
-`wss_client` connects to a server on the internet, but on the tap device the examples use, its packets reach only the container, so the container has to forward them. Forwarding takes `nftables`, which is in a second image built on the first.
+`wss_client` connects to a server on the internet, but on the tap device the examples use, its packets reach only the container, so the container has to forward them with NAT. That takes `nftables`, which is in a second image built on the first.
 
 1. From the repository root, build both images:
 
@@ -19,7 +19,7 @@ The others open a network card and need Linux with DPDK, as the guide chapter Se
    make -C conduit docker-binance-image
    ```
 
-2. Open a shell in the second image, `switch-dpdk-test:binance`. Compared with the guide's container, `--sysctl net.ipv4.ip_forward=1` lets it forward packets:
+2. Open a shell in the second image, `switch-dpdk-test:binance`. Compared with the guide's container, `--sysctl net.ipv4.ip_forward=1` enables IP forwarding:
 
    ```sh
    docker run --rm -it --init --cpuset-cpus=0 --cap-add NET_ADMIN \
@@ -46,7 +46,7 @@ The others open a network card and need Linux with DPDK, as the guide chapter Se
    ip link set cdnic0 up
    ```
 
-5. Send the client's packets out under the container's own address:
+5. Masquerade the client's packets behind the container's own address:
 
    ```sh
    uplink=$(ip -4 route show default | awk '{ for (i=1; i<NF; i++) if ($i=="dev") { print $(i+1); exit } }')

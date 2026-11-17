@@ -15,7 +15,7 @@ rustls = { path = "<clone>/vendor/rustls" }
 
 ## The TLS client config
 
-A `wss://` connection needs a `rustls::ClientConfig` holding the certificate authorities to trust. Build it once in `main`, with the other blocking setup that comes before the card is opened:
+A `wss://` connection needs a `rustls::ClientConfig` holding the trust roots. Build it once in `main`, with the other blocking setup that comes before the card is opened:
 
 ```rust
 use std::sync::Arc;
@@ -35,7 +35,7 @@ fn tls_config(ca_file: &str) -> Result<Arc<ClientConfig>, Box<dyn std::error::Er
 }
 ```
 
-On Ubuntu the system's authorities are in `/etc/ssl/certs/ca-certificates.crt`.
+On Ubuntu the system's root certificates are in `/etc/ssl/certs/ca-certificates.crt`.
 
 ## Connecting
 
@@ -75,7 +75,7 @@ async fn open(
 }
 ```
 
-The host name is used for the certificate check and the `Host` header, and the path is the one in the URL. The TCP connect, the TLS handshake and the upgrade each wait on the server, so the whole block goes inside one [`within`](crate::guide::timeouts).
+The host name is used for SNI, certificate verification and the `Host` header, and the path is the one in the URL. The TCP connect, the TLS handshake and the upgrade each wait on the server, so the whole block goes inside one [`within`](crate::guide::timeouts).
 
 For a `ws://` server, [`connect_ws`](crate::ws::net::connect_ws) takes the same arguments without the config and returns a `Ws`.
 
@@ -99,11 +99,11 @@ async fn talk(ws: &mut Wss) -> Result<(), Error> {
 }
 ```
 
-`recv` resolves to the next whole message, however many WebSocket frames the peer split it into, or to `None` when the connection has been closed. A [`Message`](crate::ws::Message) borrows the connection, so it has to be released before the next call. `text()` is `Some` for a text message, already checked to be UTF-8, and `bytes()` is the payload of either kind.
+`recv` resolves to the next complete message, reassembled if the peer fragmented it, or to `None` when the connection has been closed. A [`Message`](crate::ws::Message) borrows the connection. `text()` is `Some` for a text message, already validated as UTF-8, and `bytes()` is the payload of either kind.
 
 `send` sends one message of the given [`Kind`](crate::ws::Kind) and returns when all of it has been handed to TCP.
 
-The connection does its work only inside these calls. A ping from the peer is answered during `recv`, so a task that mostly sends must still call `recv` regularly.
+The connection does its work only inside these calls. The pong for a peer's ping is queued only by `recv`, so a task that mostly sends must still call `recv` regularly.
 
 ## Closing
 
@@ -139,8 +139,8 @@ Every failure of an open connection arrives through `recv`, `send` or `close` as
 | `Failure` | What happened |
 |---|---|
 | `Protocol(_)` | The peer broke the WebSocket protocol, or sent a message over `max_message`. |
-| `PeerEof` | The peer ended the connection without a WebSocket close frame. |
-| `Tls(_)` | A TLS record from the peer was rejected, or the connection ended without the TLS close. |
+| `PeerEof` | The peer's `close_notify` (`wss://`) or FIN (`ws://`) arrived before its WebSocket close frame. |
+| `Tls(_)` | A TLS record from the peer was rejected, or TCP ended without `close_notify`. |
 | `Dead` | The TCP connection was reset or closed underneath. |
 
 After a failure, drop the connection. To end without resetting a peer that may still be sending, call [`linger`](crate::ws::net::Wss::linger) first, inside a `within`.

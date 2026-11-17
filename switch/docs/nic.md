@@ -4,7 +4,7 @@ A card is described by a JSON config file, loaded as a [`Config`]. [`open`] star
 
 - [`Config`]: the config file. [`Config::load`] reads and checks it.
 - [`Sizing`]: how many sockets and send frames the program needs.
-- [`open`]: opens the card. The calling thread must be allowed on exactly one CPU.
+- [`open`]: opens the card. The calling thread's affinity mask must contain exactly one CPU.
 - [`Opened`]: the value `open` returns, holding the stack, a report to print, and the DPDK handle to keep until the card is closed.
 - [`OpenError`]: why an open failed.
 

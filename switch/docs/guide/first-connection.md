@@ -2,7 +2,7 @@
 
 The first network program is a TCP client that connects to a server, sends one line, prints what the server sends back, and exits when the server closes the connection.
 
-It needs no spare network card, because it opens a tap device, a virtual card that also appears in Linux as an ordinary interface, here `cdnic0`. The program is on one side of it with the address 192.0.2.2, and the Linux kernel is on the other with 192.0.2.1, where a few lines of Python act as the server.
+It needs no spare network card, because it opens a tap device, `cdnic0`. The program has the address 192.0.2.2 on it and the Linux kernel has 192.0.2.1, where a few lines of Python act as the server.
 
 ```text
    your program (one CPU)                        Linux kernel
@@ -236,13 +236,13 @@ A real card is described by the same kind of file; `docs/operations/config.md` i
 
 ## Opening the card
 
-`main` resolves the server's address before it opens the card, because name lookup is a blocking call into the kernel and switch has none of its own. Any other blocking setup, such as reading files, also belongs before the loop starts.
+`main` resolves the server's name before it opens the card, because `to_socket_addrs` blocks and switch has no DNS resolver of its own. Any other blocking setup, such as reading files, also belongs before the loop starts.
 
-[`open`](crate::nic::open) starts DPDK, opens the card the config names, and returns the network stack running on it as `opened.stack`. It fails unless the calling thread is allowed on exactly one CPU. On a Linux machine `taskset -c 0` arranges that, and the one-CPU container already satisfies it. `open` is `unsafe` because DPDK and the card write to memory the compiler cannot check; the comment above the call states what the program promises, and the reference for `open` has the full list. The program keeps `opened.eal`, DPDK's own state, in `_eal` until the end.
+[`open`](crate::nic::open) starts DPDK, opens the card the config names, and returns the network stack running on it as `opened.stack`. It fails unless the calling thread's CPU affinity mask contains exactly one CPU. On a Linux machine `taskset -c 0` arranges that, and the one-CPU container already satisfies it. `open` is `unsafe` because DPDK and the card write to memory the compiler cannot check; the comment above the call states what the program promises, and the reference for `open` has the full list. The program keeps `opened.eal`, DPDK's own state, in `_eal` until the end.
 
 The third argument, `None`, leaves DPDK's helper threads where `open` puts them by default. The fourth is the clock `open` reads while it starts up, which must be the clock the loop will use. The network stack counts time in microseconds and the runtime in ticks, here nanoseconds, so `Clock` gives both from one reading; [The drive loop](crate::guide::drive_loop) says why.
 
-[`tcp::Config`](crate::net::tcp::Config) sizes one socket. `tx_capacity` is the number of bytes the socket holds that are queued or not yet acknowledged, and `rx_capacity` is the TCP receive window it advertises. The examples use 64 KiB for both. `mss_cap` limits the payload of one TCP packet, here to the largest packet the config allows towards the server less 40 bytes of IP and TCP headers.
+[`tcp::Config`](crate::net::tcp::Config) sizes one socket. `tx_capacity` is the number of bytes the socket holds that are queued or not yet acknowledged, and `rx_capacity` is the TCP receive window it advertises. The examples use 64 KiB for both. `mss_cap` caps the MSS, here at the config's MTU towards the server less 40 bytes of IP and TCP headers.
 
 [`Sizing`](crate::nic::Sizing) sizes the whole program. `max_sockets` and `max_udp_sockets` are the numbers of TCP and UDP sockets open at once, and `frame_share` is the number of buffers for data being sent, for which `tcp::tx_mbuf_budget` gives what one TCP socket needs. The other three values can stay as they are here. The reference for `Sizing` says how to choose each one and what happens when it is too small.
 
@@ -256,7 +256,7 @@ The third argument, `None`, leaves DPDK's helper threads where `open` puts them 
 
 Data is sent and received in frames, which are packet buffers. The task takes an empty frame from the handle, copies its line in, truncates the frame to that length and freezes it. `room` then waits until the connection can take that many bytes, and `try_send` queues the frame. [Frames](crate::guide::frames) and [TCP streams](crate::guide::tcp) cover each call.
 
-`recv` returns the next data from the server, in order, and `Err(Error::Finished)` once the server has closed its side. The task then closes its own side with `shutdown` and waits in `delivered` until the server has acknowledged everything.
+`recv` returns the next data from the server, in order, and `Err(Error::Finished)` once the server's FIN has arrived. The task then sends its own FIN with `shutdown` and waits in `delivered` until the server has acknowledged everything.
 
 A task cannot return a value to `main` directly, so `hello` leaves the result in a shared cell.
 

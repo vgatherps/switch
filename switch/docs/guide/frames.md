@@ -1,8 +1,8 @@
 # Frames
 
-Sockets send and receive frames, which are handles to the packet buffers the network card itself uses. Received data reaches a task in the buffer the card wrote it into, and a task writes what it sends into a buffer the card can transmit.
+Sockets send and receive frames, which are handles to the packet buffers the network card itself uses. A program that owns its card receives zero-copy, and sends zero-copy under the conditions below.
 
-An [`OwnedFrame`](crate::net::OwnedFrame) has one holder and can be written; it dereferences to `&mut [u8]`. An [`ImmutableFrame`](crate::net::ImmutableFrame) is read-only and can be cloned without copying bytes. The buffer goes back to its pool when the last handle to it is dropped.
+An [`OwnedFrame`](crate::net::OwnedFrame) has one holder and can be written; it dereferences to `&mut [u8]`. An [`ImmutableFrame`](crate::net::ImmutableFrame) is read-only and reference-counted, so cloning it copies no bytes. The buffer goes back to its pool when the last handle to it is dropped.
 
 ## Sending
 
@@ -24,7 +24,7 @@ The frames come from a pool of fixed size that all sockets share, sized by `fram
 
 The sending calls, `try_send` on TCP and `send` on UDP, take the `ImmutableFrame` and return at once. A call that fails returns the same frame with the error, so the frame can be sent again.
 
-A frame that you alone hold, that still starts where `tx_frame` gave it, and that fits in one packet can go to the card without being copied. Other frames are copied on the way out.
+A frame with no other handle that still starts where `tx_frame` gave it is sent in place, provided it goes out as one packet of its own. A shared or sliced frame is copied, TCP copies a frame it has to split or merge with the one before it, and a retransmission can copy again. The references for [`TcpTx::try_send`](crate::net::TcpTx::try_send) and [`UdpTx::send`](crate::net::UdpTx::send) give the exact rules.
 
 ## Receiving
 

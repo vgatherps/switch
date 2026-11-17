@@ -96,14 +96,14 @@ tick
 session finished
 ```
 
-The `EAL:` lines are the daemon's. Start the client under `taskset` as shown, because the session starts a helper thread that stays on the CPUs the program was allowed when it connected. Running the daemon on a real card, and its flags, are in `docs/operations/junctiond.md` in the repository.
+The `EAL:` lines are the daemon's. Start the client under `taskset` as shown, because the session starts a helper thread that inherits the CPU affinity the program had when it connected. Running the daemon on a real card, and its flags, are in `docs/operations/junctiond.md` in the repository.
 
 ## What behaves differently
 
 | | Owning the card | Sharing a card |
 |---|---|---|
 | After `room(len)` resolves | `try_send` of that length does not return `Full` | `try_send` can still return `Full`; keep the frame and await `room` again |
-| A peer that reads slowly | `room` waits while `tx_capacity` bytes are queued or unacknowledged | The daemon holds the bytes, without a limit; `room` does not wait for the peer |
+| Backpressure from a slow peer | `room` waits while `tx_capacity` bytes are queued or unacknowledged | The daemon holds the bytes, without a limit; `room` does not wait for the peer |
 | UDP `send` to an address that cannot be reached yet | Returns `NoRoute`, `NeighborPending` or `Unaddressable` | Returns `Ok`; the daemon drops the datagram |
 | Size of a frame from `tx_frame` | The config's `mtu` less 28 | `session.frame_capacity()` |
 | Received frames you hold | Keep the card's buffers | Keep space in the session's receive area, which all the program's sockets share |
@@ -125,7 +125,7 @@ async fn send(tx: &mut TcpTx, mut frame: ImmutableFrame) -> Result<(), Error> {
 }
 ```
 
-Because the daemon accepts bytes faster than a slow peer reads them, a program that streams without end to such a peer should pace itself by its own protocol's acknowledgements.
+Because a slow peer exerts no backpressure through the daemon, a program that streams without end to such a peer should pace itself by its own protocol's acknowledgements.
 
 ## When the daemon goes away
 

@@ -49,7 +49,7 @@ The socket holds up to `rx_queue` datagrams and drops one that arrives when the 
 
 `send(Some(to), frame)` sends one [frame](crate::guide::frames) as one datagram without waiting. Either the datagram is queued for the round's send step, or `send` returns the frame with an error. These sockets have no default destination, so always pass `Some`; `None` returns `NoDestination`.
 
-`Full` and `NeighborPending` are worth retrying, and the echo does so after a [`yield_now`](crate::guide::tasks), which lets the loop go round once. `Full` means the datagram cannot be queued now, usually because the card has not yet taken the packets queued before it. `NeighborPending` means the hardware address of the destination is not known yet. switch has asked for it and the send succeeds once the answer has arrived, which is normal for the first datagram to a new address. A destination that never answers stays `NeighborPending`, so a program that must not wait forever bounds its retries.
+`Full` and `NeighborPending` are worth retrying, and the echo does so after a [`yield_now`](crate::guide::tasks), which lets the loop go round once. `Full` means the datagram cannot be queued now, usually because the card has not yet taken the packets queued before it. `NeighborPending` means ARP resolution of the next hop is still in progress, and a retry succeeds once the reply has arrived. This is normal for the first datagram through a new next hop. A next hop that never answers stays `NeighborPending`, so a program that must not wait forever bounds its retries.
 
 The other errors do not clear by waiting. They are `NoRoute` and `Unaddressable` for a destination the program cannot send to, and `TooLarge`.
 

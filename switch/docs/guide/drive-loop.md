@@ -1,6 +1,6 @@
 # The drive loop
 
-Packets are received and sent, and tasks run, only when the loop in `main` goes round. That loop is called the drive loop, and one trip through it is a round.
+The drive loop is the loop in `main` that receives and sends packets and runs tasks, none of which happens outside it. A round is one iteration of that loop.
 
 ## A round
 
@@ -49,7 +49,7 @@ fn drive(
 
 Because tasks run between the receive and send steps, a task woken by a packet can run in the same round, and what it sends in answer can leave at the end of that round.
 
-`try_send` on a socket queues data and returns; the data leaves in a send step. A task waiting in `recv` runs again only after a receive step has found data, or the end of the connection, for it.
+`try_send` on a socket queues data and returns; the data leaves in a send step. A task waiting in `recv` runs again only after a receive step has found data, a FIN or an RST for it.
 
 `round` is three calls, [`Net::receive`](crate::net::Net::receive), [`Runtime::poll`](crate::Runtime::poll) and [`Net::send`](crate::net::Net::send), which a loop with work of its own to do between them can make itself.
 
@@ -59,11 +59,11 @@ Because tasks run between the receive and send steps, a task woken by a packet c
 
 Read the clock once per round and derive both from that reading, so tasks and the network agree on the time. Count ticks in nanoseconds, because the [timeout helpers](crate::guide::timeouts) convert a `Duration` to ticks on that assumption. The `Clock` in [Your first network program](crate::guide::first_connection) does both in its `sample`.
 
-Neither unit may go backwards, which `std::time::Instant` guarantees. Pass the same clock to `open`, and start the runtime at a tick no later than the first reading. `Runtime::new(0)` will do when ticks count from the program's start.
+Both times must be monotonic, which `std::time::Instant` guarantees. Pass the same clock to `open`, and start the runtime at a tick no later than the first reading. `Runtime::new(0)` will do when ticks count from the program's start.
 
 ## Going round without pause, or sleeping
 
-The loop above busy-polls, calling `round` again at once whether or not anything happened. A latency-sensitive program runs this way on a CPU it has to itself, which it keeps at 100% so that it sees a packet as soon as the card has it. `docs/operations/cpus.md` in the repository explains how to keep other work off that CPU.
+The loop above busy-polls, which is how a latency-sensitive program runs on an isolated CPU. `docs/operations/cpus.md` in the repository explains how to isolate one.
 
 A program that shares its CPU can sleep when a round did nothing. `round` returns `false` when no packet was received or sent, none is waiting, and no task ran:
 

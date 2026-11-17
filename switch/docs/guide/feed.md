@@ -406,8 +406,6 @@ The message loop limits every `recv`, so the program gives up when no complete m
 
 Closing is as in [WebSocket](crate::guide::websocket). The feed keeps sending updates until it has seen the close, and the loop reads past them.
 
-The task's errors are turned into strings so that the three kinds, from TCP, from WebSocket and from the limits, fit one `Result`. The whole body is an inner `async` block so that `?` can be used and the outcome still lands in `done`, where `main` finds it.
-
 ## Before the card is opened
 
 ```rust,no_run
@@ -599,7 +597,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 # }
 ```
 
-The blocking setup, here the name lookup and the certificate file, comes before the card is opened, as in [Your first network program](crate::guide::first_connection).
+The blocking setup, here DNS resolution and reading the certificate file, comes before the card is opened, as in [Your first network program](crate::guide::first_connection).
 
 ## Opening the card
 
@@ -792,7 +790,7 @@ The blocking setup, here the name lookup and the certificate file, comes before 
 # }
 ```
 
-This is the setup of [the first network program](crate::guide::first_connection), with one TCP socket sized for one connection. The server is on the internet, so the config file must name a `gateway`, and `open` fails if the gateway does not answer within three seconds.
+This is the setup of [the first network program](crate::guide::first_connection), with one TCP socket sized for one connection. The server is on the internet, so the config file must name a `gateway`, and `open` fails if the gateway does not answer ARP within three seconds.
 
 ## The loop and the end
 
@@ -985,7 +983,7 @@ This is the setup of [the first network program](crate::guide::first_connection)
 }
 ```
 
-The [loop](crate::guide::drive_loop) sleeps a millisecond after an idle round, which suits a program that prints to a terminal. A feed handler that cares about every microsecond removes the sleep and gives the loop a CPU of its own.
+The [loop](crate::guide::drive_loop) sleeps a millisecond after an idle round, which suits a program that prints to a terminal. A latency-sensitive feed handler busy-polls on an isolated CPU instead.
 
 The loop needs no time limit, because every wait in the task has one and the task always ends. When it has, the program [shuts down](crate::guide::shutdown) in order.
 
