@@ -1090,14 +1090,15 @@ impl Future for Accepting {
 /// `accept`, those still in the handshake included. A connection completes the handshake and
 /// receives data while it waits, with no task in `accept`. A reset during the handshake
 /// returns the socket to listening. A handshake the peer does not complete is given up after
-/// five SYN-ACK retransmissions, about 19 s, and the socket listens again. A SYN that finds no
-/// socket listening on the endpoint is dropped, and the client retransmits it; when sharing a
-/// card it is reset. The listener takes `backlog` slots of the Net's socket table, and each
-/// accepted stream keeps the slot of its socket.
+/// five SYN-ACK retransmissions, about 19 s, and the socket listens again. A SYN that no socket
+/// takes is dropped, and the client retransmits it; when sharing a card it is reset. The
+/// listener takes `backlog` slots of the Net's socket table, and each accepted stream keeps the
+/// slot of its socket.
 ///
 /// Dropping the listener resets the connections not yet accepted and closes its listening
-/// sockets. A SYN to the port is then refused, unless another listener or socket listens on
-/// it. When sharing a card, the slots of these sockets are free once the daemon confirms.
+/// sockets. A new connection to the port is then refused, unless another listener or socket
+/// listens on it. When sharing a card, the slots of these sockets are free once the daemon
+/// confirms.
 pub struct TcpListener {
     handle: NetHandle,
     config: tcp::Config,

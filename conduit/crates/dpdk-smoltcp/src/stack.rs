@@ -882,9 +882,10 @@ impl Stack {
         self.sockets.listen(raw, local)
     }
 
-    /// Register `local` as a listener's endpoint: a SYN to it that no socket takes, for example
-    /// while none listens, is dropped instead of reset, and the client retransmits it. Each call
-    /// adds one registration; [`remove_listener_port`](Self::remove_listener_port) removes one.
+    /// Register `local` as a listener's endpoint: a SYN without ACK to it that no socket takes,
+    /// for example while none listens, is dropped instead of reset, and the client retransmits
+    /// it. Each call adds one registration;
+    /// [`remove_listener_port`](Self::remove_listener_port) removes one.
     pub fn add_listener_port(&mut self, local: IpListenEndpoint) {
         self.sockets.add_listener_port(local);
     }

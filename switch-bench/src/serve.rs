@@ -474,8 +474,8 @@ mod tests {
             let mut b = std::net::TcpStream::connect(("10.79.0.2", PORT)).unwrap();
             echo(&mut b);
             drop((a, b));
-            // the slots free once the closes complete; until the listener opens a socket again a
-            // connect is refused
+            // the slots free once the closes complete; until the listener opens a socket again
+            // the SYN is dropped and the kernel retransmits it
             let deadline = Instant::now() + Duration::from_secs(10);
             let mut c = loop {
                 match std::net::TcpStream::connect(("10.79.0.2", PORT)) {
