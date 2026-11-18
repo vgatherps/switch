@@ -49,7 +49,7 @@ These sit under `switch-net` and `switch-junctiond`.
 |---|---|---|---|
 | `switch-frame` | `switch-frame/` | no | Packet frames, the buffers every layer hands to application code |
 | `shared-memory` | `shared-memory/` | no | Shared-memory backings and single or mirrored mappings |
-| `slice_ringbuffer` | `vendor/slice_ringbuffer/` | no | A one-writer, one-reader shared-memory record ring: how received packets reach an application that shares a card through the daemon |
+| `slice_ringbuffer` | `slice_ringbuffer/` | no | A one-writer, one-reader shared-memory record ring: how received packets reach an application that shares a card through the daemon |
 | `ceph-ring` | `cephalopod/crates/ring/` | no | Per-CPU shared-memory rings with many writers and one reader: how such applications send to the daemon |
 | `ceph-rseq` | `cephalopod/crates/rseq/` | no | The record layout and the write into a per-CPU ring that `ceph-ring` uses |
 | `ceph-fifo` | `cephalopod/crates/fifo/` | no | Ordered delivery per stream over `ceph-ring` |
