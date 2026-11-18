@@ -13,11 +13,36 @@ A card opened with [`open`](crate::nic::open) belongs to that one process. For s
                network card
 ```
 
-Only `main` changes, in how it gets its [`Net`](crate::net::Net) and gives it back.
+The example `tcp_client_junction`, which is the client from [Your first network program](crate::guide::first_connection), keeps its task and drive loop. `main` opens and closes a daemon session.
+
+## What behaves differently
+
+| | Owning the card | Sharing a card |
+|---|---|---|
+| After `room(len)` resolves | `try_send` of that length does not return `Full` | `try_send` can still return `Full`; keep the frame and await `room` again |
+| Backpressure from a slow peer | `room` waits while `tx_capacity` bytes are queued or unacknowledged | The daemon holds the bytes, without a limit; `room` does not wait for the peer |
+| UDP `send` to an address that cannot be reached yet | Returns `NoRoute`, `NeighborPending` or `Unaddressable` | Returns `Ok`; the daemon drops the datagram |
+
+The reference for [`Net`](crate::net::Net) lists every difference. Code that should run both ways sends like this:
+
+```rust
+use switch::net::{Error, ImmutableFrame, TcpTx};
+
+async fn send(tx: &mut TcpTx, mut frame: ImmutableFrame) -> Result<(), Error> {
+    loop {
+        tx.room(frame.len()).await?;
+        match tx.try_send(frame) {
+            Ok(()) => return Ok(()),
+            Err((back, Error::Full)) => frame = back,
+            Err((_frame, error)) => return Err(error),
+        }
+    }
+}
+```
 
 ## What changes in the code
 
-The example `tcp_client_junction` is the client from [Your first network program](crate::guide::first_connection) with the config file, `Sizing` and `open` replaced by a connection to the daemon. Written as a function, that part is:
+The config file, `Sizing` and `open` are replaced by a connection to the daemon:
 
 ```rust
 use std::path::Path;
@@ -45,7 +70,7 @@ fn connect(control: &str) -> Result<(Net, tcp::Config), Box<dyn std::error::Erro
 
 From there the program is the same: `net.handle()`, the task, and the loop calling [`round`](crate::net::round).
 
-At the end, the program takes the session back and finishes it, so the daemon knows it left on purpose. As a function:
+At the end, the program takes the session back and finishes it, so the daemon knows it left on purpose:
 
 ```rust
 use std::time::{Duration, Instant};
@@ -97,31 +122,6 @@ session finished
 ```
 
 The `EAL:` lines are the daemon's. Start the client under `taskset` as shown, because the session starts a helper thread that inherits the CPU affinity the program had when it connected. Running the daemon on a real card, and its flags, are in `docs/operations/junctiond.md` in the repository.
-
-## What behaves differently
-
-| | Owning the card | Sharing a card |
-|---|---|---|
-| After `room(len)` resolves | `try_send` of that length does not return `Full` | `try_send` can still return `Full`; keep the frame and await `room` again |
-| Backpressure from a slow peer | `room` waits while `tx_capacity` bytes are queued or unacknowledged | The daemon holds the bytes, without a limit; `room` does not wait for the peer |
-| UDP `send` to an address that cannot be reached yet | Returns `NoRoute`, `NeighborPending` or `Unaddressable` | Returns `Ok`; the daemon drops the datagram |
-
-The reference for [`Net`](crate::net::Net) lists every difference. Code that should run both ways sends like this:
-
-```rust
-use switch::net::{Error, ImmutableFrame, TcpTx};
-
-async fn send(tx: &mut TcpTx, mut frame: ImmutableFrame) -> Result<(), Error> {
-    loop {
-        tx.room(frame.len()).await?;
-        match tx.try_send(frame) {
-            Ok(()) => return Ok(()),
-            Err((back, Error::Full)) => frame = back,
-            Err((_frame, error)) => return Err(error),
-        }
-    }
-}
-```
 
 ## When the daemon goes away
 

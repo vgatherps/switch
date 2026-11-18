@@ -1,6 +1,6 @@
 # Frames
 
-Sockets send and receive frames, which are handles to the packet buffers the network card itself uses. A program that owns its card receives zero-copy, and sends zero-copy under the conditions below.
+Sockets send and receive frames, which are handles to the packet buffers the network card itself uses. A program that owns its card receives zero-copy and can send zero-copy.
 
 An [`OwnedFrame`](crate::net::OwnedFrame) has one holder and can be written. An [`ImmutableFrame`](crate::net::ImmutableFrame) is read-only and reference-counted. The buffer goes back to its pool when the last handle to it is dropped.
 
@@ -18,7 +18,7 @@ async fn filled(handle: &NetHandle, bytes: &[u8]) -> ImmutableFrame {
 }
 ```
 
-[`tx_frame`](crate::net::NetHandle::tx_frame) gives a blank frame of the largest size, which is the config file's `mtu` less 28 bytes. The `bytes` here must fit in one frame; longer data goes out as several.
+[`tx_frame`](crate::net::NetHandle::tx_frame) gives a blank frame of the largest size, which is the config file's `mtu` less 28 bytes. The `bytes` here must fit in one frame. The caller splits longer TCP data across frames ([TCP streams](crate::guide::tcp)), and one UDP `send` is one frame and one datagram.
 
 The frames come from a pool of fixed size that all sockets share, sized by `frame_share` in [`Sizing`](crate::nic::Sizing). When the pool is empty, `tx_frame().await` waits until a frame comes back.
 

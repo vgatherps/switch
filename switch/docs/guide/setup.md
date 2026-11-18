@@ -33,6 +33,8 @@ The clone is mounted at `/work`, and the two named volumes keep cargo's download
 
 `--cpuset-cpus=0` gives the container one CPU, because opening a network card requires a CPU affinity mask of exactly one CPU. Any CPU the Docker host has will do.
 
+In the container, continue at the section Check the setup.
+
 ## On a Linux machine
 
 The image is Ubuntu 24.04, and its recipe, `conduit/docker/Dockerfile`, is the reference for a native setup. Install the same packages:

@@ -5,12 +5,34 @@ The first network program is a TCP client that connects to a server, sends one l
 It needs no spare network card, because it opens a tap device, `cdnic0`. The program has the address 192.0.2.2 on it and the Linux kernel has 192.0.2.1, where a few lines of Python act as the server.
 
 ```text
-   your program (one CPU)                        Linux kernel
+   your program (one CPU)                         Linux side
  +-----------------------------+           +----------------------+
  |  task: connect, send, print |           |  python3 server      |
  |  switch: TCP/IP             |           |  192.0.2.1:7000      |
  |  tap device, 192.0.2.2      | <-------> |  interface cdnic0    |
  +-----------------------------+           +----------------------+
+```
+
+## Running it
+
+With the example [built](crate::guide::setup), start the server, start the client, and give the Linux side of the tap device its address once the client has created it:
+
+```sh
+python3 -c 'import socket; s = socket.create_server(("0.0.0.0", 7000)); c, _ = s.accept(); c.recv(100); c.sendall(b"tick\n"); c.close()' &
+taskset -c 0 target/debug/examples/tcp_client_local examples/tap.json 192.0.2.1:7000 &
+until ip link show cdnic0 >/dev/null 2>&1; do sleep 0.1; done
+ip addr add 192.0.2.1/24 dev cdnic0 && ip link set cdnic0 up
+wait
+```
+
+After the card report, the client prints `tick` and `port closed`. `docs/operations/switch-nic.md` in the repository says what each line of the report means.
+
+```text
+...
+link_status: up
+gateway: none
+tick
+port closed
 ```
 
 ## The program
@@ -170,48 +192,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-## Running it
-
-With the example [built](crate::guide::setup), start the server, start the client, and give the Linux side of the tap device its address once the client has created it:
-
-```sh
-python3 -c 'import socket; s = socket.create_server(("0.0.0.0", 7000)); c, _ = s.accept(); c.recv(100); c.sendall(b"tick\n"); c.close()' &
-taskset -c 0 target/debug/examples/tcp_client_local examples/tap.json 192.0.2.1:7000 &
-until ip link show cdnic0 >/dev/null 2>&1; do sleep 0.1; done
-ip addr add 192.0.2.1/24 dev cdnic0 && ip link set cdnic0 up
-wait
-```
-
-The client prints DPDK's startup lines, a report on the card it opened, the server's reply, and a last line once the card is closed. `docs/operations/switch-nic.md` in the repository says what each line of the report means.
-
-```text
-EAL: Detected CPU lcores: 14
-EAL: Detected NUMA nodes: 1
-EAL: Detected shared linkage of DPDK
-EAL: Selected IOVA mode 'VA'
-driver: net_tap
-mac: be:07:75:ea:11:c1
-cpu: 0
-port_id: 0
-rx_offload_capa: 0x000000000000200e
-tx_offload_capa: 0x000000000000802e
-max_rx_pktlen: 16128
-min_mtu: 46
-max_mtu: 65535
-descriptors: rx=1024 tx=1024
-rx_pool_count: 32767
-tx_pool_count: 1056
-rx_checksum: not requested (explicit)
-tx_tcp_checksum: not requested (explicit)
-tx_udp_checksum: not requested (explicit)
-link_speed_mbps: 10000
-link_duplex: full
-link_status: up
-gateway: none
-tick
-port closed
-```
-
 ## The config file
 
 The first argument is a network config file, which describes the card and the program's address on it. `examples/tap.json` creates the tap device `cdnic0` and gives the program 192.0.2.2/24:
@@ -240,6 +220,8 @@ A real card is described by the same kind of file; `docs/operations/config.md` i
 
 [`open`](crate::nic::open) starts DPDK, opens the card the config names, and returns the network stack running on it as `opened.stack`. It fails unless the calling thread's CPU affinity mask contains exactly one CPU, which `taskset -c 0` or the one-CPU container provides. It is `unsafe`, and its reference lists what the caller promises. Its last argument is the clock, which must be the one the loop uses; [The drive loop](crate::guide::drive_loop) covers the two time units that `Clock` produces.
 
+This program owns the card. To share a card through the daemon, see [Sharing a network card](crate::guide::sharing).
+
 [`tcp::Config`](crate::net::tcp::Config) sizes one socket and [`Sizing`](crate::nic::Sizing) the whole program. The reference for each says how to choose its values.
 
 ## The Net and its handle
@@ -248,12 +230,12 @@ A real card is described by the same kind of file; `docs/operations/config.md` i
 
 ## The task
 
-Data is sent and received in [frames](crate::guide::frames), which are packet buffers. `room` waits until the connection can take the bytes, and `try_send` queues the frame without waiting ([TCP streams](crate::guide::tcp)). `recv` returns `Err(Error::Finished)` once the server's FIN has arrived, and `delivered` waits until the server has acknowledged everything.
+Data is sent and received in [frames](crate::guide::frames), which are packet buffers. `room` waits until the connection can take the bytes, and `try_send` queues the frame without waiting ([TCP streams](crate::guide::tcp)). `recv` returns `Err(Error::Finished)` once the server's FIN has arrived, and `delivered` returns once the server has acknowledged the data and the FIN, or the connection has ended.
 
 A task cannot return a value to `main` directly, so `hello` leaves the result in a shared cell.
 
 ## The loop
 
-Each call to [`round`](crate::net::round) receives packets, runs the tasks and sends what they queued. This loop sleeps a millisecond after a round that did nothing, because the Python server needs the same CPU. [The drive loop](crate::guide::drive_loop) covers both, and [Shutting down](crate::guide::shutdown) the order in which the program ends.
+This loop calls [`round`](crate::net::round) and sleeps a millisecond after a round that did nothing, because the Python server needs the same CPU. [The drive loop](crate::guide::drive_loop) covers both, and [Shutting down](crate::guide::shutdown) the order in which the program ends.
 
 Next: [Tasks](crate::guide::tasks).

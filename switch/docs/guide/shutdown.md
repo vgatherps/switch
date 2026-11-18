@@ -2,6 +2,8 @@
 
 A program ends in the reverse of the order it started: the tasks go first, then the [`Net`](crate::net::Net), then the card.
 
+If tasks still have TCP data to send, keep calling `round` while they finish ([TCP streams](crate::guide::tcp)). Then call `rt.shutdown()` to drop any remaining tasks.
+
 ```text
  1. rt.shutdown()                    drops every task, and with each task the
                                      sockets, handles and frames it holds
@@ -23,10 +25,6 @@ fn close(mut rt: Runtime, net: Net) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
-
-## Let the tasks finish first
-
-Shutting the runtime down drops tasks where they stand, and data still queued when the loop stops is never sent ([TCP streams](crate::guide::tcp)). If data must reach the peer, have each task call `shutdown` and await `delivered` on its connections, and keep the loop going round until the tasks are done.
 
 ## The steps
 

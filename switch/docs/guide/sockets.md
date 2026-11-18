@@ -1,6 +1,6 @@
 # Opening sockets
 
-A task opens sockets through its [`NetHandle`](crate::net::NetHandle). Addresses are IPv4.
+A task opens sockets through its [`NetHandle`](crate::net::NetHandle). Addresses are IPv4. Socket futures, here and in the following chapters, must be awaited in switch tasks. On another executor, a socket future that has to wait panics.
 
 Every open socket takes one of the places reserved with `max_sockets` (TCP) or `max_udp_sockets` (UDP) in [`Sizing`](crate::nic::Sizing), and an open fails with `SocketsFull` when none is free.
 
@@ -64,7 +64,7 @@ async fn serve(mut stream: TcpStream) {
 }
 ```
 
-The last argument of `tcp_listen` is the backlog, the number of connections that can wait for `accept`. A waiting connection completes the handshake and receives data. The listener takes that many sockets of `max_sockets`. A SYN that arrives when all of them hold a connection is dropped, and the client retransmits it. When sharing a card it is answered with an RST instead. Dropping the listener resets the connections that were not accepted.
+The last argument of `tcp_listen` is the backlog. A backlog of 4 reserves four of the `max_sockets` TCP sockets for connections waiting for `accept`, which complete the handshake and receive data while they wait. Dropping the listener resets the connections that were not accepted. [`TcpListener`](crate::net::TcpListener) says what a full backlog does.
 
 ## Binding UDP
 
@@ -88,7 +88,5 @@ async fn bind(handle: &NetHandle) -> Result<UdpSocket, Error> {
 ## Errors
 
 The reference for each call on [`NetHandle`](crate::net::NetHandle) lists what it can return, and [`Error`](crate::net::Error) describes every variant.
-
-Socket futures, here and in the following chapters, must be awaited in switch tasks. On another executor, a socket future that has to wait panics.
 
 Next: [Frames](crate::guide::frames).

@@ -4,7 +4,7 @@ The drive loop is the loop in `main` that receives and sends packets and runs ta
 
 ## A round
 
-One call to [`round`](crate::net::round) is one round:
+The loop calls [`round`](crate::net::round):
 
 ```rust
 use switch::Runtime;
@@ -47,7 +47,7 @@ fn drive(
         back to the top
 ```
 
-`round` is three calls, [`Net::receive`](crate::net::Net::receive), [`Runtime::poll`](crate::Runtime::poll) and [`Net::send`](crate::net::Net::send), which a loop with work of its own to do between them can make itself.
+If your loop needs to do work between steps, call [`net.receive(now)`](crate::net::Net::receive), [`rt.poll(tick)`](crate::Runtime::poll) and [`net.send()`](crate::net::Net::send) in that order instead of `round`.
 
 ## The clock
 
@@ -88,6 +88,6 @@ While the loop sleeps, nothing is received and no timer fires, so everything can
 
 ## When a round fails
 
-`round` returns a [`RoundError`](crate::net::RoundError) that names the step that failed, for example `Turn(TurnError::Stack(_))` when the network stack or the card reported a failure and `Runtime(RuntimeError::Panicked)` after a task panicked. The programs in this guide treat any of them as fatal, leave the loop and [shut down](crate::guide::shutdown). `RoundError` implements only `Debug`, so print it with `{:?}`.
+`round` returns a [`RoundError`](crate::net::RoundError), which is `Turn` for a receive or send error and `Runtime` for a poll error. The guide's examples return it from `main`, and `tcp_echo_server` [shuts down](crate::guide::shutdown) first. `RoundError` implements only `Debug`, so print it with `{:?}`.
 
 Next: [Opening sockets](crate::guide::sockets).

@@ -10,8 +10,8 @@ A [`TcpStream`](crate::net::TcpStream) is an open connection. `split` divides it
       |                         |
       | data frames, in order   | tx.shutdown()        your side is finished
       |                         v
-      | Err(Finished)         tx.delivered().await    the peer has all of it
-      v  the peer is finished
+      | Err(Finished)         tx.delivered().await    data and FIN acknowledged,
+      v  the peer is finished                         or the connection has ended
   drop both halves: the connection is closed
 ```
 
@@ -59,11 +59,11 @@ async fn send_all(handle: &NetHandle, tx: &mut TcpTx, mut rest: &[u8]) -> Result
 
 `max_segment_payload` is the connection's effective MSS, and a frame no longer than that can go out as one segment.
 
-`room` fails with `InvalidState` once the connection can no longer send, and with `TooLarge` if `len` is more than the socket's `tx_capacity`. `try_send` fails with `Full` if the caller did not wait for room, and returns the frame with the error.
+`room` fails with `InvalidState` once the connection can no longer send, and with `TooLarge` if `len` is more than the socket's `tx_capacity`. `try_send` fails with `Full` if the caller did not wait for room, and returns the frame with the error. When [sharing a card](crate::guide::sharing), it can return `Full` after `room` as well.
 
 ## When the peer is slow
 
-The socket holds at most `tx_capacity` bytes that are queued or unacknowledged, and `room` waits while it is full, so backpressure from a slow peer reaches the task as a wait in `room`.
+The socket holds at most `tx_capacity` bytes that are queued or unacknowledged, and `room` waits while it is full, so backpressure from a slow peer reaches the task as a wait in `room`. When [sharing a card](crate::guide::sharing), `room` does not wait for the peer.
 
 ## Finishing
 

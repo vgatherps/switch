@@ -128,11 +128,9 @@ When the peer closes first, `recv` answers its close and returns `None` in the s
 
 ## Failures
 
-Every failure of an open connection arrives through `recv`, `send` or `close` as `Error::Failed` with a [`Failure`](crate::ws::net::Failure) inside, for example `Protocol(_)` when the peer broke the WebSocket protocol or sent a message over `max_message`, and `Dead` when the TCP connection was reset or closed underneath.
+`Error::Failed` reports a connection failure, described by the [`Failure`](crate::ws::net::Failure) inside. After a failure, drop the connection. To end without resetting a peer that may still be sending, call [`linger`](crate::ws::net::Wss::linger) first, inside a `within`.
 
-After a failure, drop the connection. To end without resetting a peer that may still be sending, call [`linger`](crate::ws::net::Wss::linger) first, inside a `within`.
-
-`connect` fails with other variants of the same [`Error`](crate::ws::net::Error), for example `Upgrade(UpgradeError::Status(Some(404)))` for a wrong path.
+An oversized outgoing message returns `Error::TooBig` and leaves the connection usable. [`Error`](crate::ws::net::Error) lists the other variants.
 
 ## Serving ws://
 

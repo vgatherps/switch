@@ -79,6 +79,6 @@ When the limit passes or `b` wins, the other future is dropped. The effect depen
 | `accept` | Nothing is lost. Waiting connections stay in the listener. |
 | `recv` on TCP or UDP | Nothing is lost. Data stays queued for the next `recv`. |
 | `room`, `delivered`, `tx_frame` | Nothing is lost. Call it again. |
-| An `async` block of yours | Its sockets close as in [Dropping a stream](crate::guide::tcp) and its frames return to the pool. |
+| An `async` block of yours | Cancellation drops values the block owns. Borrowed sockets stay with the caller. Operations that already took effect stay in effect. |
 
 Next: [Shutting down](crate::guide::shutdown).

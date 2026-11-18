@@ -2,7 +2,7 @@
 
 For a protocol of your own over TLS 1.3, [`tls_connect`](crate::tls::net::tls_connect) turns a connected [`TcpStream`](crate::net::TcpStream) into an encrypted stream of bytes. The client config is built as for [WebSocket](crate::guide::websocket), and the feature is `tls` in place of `ws`.
 
-The example `tls_client` sends one line and prints the reply. Here is that exchange as a function:
+The example `tls_client` sends one line and prints the reply:
 
 ```rust
 use std::sync::Arc;

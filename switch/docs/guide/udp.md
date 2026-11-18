@@ -43,7 +43,7 @@ async fn echo(handle: NetHandle, port: u16) {
 
 `recv` resolves to the next [`Datagram`](crate::net::Datagram) and has no error. Besides its `payload()`, a datagram carries the sender, `src()`, and the address it was sent to, `dst_addr()`.
 
-The socket holds up to `rx_queue` datagrams, counting those the task still holds, and drops one that arrives when the queue is full. `tx.stats().rx_dropped_full` counts those drops.
+The socket holds up to `rx_queue` datagrams, counting those the task still holds, and drops one that arrives when the queue is full. `tx.stats().rx_dropped_full` counts those drops, and stays zero when [sharing a card](crate::guide::sharing).
 
 ## Sending
 

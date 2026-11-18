@@ -1,6 +1,6 @@
 # A complete program
 
-The example `wss_client` connects to Binance's public book-ticker feed over `wss://`, prints a few updates, closes the connection and exits.
+The example `wss_client` connects to Binance's public book-ticker feed over `wss://`, prints a few updates, closes the connection and exits. To run it in a container on the tap device, the container has to forward the program's packets to the internet; `examples/README.md` in the repository has the steps.
 
 ```toml
 [package]
@@ -396,7 +396,7 @@ async fn read_feed(
 # }
 ```
 
-Each phase of the task is under [`within`](crate::guide::timeouts). The limit on each `recv` is needed because [TCP has no keep-alive](crate::guide::tcp), so a feed that had gone quiet would otherwise keep the task waiting.
+Each phase of the task is under [`within`](crate::guide::timeouts), and the client waits up to ten seconds for each update.
 
 Closing is as in [WebSocket](crate::guide::websocket). The feed keeps sending updates until it has seen the close, and the loop reads past them.
 
@@ -990,7 +990,7 @@ cargo build -p switch-examples --features ws --example wss_client
 taskset -c 0 target/debug/examples/wss_client /etc/switch/dut.json
 ```
 
-The other arguments default to the Binance feed, three messages and the system's certificate file. To run it in a container on the tap device, the container has to forward the program's packets to the internet; `examples/README.md` in the repository has the steps. After the report on the card, a run prints:
+The other arguments default to the Binance feed, three messages and the system's certificate file. After the report on the card, a run prints:
 
 ```text
 {"u":103008143177,"s":"BTCUSDT","b":"64604.23000000","B":"2.17781000","a":"64604.24000000","A":"0.16129000"}
