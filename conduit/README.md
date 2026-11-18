@@ -13,6 +13,8 @@ make help            # the per-suite test targets, which run natively on Linux o
 
 Copyright (C) 2026 vgatherps. GPL-3.0-only, see [LICENSE](LICENSE).
 
+`fuzz/scapy/` is GPL-2.0-or-later, because it imports Scapy, which is GPL-2.0-only.
+
 Imported files keep their own licenses:
 
 - `vendor/smoltcp`: 0BSD (`vendor/smoltcp/LICENSE-0BSD.txt`).

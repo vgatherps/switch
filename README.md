@@ -42,4 +42,4 @@ The first chapter of the guide explains what it prints. The network examples nee
 
 ## License
 
-GPL-3.0-only.
+GPL-3.0-only, see [LICENSE](LICENSE).
